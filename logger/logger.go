@@ -18,8 +18,10 @@ var (
 
 // Config 用于首次初始化时的配置，仅第一次调用 Init 时生效。
 // 一套集群对应一个日志文件；通过 ClusterID 区分多套 MHA，日志路径为 LogDir/ClusterID/LogFile。
+// 如果是管理节点（Manager），ClusterID 可留空，日志将直接写入 LogDir/LogFile。
 type Config struct {
-	// 集群标识，多套 MHA 时必填；日志将写入 LogDir/ClusterID/LogFile，且每条日志带 cluster_id 字段
+	// 集群标识，多套 MHA 时必填；日志将写入 LogDir/ClusterID/LogFile，且每条日志带 cluster_id 字段。
+	// 对于管理节点，此字段留空。
 	ClusterID string
 	// 日志根目录，如 "log" 或 "/var/log/gmha"
 	LogDir string
