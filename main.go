@@ -12,7 +12,7 @@ import (
 
 func main() {
 	// 1. 初始化基础设施
-	if err := store.InitSQLite("data/mha.db"); err != nil {
+	if err := store.InitSQLite("data/gmha.db"); err != nil {
 		fmt.Printf("Error initializing DB: %v\n", err)
 		os.Exit(1)
 	}

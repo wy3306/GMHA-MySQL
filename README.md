@@ -15,7 +15,8 @@ GMHA-MySQL 是一个基于 Go 语言开发的 MySQL 高可用（High Availabilit
 ```
 GMHA-MySQL/
 ├── main.go                 # 程序入口
-├── gmha.db                 # SQLite 数据库文件 (自动生成)
+├── data/
+│   └── gmha.db                 # SQLite 数据库文件 (自动生成)
 ├── internal/
 │   ├── interaction/        # 交互层
 │   │   ├── wizard/         # 命令行向导模式逻辑
@@ -72,7 +73,7 @@ GMHA-MySQL 支持多种运行模式：
 ## 💾 数据库连接
 
 项目使用 **SQLite** 作为元数据存储。
-*   **数据库文件**: `gmha.db` (位于项目根目录)
+*   **数据库文件**: `gmha.db` (位于 `data` 目录)
 *   **连接方式**: 您可以使用 Navicat、DBeaver 或 SQLite 命令行工具直接连接该文件查看数据。
 *   **主要数据表**:
     *   `clusters`: 集群信息
