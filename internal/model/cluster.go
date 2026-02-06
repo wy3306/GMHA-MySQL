@@ -1,112 +1,51 @@
 package model
 
 import (
-	"GMHA-MySQL/internal/store"
-	"context"
 	"time"
-
-	"gorm.io/gorm"
 )
 
-// ClusterStatus 定义集群状态枚举
-type ClusterStatus int
-
-const (
-	ClusterStatusUnknown ClusterStatus = iota
-	ClusterStatusNormal
-	ClusterStatusWarning
-	ClusterStatusError
-)
-
-// Cluster 集群信息
+// Cluster 代表一个 MySQL 集群
 type Cluster struct {
-	ID               string `gorm:"primaryKey;type:varchar(64)"`
-	Name             string `gorm:"uniqueIndex;type:varchar(128);not null"`
-	Description      string `gorm:"type:varchar(255)"`
-	VIP              string `gorm:"type:varchar(64)"`
-	VIPEnabled       bool
-	HasL3Switch      bool
-	Status           ClusterStatus
-	HasSplitBrain    bool
-	SSHTrustComplete bool
-
-	// 关联
-	Machines  []Machine  `gorm:"foreignKey:ClusterID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE;"`
-	Databases []Database `gorm:"foreignKey:ClusterID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE;"`
-
-	CreatedAt time.Time
-	UpdatedAt time.Time
-	DeletedAt gorm.DeletedAt `gorm:"index"`
+	ID              uint      `gorm:"primaryKey" json:"id"`
+	Name            string    `gorm:"uniqueIndex;not null" json:"name"` // 集群名称
+	Status          string    `json:"status"`                           // 状态: Online, Offline
+	Description     string    `gorm:"size:256" json:"description"`      //集群描述
+	Machines        []Machine `gorm:"foreignKey:ClusterID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE" json:"machines"`
+	ClusterIP       string    `gorm:"size:64" json:"cluster_ip"`              // 集群IP地址
+	VIP             string    `gorm:"size:64" json:"vip"`                     // 虚拟IP地址
+	VIPStatus       string    `json:"vip_status"`                             // VIP状态: Allocated, Unallocated
+	SSHTrust        bool      `gorm:"default:false" json:"ssh_trust"`         // 是否支持SSH互信
+	HasLayer3Switch bool      `gorm:"default:false" json:"has_layer3_switch"` // 是否存在三层交换机
+	ManagerPort     string    `gorm:"index" json:"manager_port"`              // 管理端口
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
-// ---------------------------------------------------------------------
-// Cluster Repository
-// ---------------------------------------------------------------------
-
-// ClusterRepository 定义集群操作接口
-type ClusterRepository interface {
-	Create(ctx context.Context, c *Cluster) error
-	Update(ctx context.Context, c *Cluster) error
-	Delete(ctx context.Context, id string) error
-	Get(ctx context.Context, id string) (*Cluster, error)
-	GetWithDetails(ctx context.Context, id string) (*Cluster, error)
-	List(ctx context.Context) ([]Cluster, error)
-}
-
-// clusterRepo 实现 ClusterRepository 接口
-type clusterRepo struct {
-	db *gorm.DB
-}
-
-// NewClusterRepository 创建一个新的集群仓库实例
-func NewClusterRepository(db *gorm.DB) ClusterRepository {
-	if db == nil {
-		db = store.GetDB()
+// NewCluster 创建一个新的集群
+func (c Cluster) NewCluster(name, description string) *Cluster {
+	return &Cluster{
+		Name:        name,
+		Status:      "Online",
+		Description: description,
+		VIPStatus:   "Unallocated",
 	}
-	return &clusterRepo{db: db}
 }
 
-// Create 创建集群
-func (r *clusterRepo) Create(ctx context.Context, c *Cluster) error {
-	return r.db.WithContext(ctx).Create(c).Error
+// 修改VIP
+func (c *Cluster) UpdateVIP(vip string) *Cluster {
+	c.VIP = vip
+	c.VIPStatus = "Allocated"
+	return c
 }
 
-// Update 更新集群
-func (r *clusterRepo) Update(ctx context.Context, c *Cluster) error {
-	return r.db.WithContext(ctx).Save(c).Error
+// 修改集群状态
+func (c *Cluster) UpdateStatus(status string) *Cluster {
+	c.Status = status
+	return c
 }
 
-// Delete 删除集群
-func (r *clusterRepo) Delete(ctx context.Context, id string) error {
-	return r.db.WithContext(ctx).Delete(&Cluster{}, "id = ?", id).Error
-}
-
-// Get 获取集群详情
-func (r *clusterRepo) Get(ctx context.Context, id string) (*Cluster, error) {
-	var c Cluster
-	err := r.db.WithContext(ctx).First(&c, "id = ?", id).Error
-	if err != nil {
-		return nil, err
-	}
-	return &c, nil
-}
-
-// GetWithDetails 获取集群详情 (包含关联数据)
-func (r *clusterRepo) GetWithDetails(ctx context.Context, id string) (*Cluster, error) {
-	var c Cluster
-	err := r.db.WithContext(ctx).
-		Preload("Machines").
-		Preload("Databases").
-		First(&c, "id = ?", id).Error
-	if err != nil {
-		return nil, err
-	}
-	return &c, nil
-}
-
-// List 列出所有集群
-func (r *clusterRepo) List(ctx context.Context) ([]Cluster, error) {
-	var list []Cluster
-	err := r.db.WithContext(ctx).Find(&list).Error
-	return list, err
+// 修改集群描述
+func (c *Cluster) UpdateDescription(description string) *Cluster {
+	c.Description = description
+	return c
 }

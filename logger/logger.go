@@ -1,6 +1,7 @@
 package logger
 
 import (
+	"context"
 	"io"
 	"os"
 	"path/filepath"
@@ -17,12 +18,8 @@ var (
 )
 
 // Config 用于首次初始化时的配置，仅第一次调用 Init 时生效。
-// 一套集群对应一个日志文件；通过 ClusterID 区分多套 MHA，日志路径为 LogDir/ClusterID/LogFile。
-// 如果是管理节点（Manager），ClusterID 可留空，日志将直接写入 LogDir/LogFile。
+// 日志统一写入 LogDir/LogFile（不再包含集群标识字段）。
 type Config struct {
-	// 集群标识，多套 MHA 时必填；日志将写入 LogDir/ClusterID/LogFile，且每条日志带 cluster_id 字段。
-	// 对于管理节点，此字段留空。
-	ClusterID string
 	// 日志根目录，如 "log" 或 "/var/log/gmha"
 	LogDir string
 	// 单集群内主日志文件名，如 "app.log"
@@ -42,6 +39,7 @@ type Config struct {
 }
 
 // Init 在程序启动时调用一次，完成目录创建、Lumberjack 初始化（切割/压缩/清理）和全局 logger。
+// 日志将写入 `LogDir/LogFile`。
 // 之后任意模块通过 For(prefix) 或 GetLogger() 使用，不会再次创建文件。
 func Init(cfg Config) error {
 	var err error
@@ -61,16 +59,12 @@ func initLogger(cfg Config) error {
 	if cfg.LogFile == "" {
 		cfg.LogFile = "app.log"
 	}
-	// 一套集群一个目录：LogDir/ClusterID；无 ClusterID 时用 LogDir
-	logDir := cfg.LogDir
-	if cfg.ClusterID != "" {
-		logDir = filepath.Join(cfg.LogDir, cfg.ClusterID)
-	}
-	if err := os.MkdirAll(logDir, 0755); err != nil {
+	// 所有进程写入统一日志目录并使用相同文件名
+	if err := os.MkdirAll(cfg.LogDir, 0755); err != nil {
 		return err
 	}
 
-	filename := filepath.Join(logDir, cfg.LogFile)
+	filename := filepath.Join(cfg.LogDir, cfg.LogFile)
 	maxSize := cfg.MaxSize
 	if maxSize <= 0 {
 		maxSize = 100
@@ -90,12 +84,9 @@ func initLogger(cfg Config) error {
 	}
 	out := io.MultiWriter(writers...)
 
-	base := zerolog.New(out).With().Timestamp().Logger()
-	if cfg.ClusterID != "" {
-		globalLogger = base.With().Str("cluster_id", cfg.ClusterID).Logger()
-	} else {
-		globalLogger = base
-	}
+	// 将进程名与 pid 作为每条日志的默认字段
+	base := zerolog.New(out).With().Timestamp().Int("pid", os.Getpid()).Logger()
+	globalLogger = base
 
 	switch cfg.Level {
 	case "debug":
@@ -113,7 +104,7 @@ func initLogger(cfg Config) error {
 // GetLogger 返回全局 logger。必须先调用 Init 一次，否则返回仅输出到 stdout 的默认 logger。
 func GetLogger() zerolog.Logger {
 	if !inited {
-		return zerolog.New(os.Stdout).With().Timestamp().Logger()
+		return zerolog.New(os.Stdout).With().Timestamp().Str("process", "").Int("pid", os.Getpid()).Logger()
 	}
 	return globalLogger
 }
@@ -141,4 +132,49 @@ func (l Log) Debugf(format string, args ...any) { l.z.Debug().Msgf(format, args.
 // WithErr 返回带 err 字段的链式接口，用于 log.WithErr(err).Errorf("...")
 func (l Log) WithErr(err error) Log {
 	return Log{z: l.z.With().Err(err).Logger()}
+}
+
+// WithField 返回带单个额外字段的 Log，用于在局部上下文添加临时字段
+func (l Log) WithField(key string, val any) Log {
+	return Log{z: l.z.With().Interface(key, val).Logger()}
+}
+
+// WithFields 返回带多个额外字段的 Log
+func (l Log) WithFields(fields map[string]any) Log {
+	w := l.z.With()
+	for k, v := range fields {
+		w = w.Interface(k, v)
+	}
+	return Log{z: w.Logger()}
+}
+
+// Context helpers: 支持在 context 中携带 request_id，并将其附加到现有 Log
+type ctxKey string
+
+const ctxRequestIDKey ctxKey = "request_id"
+
+// WithRequestID 在 ctx 中设置 request_id
+func WithRequestID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, ctxRequestIDKey, id)
+}
+
+// RequestIDFromContext 从 ctx 中获取 request_id
+func RequestIDFromContext(ctx context.Context) (string, bool) {
+	if ctx == nil {
+		return "", false
+	}
+	v := ctx.Value(ctxRequestIDKey)
+	if v == nil {
+		return "", false
+	}
+	s, ok := v.(string)
+	return s, ok
+}
+
+// WithContext 将 ctx 中的 request_id 附加到已有的 Log（不改变原有 component 等字段）
+func WithContext(l Log, ctx context.Context) Log {
+	if id, ok := RequestIDFromContext(ctx); ok && id != "" {
+		return Log{z: l.z.With().Str("request_id", id).Logger()}
+	}
+	return l
 }

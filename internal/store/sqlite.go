@@ -25,7 +25,7 @@ func InitSQLite(dataPath string) error {
 	// 连接 SQLite
 	var err error
 	DB, err = gorm.Open(sqlite.Open(dataPath), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Info),
+		Logger: logger.Default.LogMode(logger.Warn),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to connect database: %w", err)

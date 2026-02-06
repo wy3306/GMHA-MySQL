@@ -1,4 +1,4 @@
-package ui
+package terminal_utils
 
 import (
 	"bufio"
