@@ -31,7 +31,7 @@ func main() {
 	// 4. 根据参数选择交互模式
 	if len(os.Args) < 2 {
 		// 默认模式：引导式交互 (Wizard)
-		wizard.Run(db)
+		wizard.Enter(db)
 		return
 	}
 
@@ -43,7 +43,8 @@ func main() {
 		web.Run(port)
 	case "interactive":
 		// 显式调用引导模式
-		wizard.Run(db)
+		//wizard.Run(db)
+		wizard.Enter(db)
 	case "help", "--help", "-h":
 		printHelp()
 	default:
