@@ -1,0 +1,37 @@
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Go build artifacts
+bin/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go cache
+.gocache/
+.gomodcache/
+
+# macOS
+.DS_Store
+
+# Compiled binaries (project-specific)
+gmha
+gmha-agent
+agentd
+demo
+
+# Data and runtime
+data/
+
+# Software dependencies (large binaries)
+software/
+
+# Temporary files
+*.tmp
+*.log

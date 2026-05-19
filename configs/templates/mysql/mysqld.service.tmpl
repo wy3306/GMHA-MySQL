@@ -1,0 +1,20 @@
+[Unit]
+Description=MySQL Server
+Documentation=man:mysqld(8)
+Documentation=http://dev.mysql.com/doc/refman/en/using-systemd.html
+After=network.target
+After=syslog.target
+
+[Service]
+Type=forking
+User={{ .MySQLUser }}
+Group={{ .MySQLUser }}
+PermissionsStartOnly=true
+ExecStart={{ .BaseDir }}/bin/mysqld --defaults-file={{ .MyCnfPath }} --daemonize --user={{ .MySQLUser }}
+ExecStop={{ .BaseDir }}/bin/mysqladmin --defaults-file={{ .MyCnfPath }} shutdown
+Restart=always
+LimitNOFILE={{ .OpenFilesLimit }}
+LimitNPROC={{ .LimitNProc }}
+
+[Install]
+WantedBy=multi-user.target

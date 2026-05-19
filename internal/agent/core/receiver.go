@@ -1,0 +1,97 @@
+package core
+
+import (
+	"context"
+	"fmt"
+	"net/url"
+	"strings"
+	"time"
+
+	taskdomain "gmha/internal/domain/task"
+	"golang.org/x/net/websocket"
+)
+
+// Receiver 是 WebSocket 任务接收器，通过 WebSocket 长连接从管理端接收任务并交给分发器处理。
+type Receiver struct {
+	managerHTTPAddr string
+	agentID         string
+	machineID       string
+	dispatcher      *Dispatcher
+}
+
+// NewReceiver 创建一个新的任务接收器实例。
+func NewReceiver(managerHTTPAddr, agentID, machineID string, dispatcher *Dispatcher) *Receiver {
+	return &Receiver{
+		managerHTTPAddr: managerHTTPAddr,
+		agentID:         agentID,
+		machineID:       machineID,
+		dispatcher:      dispatcher,
+	}
+}
+
+// Run 启动任务接收循环，自动重连 WebSocket 并接收任务。
+func (r *Receiver) Run(ctx context.Context) error {
+	for {
+		err := r.runOnce(ctx)
+		if ctx.Err() != nil {
+			return nil
+		}
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(3 * time.Second):
+			}
+		}
+	}
+}
+
+func (r *Receiver) runOnce(ctx context.Context) error {
+	wsURL, err := buildTaskWSURL(r.managerHTTPAddr, r.agentID, r.machineID, r.dispatcher.Types())
+	if err != nil {
+		return err
+	}
+	conn, err := websocket.Dial(wsURL, "", r.managerHTTPAddr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	reporter := NewReporter(conn, r.agentID, r.machineID)
+	for {
+		var envelope taskdomain.DispatchEnvelope
+		if err := websocket.JSON.Receive(conn, &envelope); err != nil {
+			return err
+		}
+		go r.dispatcher.Dispatch(ctx, envelope, reporter)
+	}
+}
+
+func buildTaskWSURL(managerHTTPAddr, agentID, machineID string, capabilities []string) (string, error) {
+	managerHTTPAddr = strings.TrimSpace(managerHTTPAddr)
+	if managerHTTPAddr == "" {
+		return "", fmt.Errorf("manager_http_addr is required")
+	}
+	u, err := url.Parse(managerHTTPAddr)
+	if err != nil {
+		return "", err
+	}
+	switch u.Scheme {
+	case "http":
+		u.Scheme = "ws"
+	case "https":
+		u.Scheme = "wss"
+	case "ws", "wss":
+	default:
+		return "", fmt.Errorf("unsupported manager http scheme %s", u.Scheme)
+	}
+	u.Path = "/ws/agent/tasks"
+	q := u.Query()
+	q.Set("agent_id", agentID)
+	q.Set("machine_id", machineID)
+	if len(capabilities) > 0 {
+		q.Set("capabilities", strings.Join(capabilities, ","))
+	}
+	u.RawQuery = q.Encode()
+	return u.String(), nil
+}

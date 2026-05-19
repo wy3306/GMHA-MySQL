@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GMHA Manager</title>
+  <style>
+    :root {
+      --bg: #f2efe8;
+      --panel: rgba(255,255,255,0.86);
+      --ink: #1f2937;
+      --muted: #6b7280;
+      --accent: #9f3a21;
+      --line: rgba(31,41,55,0.12);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Iowan Old Style", "Palatino Linotype", serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(159,58,33,0.18), transparent 28%),
+        linear-gradient(135deg, #efe5d1, #f7f4ee 58%, #e3ebea);
+      min-height: 100vh;
+    }
+    .wrap {
+      max-width: 1040px;
+      margin: 0 auto;
+      padding: 32px 20px 56px;
+    }
+    .hero {
+      padding: 28px;
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      background: var(--panel);
+      backdrop-filter: blur(14px);
+      box-shadow: 0 18px 40px rgba(31,41,55,0.08);
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: clamp(32px, 6vw, 56px);
+      letter-spacing: -0.04em;
+    }
+    p { color: var(--muted); line-height: 1.6; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 18px;
+      margin-top: 18px;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      padding: 22px;
+      box-shadow: 0 12px 28px rgba(31,41,55,0.06);
+    }
+    label {
+      display: block;
+      font-size: 14px;
+      margin-bottom: 12px;
+    }
+    input {
+      width: 100%;
+      margin-top: 6px;
+      border: 1px solid rgba(31,41,55,0.16);
+      border-radius: 12px;
+      padding: 12px 14px;
+      font: inherit;
+      background: rgba(255,255,255,0.8);
+    }
+    button {
+      border: 0;
+      border-radius: 999px;
+      padding: 12px 18px;
+      font: inherit;
+      color: white;
+      background: linear-gradient(135deg, #9f3a21, #cf6f2f);
+      cursor: pointer;
+    }
+    pre {
+      overflow: auto;
+      padding: 16px;
+      border-radius: 18px;
+      background: #1f2937;
+      color: #f9fafb;
+      min-height: 180px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+    th, td {
+      text-align: left;
+      padding: 10px 8px;
+      border-bottom: 1px solid var(--line);
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="hero">
+      <h1>GMHA Manager</h1>
+      <p>当前阶段聚焦主机纳管 bootstrap。Manager 通过 SSH 推送 Agent，Agent 完成注册后，后续运维入口即可从 SSH 转向 Agent 化执行。</p>
+    </section>
+
+    <div class="grid">
+      <section class="card">
+        <h2>主机纳管</h2>
+        <form id="bootstrap-form">
+          <label>主机名<input name="name" required></label>
+          <label>地址<input name="address" required placeholder="10.0.0.11"></label>
+          <label>集群<input name="cluster" placeholder="prod-a"></label>
+          <label>SSH 端口<input name="ssh_port" value="22"></label>
+          <label>SSH 用户<input name="ssh_user" required value="root"></label>
+          <label>SSH 密码<input name="ssh_password" required type="password"></label>
+          <button type="submit">开始 Bootstrap</button>
+        </form>
+      </section>
+
+      <section class="card">
+        <h2>执行结果</h2>
+        <pre id="output">等待提交...</pre>
+      </section>
+    </div>
+
+    <section class="card" style="margin-top:18px;">
+      <h2>主机列表</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Address</th>
+            <th>Cluster</th>
+            <th>Bootstrap</th>
+            <th>Agent</th>
+          </tr>
+        </thead>
+        <tbody id="host-rows"></tbody>
+      </table>
+    </section>
+  </div>
+
+  <script>
+    async function loadHosts() {
+      const res = await fetch('/api/v1/hosts');
+      const data = await res.json();
+      const tbody = document.getElementById('host-rows');
+      tbody.innerHTML = '';
+      for (const item of data.items || []) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${item.Name || item.name || ''}</td>
+          <td>${item.Address || item.address || ''}</td>
+          <td>${item.Cluster || item.cluster || ''}</td>
+          <td>${item.BootstrapState || item.bootstrap_state || ''}</td>
+          <td>${item.AgentID || item.agent_id || ''}</td>`;
+        tbody.appendChild(tr);
+      }
+    }
+
+    document.getElementById('bootstrap-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const form = new FormData(event.target);
+      const payload = {
+        name: form.get('name'),
+        address: form.get('address'),
+        cluster: form.get('cluster'),
+        ssh_port: Number(form.get('ssh_port')),
+        ssh_user: form.get('ssh_user'),
+        ssh_password: form.get('ssh_password')
+      };
+      const output = document.getElementById('output');
+      output.textContent = 'Bootstrap running...';
+      const res = await fetch('/api/v1/bootstrap', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      output.textContent = JSON.stringify(data, null, 2);
+      await loadHosts();
+    });
+
+    loadHosts();
+  </script>
+</body>
+</html>
