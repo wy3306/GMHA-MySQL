@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package gmha.agent.v1;
+
+option go_package = "gmha/pkg/rpc/heartbeat;heartbeat";
+
+service HeartbeatService {
+  rpc StreamHeartbeat(stream HeartbeatRequest) returns (stream HeartbeatResponse);
+}
+
+message HeartbeatRequest {
+  AgentIdentity identity = 1;
+  AgentRuntime runtime = 2;
+  AgentHealth health = 3;
+}
+
+message AgentIdentity {
+  string agent_id = 1;
+  string machine_id = 2;
+  string cluster_id = 3;
+  string hostname = 4;
+  string version = 5;
+  string boot_id = 6;
+}
+
+message AgentRuntime {
+  int64 sent_at_unix_ms = 1;
+  uint64 seq = 2;
+  uint64 uptime_sec = 3;
+  uint32 heartbeat_interval_ms = 4;
+  string stream_id = 5;
+}
+
+message AgentHealth {
+  string overall = 1;
+  string summary = 2;
+  repeated HealthCheck checks = 3;
+}
+
+message HealthCheck {
+  string name = 1;
+  string status = 2;
+  string detail = 3;
+  int64 checked_at_unix_ms = 4;
+}
+
+message HeartbeatResponse {
+  int64 server_time_unix_ms = 1;
+  string state = 2;
+  string message = 3;
+}

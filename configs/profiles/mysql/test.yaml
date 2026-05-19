@@ -1,0 +1,15 @@
+buffer_pool_ratio: 0.5
+max_conn_per_gb: 10
+max_max_connections: 200
+redo_log_ratio: 0.20
+sort_buffer_size_mb: 2
+read_buffer_size_mb: 1
+read_rnd_buffer_size_mb: 1
+join_buffer_size_mb: 1
+table_open_cache: 1024
+thread_cache_size: 32
+sysctl_swappiness: 10
+open_files_limit: 32768
+
+innodb_data_file_initial_mb: 128
+innodb_temp_file_initial_mb: 128

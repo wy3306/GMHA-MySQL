@@ -1,0 +1,78 @@
+[client]
+port = {{ .Port }}
+socket = {{ .SocketPath }}
+
+[mysqld]
+user = {{ .MySQLUser }}
+port = {{ .Port }}
+basedir = {{ .BaseDir }}
+datadir = {{ .DataDir }}
+socket = {{ .SocketPath }}
+pid-file = {{ .PIDFile }}
+log-error = {{ .ErrorLog }}
+character_sets_dir = {{ .CharacterSetsDir }}
+plugin_dir = {{ .PluginDir }}
+tmpdir = {{ .TmpDir }}
+character_set_server = {{ .CharacterSetServer }}
+collation_server = {{ .CollationServer }}
+autocommit = {{ .Autocommit }}
+transaction_isolation = {{ .TransactionIsolation }}
+
+log_bin = {{ .BinlogDir }}/mysql-bin
+relay_log = {{ .BinlogDir }}/relay-bin
+innodb_log_group_home_dir = {{ .RedoDir }}
+innodb_undo_directory = {{ .UndoDir }}
+binlog_format = {{ .BinlogFormat }}
+sync_binlog = {{ .SyncBinlog }}
+binlog_expire_logs_seconds = {{ .BinlogExpireSeconds }}
+binlog_rows_query_log_events = {{ .BinlogRowsQueryEvents }}
+log_replica_updates = {{ .LogReplicaUpdates }}
+gtid_mode = {{ .GTIDMode }}
+enforce_gtid_consistency = {{ .EnforceGTIDConsistency }}
+relay_log_recovery = {{ .RelayLogRecovery }}
+read_only = {{ .ReadOnly }}
+super_read_only = {{ .SuperReadOnly }}
+
+open_files_limit = {{ .OpenFilesLimit }}
+max_connections = {{ .MaxConnections }}
+interactive_timeout = {{ .InteractiveTimeout }}
+wait_timeout = {{ .WaitTimeout }}
+lock_wait_timeout = {{ .LockWaitTimeout }}
+max_connect_errors = {{ .MaxConnectErrors }}
+max_allowed_packet = {{ .MaxAllowedPacket }}
+table_open_cache = {{ .TableOpenCache }}
+thread_cache_size = {{ .ThreadCacheSize }}
+
+log_timestamps = {{ .LogTimestamps }}
+slow_query_log = {{ .SlowQueryLog }}
+slow_query_log_file = {{ .SlowQueryLogFile }}
+long_query_time = {{ .LongQueryTime }}
+min_examined_row_limit = {{ .MinExaminedRowLimit }}
+log_slow_admin_statements = {{ .LogSlowAdminStatements }}
+log_slow_replica_statements = {{ .LogSlowReplicaStmts }}
+log_throttle_queries_not_using_indexes = {{ .LogThrottleNoIndex }}
+
+default_storage_engine = {{ .DefaultStorageEngine }}
+innodb_data_file_path = {{ .InnodbDataFilePath }}
+innodb_temp_data_file_path = {{ .InnodbTempDataFilePath }}
+innodb_buffer_pool_size = {{ .BufferPoolSize }}
+innodb_buffer_pool_instances = {{ .BufferPoolInstances }}
+innodb_redo_log_capacity = {{ .RedoLogCapacity }}
+innodb_flush_log_at_trx_commit = {{ .InnodbFlushLogAtCommit }}
+innodb_lock_wait_timeout = {{ .InnodbLockWaitTimeout }}
+innodb_file_per_table = {{ .InnodbFilePerTable }}
+innodb_flush_method = {{ .InnodbFlushMethod }}
+innodb_log_buffer_size = {{ .InnodbLogBufferSize }}
+innodb_read_io_threads = {{ .InnodbReadIOThreads }}
+innodb_write_io_threads = {{ .InnodbWriteIOThreads }}
+
+key_buffer_size = {{ .KeyBufferSize }}
+sort_buffer_size = {{ .SortBufferSize }}
+read_buffer_size = {{ .ReadBufferSize }}
+read_rnd_buffer_size = {{ .ReadRndBufferSize }}
+join_buffer_size = {{ .JoinBufferSize }}
+myisam_sort_buffer_size = {{ .MyISAMSortBufferSize }}
+
+server_id = {{ .ServerID }}
+skip_name_resolve = 1
+symbolic_links = 0

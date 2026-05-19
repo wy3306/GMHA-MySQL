@@ -1,0 +1,6 @@
+{{ .MySQLUser }} soft nofile {{ .OpenFilesLimit }}
+{{ .MySQLUser }} hard nofile {{ .OpenFilesLimit }}
+{{ .MySQLUser }} soft nproc {{ .LimitNProc }}
+{{ .MySQLUser }} hard nproc {{ .LimitNProc }}
+{{ .MySQLUser }} soft memlock unlimited
+{{ .MySQLUser }} hard memlock unlimited

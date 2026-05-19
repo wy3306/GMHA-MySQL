@@ -1,0 +1,2 @@
+swappiness: 1
+file_max: 1048576

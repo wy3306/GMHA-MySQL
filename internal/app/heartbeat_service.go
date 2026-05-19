@@ -1,0 +1,564 @@
+package app
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	agentdomain "gmha/internal/domain/agent"
+	dynamicdomain "gmha/internal/domain/dynamic"
+	hbdomain "gmha/internal/domain/heartbeat"
+	machinedomain "gmha/internal/domain/machine"
+	mysqlapp "gmha/internal/mysql"
+	hbgrpc "gmha/pkg/rpc/heartbeat"
+)
+
+// HeartbeatConfig 是心跳服务的配置参数。
+type HeartbeatConfig struct {
+	SuspectAfter  time.Duration
+	OfflineAfter  time.Duration
+	RecoverAfter  int
+	DegradeAfter  int
+	ReconcileTick time.Duration
+}
+
+// HeartbeatService 是心跳处理的核心服务，负责处理 Agent 上报的心跳数据、
+// 管理 Agent 状态转换（INIT→ONLINE→SUSPECT→DEGRADED→OFFLINE）、
+// 协调循环检查超时、同步操作状态到 Agent/Machine 实体、管理动态采集配置。
+type HeartbeatService struct {
+	repo               hbdomain.Repository
+	cfg                HeartbeatConfig
+	agents             agentStatusUpdater
+	machines           machineStatusUpdater
+	mysql              mysqlStatusUpdater
+	mu                 sync.RWMutex
+	latest             map[string]hbdomain.LatestStatus
+	dynamicConfig      dynamicdomain.DynamicCollectConfig
+	mysqlDynamicConfig dynamicdomain.DynamicCollectConfig
+}
+
+type agentStatusUpdater interface {
+	UpdateState(ctx context.Context, machineID string, state agentdomain.State, lastError string) error
+	UpdateHeartbeat(ctx context.Context, machineID string, at time.Time) error
+}
+
+type machineStatusUpdater interface {
+	UpdateStatus(ctx context.Context, machineID string, status machinedomain.Status, lastError string) error
+}
+
+type mysqlStatusUpdater interface {
+	UpdateStatus(ctx context.Context, machineID string, port int, status string) error
+}
+
+type HeartbeatView struct {
+	AgentID           string                       `json:"agent_id"`
+	MachineID         string                       `json:"machine_id"`
+	ClusterID         string                       `json:"cluster_id"`
+	Hostname          string                       `json:"hostname"`
+	Version           string                       `json:"version"`
+	CurrentState      hbdomain.AgentState          `json:"current_state"`
+	OverallHealth     hbdomain.HealthLevel         `json:"overall_health"`
+	LastHeartbeatAt   time.Time                    `json:"last_heartbeat_at"`
+	LastHealthyAt     *time.Time                   `json:"last_healthy_at,omitempty"`
+	LastStateChangeAt time.Time                    `json:"last_state_change_at"`
+	LastErrorSummary  string                       `json:"last_error_summary"`
+	Checks            []hbdomain.HealthCheck       `json:"checks"`
+	Metrics           []dynamicdomain.MetricResult `json:"metrics"`
+}
+
+func NewHeartbeatService(repo hbdomain.Repository, cfg HeartbeatConfig, agentRepo agentStatusUpdater, machineRepo machineStatusUpdater, mysqlRepo mysqlStatusUpdater) *HeartbeatService {
+	if cfg.SuspectAfter <= 0 {
+		cfg.SuspectAfter = 15 * time.Second
+	}
+	if cfg.OfflineAfter <= 0 {
+		cfg.OfflineAfter = 30 * time.Second
+	}
+	if cfg.RecoverAfter <= 0 {
+		cfg.RecoverAfter = 2
+	}
+	if cfg.DegradeAfter <= 0 {
+		cfg.DegradeAfter = 2
+	}
+	if cfg.ReconcileTick <= 0 {
+		cfg.ReconcileTick = 5 * time.Second
+	}
+	return &HeartbeatService{
+		repo:               repo,
+		cfg:                cfg,
+		agents:             agentRepo,
+		machines:           machineRepo,
+		mysql:              mysqlRepo,
+		latest:             make(map[string]hbdomain.LatestStatus),
+		dynamicConfig:      dynamicdomain.BuildDefaultDynamicCollectConfig(),
+		mysqlDynamicConfig: dynamicdomain.BuildDefaultMySQLDynamicCollectConfig(),
+	}
+}
+
+func (s *HeartbeatService) GetDynamicCollectConfig() dynamicdomain.DynamicCollectConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.dynamicConfig
+}
+
+func (s *HeartbeatService) UpdateDynamicCollectConfig(cfg dynamicdomain.DynamicCollectConfig) dynamicdomain.DynamicCollectConfig {
+	if cfg.UpdatedAt.IsZero() {
+		cfg.UpdatedAt = time.Now().UTC()
+	}
+	if cfg.Version == "" {
+		cfg.Version = cfg.UpdatedAt.Format("20060102T150405.000000000Z")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dynamicConfig = cfg
+	return cfg
+}
+
+func (s *HeartbeatService) GetMySQLDynamicCollectConfig() dynamicdomain.DynamicCollectConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.mysqlDynamicConfig
+}
+
+func (s *HeartbeatService) UpdateMySQLDynamicCollectConfig(cfg dynamicdomain.DynamicCollectConfig) dynamicdomain.DynamicCollectConfig {
+	if cfg.UpdatedAt.IsZero() {
+		cfg.UpdatedAt = time.Now().UTC()
+	}
+	if cfg.Version == "" {
+		cfg.Version = "mysql-" + cfg.UpdatedAt.Format("20060102T150405.000000000Z")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mysqlDynamicConfig = cfg
+	return cfg
+}
+
+func (s *HeartbeatService) LoadLatest(ctx context.Context) error {
+	items, err := s.repo.ListLatest(ctx)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, item := range items {
+		s.latest[item.AgentID] = item
+	}
+	return nil
+}
+
+func (s *HeartbeatService) TickInterval() time.Duration {
+	return s.cfg.ReconcileTick
+}
+
+func (s *HeartbeatService) Snapshot() []HeartbeatView {
+	_ = s.LoadLatest(context.Background())
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]HeartbeatView, 0, len(s.latest))
+	for _, item := range s.latest {
+		out = append(out, HeartbeatView{
+			AgentID:           item.AgentID,
+			MachineID:         item.MachineID,
+			ClusterID:         item.ClusterID,
+			Hostname:          item.Hostname,
+			Version:           item.Version,
+			CurrentState:      item.CurrentState,
+			OverallHealth:     item.OverallHealth,
+			LastHeartbeatAt:   item.LastHeartbeatAt,
+			LastHealthyAt:     item.LastHealthyAt,
+			LastStateChangeAt: item.LastStateChangeAt,
+			LastErrorSummary:  item.LastErrorSummary,
+			Checks:            append([]hbdomain.HealthCheck(nil), item.Checks...),
+			Metrics:           append([]dynamicdomain.MetricResult(nil), item.Metrics...),
+		})
+	}
+	return out
+}
+
+func (s *HeartbeatService) GetByMachineID(ctx context.Context, machineID string) (HeartbeatView, bool, error) {
+	if err := s.LoadLatest(ctx); err != nil {
+		return HeartbeatView{}, false, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, item := range s.latest {
+		if item.MachineID != machineID {
+			continue
+		}
+		return HeartbeatView{
+			AgentID:           item.AgentID,
+			MachineID:         item.MachineID,
+			ClusterID:         item.ClusterID,
+			Hostname:          item.Hostname,
+			Version:           item.Version,
+			CurrentState:      item.CurrentState,
+			OverallHealth:     item.OverallHealth,
+			LastHeartbeatAt:   item.LastHeartbeatAt,
+			LastHealthyAt:     item.LastHealthyAt,
+			LastStateChangeAt: item.LastStateChangeAt,
+			LastErrorSummary:  item.LastErrorSummary,
+			Checks:            append([]hbdomain.HealthCheck(nil), item.Checks...),
+			Metrics:           append([]dynamicdomain.MetricResult(nil), item.Metrics...),
+		}, true, nil
+	}
+	return HeartbeatView{}, false, nil
+}
+
+func (s *HeartbeatService) RemoveMachine(ctx context.Context, machineID string) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	for agentID, item := range s.latest {
+		if item.MachineID == machineID {
+			delete(s.latest, agentID)
+		}
+	}
+	s.mu.Unlock()
+	if cleaner, ok := s.repo.(interface {
+		DeleteByMachineID(context.Context, string) error
+	}); ok {
+		return cleaner.DeleteByMachineID(ctx, machineID)
+	}
+	return s.repo.DeleteLatestByMachineID(ctx, machineID)
+}
+
+func (s *HeartbeatService) WaitForOnline(ctx context.Context, machineID string, timeout time.Duration) error {
+	if s == nil {
+		return errors.New("heartbeat service not configured")
+	}
+	waitCtx := ctx
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		waitCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	lastErr := ""
+	for {
+		item, ok, err := s.getByMachineIDRefreshing(waitCtx, machineID)
+		if err != nil {
+			return err
+		}
+		if ok {
+			switch item.CurrentState {
+			case hbdomain.StateOnline, hbdomain.StateDegraded:
+				return nil
+			case hbdomain.StateOffline, hbdomain.StateSuspect:
+				if strings.TrimSpace(item.LastErrorSummary) != "" {
+					lastErr = item.LastErrorSummary
+				} else {
+					lastErr = "agent heartbeat did not become healthy"
+				}
+			}
+		}
+
+		select {
+		case <-waitCtx.Done():
+			if strings.TrimSpace(lastErr) != "" {
+				return errors.New(lastErr)
+			}
+			return errors.New("timed out waiting for first agent heartbeat")
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *HeartbeatService) WaitForFreshHeartbeat(ctx context.Context, machineID string, startedAt time.Time, timeout time.Duration) error {
+	if s == nil {
+		return errors.New("heartbeat service not configured")
+	}
+	waitCtx := ctx
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		waitCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		item, ok, err := s.getByMachineIDRefreshing(waitCtx, machineID)
+		if err != nil {
+			return err
+		}
+		if ok &&
+			(item.CurrentState == hbdomain.StateOnline || item.CurrentState == hbdomain.StateDegraded) &&
+			!item.LastHeartbeatAt.IsZero() &&
+			!item.LastHeartbeatAt.Before(startedAt) {
+			return nil
+		}
+		select {
+		case <-waitCtx.Done():
+			return errors.New("timed out waiting for upgraded agent heartbeat")
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *HeartbeatService) getByMachineIDRefreshing(ctx context.Context, machineID string) (HeartbeatView, bool, error) {
+	if s.repo == nil {
+		return s.GetByMachineID(ctx, machineID)
+	}
+	items, err := s.repo.ListLatest(ctx)
+	if err != nil {
+		return HeartbeatView{}, false, err
+	}
+	s.mu.Lock()
+	for _, latest := range items {
+		s.latest[latest.AgentID] = latest
+	}
+	s.mu.Unlock()
+	return s.GetByMachineID(ctx, machineID)
+}
+
+func (s *HeartbeatService) ProcessHeartbeat(ctx context.Context, req *hbgrpc.HeartbeatRequest) (*hbgrpc.HeartbeatResponse, error) {
+	now := time.Now().UTC()
+	payload := mapRequest(req)
+
+	s.mu.Lock()
+	current, ok := s.latest[payload.AgentID]
+	if !ok {
+		current = hbdomain.LatestStatus{
+			AgentID:           payload.AgentID,
+			MachineID:         payload.MachineID,
+			ClusterID:         payload.ClusterID,
+			Hostname:          payload.Hostname,
+			Version:           payload.Version,
+			CurrentState:      hbdomain.StateInit,
+			LastStateChangeAt: now,
+		}
+	}
+	next, changed, reason := s.onReceive(current, payload, now)
+	s.latest[payload.AgentID] = next
+	s.mu.Unlock()
+
+	if err := s.repo.UpsertLatestStatus(ctx, next); err != nil {
+		return nil, err
+	}
+	s.syncOperationalState(ctx, next)
+	if changed {
+		_ = s.repo.AppendEvent(ctx, buildEvent(current, next, reason, payload, now))
+	}
+
+	cfg := s.GetDynamicCollectConfig()
+	mysqlCfg := s.GetMySQLDynamicCollectConfig()
+	return &hbgrpc.HeartbeatResponse{
+		ServerTimeUnixMS:    now.UnixMilli(),
+		State:               string(next.CurrentState),
+		Message:             reason,
+		DynamicCollect:      &cfg,
+		MySQLDynamicCollect: &mysqlCfg,
+	}, nil
+}
+
+func (s *HeartbeatService) Reconcile(ctx context.Context) error {
+	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for agentID, item := range s.latest {
+		next, changed, reason := s.onTick(item, now)
+		if !changed {
+			continue
+		}
+		s.latest[agentID] = next
+		if err := s.repo.UpsertLatestStatus(ctx, next); err != nil {
+			return err
+		}
+		s.syncOperationalState(ctx, next)
+		_ = s.repo.AppendEvent(ctx, buildEvent(item, next, reason, hbdomain.HeartbeatPayload{
+			AgentID:   item.AgentID,
+			MachineID: item.MachineID,
+			ClusterID: item.ClusterID,
+			Hostname:  item.Hostname,
+			Version:   item.Version,
+			Seq:       item.LastSeq,
+		}, now))
+	}
+	return nil
+}
+
+func (s *HeartbeatService) syncOperationalState(ctx context.Context, item hbdomain.LatestStatus) {
+	if s.agents == nil || s.machines == nil {
+		return
+	}
+	s.syncMySQLState(ctx, item)
+	switch item.CurrentState {
+	case hbdomain.StateOnline, hbdomain.StateDegraded:
+		_ = s.agents.UpdateHeartbeat(ctx, item.MachineID, item.LastHeartbeatAt)
+		_ = s.agents.UpdateState(ctx, item.MachineID, agentdomain.StateOnline, "")
+		_ = s.machines.UpdateStatus(ctx, item.MachineID, machinedomain.StatusAgentOnline, "")
+	case hbdomain.StateOffline, hbdomain.StateSuspect:
+		msg := item.LastErrorSummary
+		_ = s.agents.UpdateState(ctx, item.MachineID, agentdomain.StateError, msg)
+		_ = s.machines.UpdateStatus(ctx, item.MachineID, machinedomain.StatusAgentError, msg)
+	}
+}
+
+func (s *HeartbeatService) syncMySQLState(ctx context.Context, item hbdomain.LatestStatus) {
+	if s.mysql == nil {
+		return
+	}
+	for _, check := range item.Checks {
+		if !strings.HasPrefix(check.Name, "mysql.heartbeat.") {
+			continue
+		}
+		portText := strings.TrimPrefix(check.Name, "mysql.heartbeat.")
+		port, err := strconv.Atoi(portText)
+		if err != nil || port <= 0 {
+			continue
+		}
+		status := mysqlapp.StatusRunning
+		if check.Status == hbdomain.CheckFail {
+			status = mysqlapp.StatusHeartbeatFailed
+			if strings.Contains(check.Detail, "systemctl start failed") {
+				status = mysqlapp.StatusInstanceError
+			}
+		}
+		_ = s.mysql.UpdateStatus(ctx, item.MachineID, port, status)
+	}
+}
+
+func (s *HeartbeatService) onReceive(cur hbdomain.LatestStatus, payload hbdomain.HeartbeatPayload, now time.Time) (hbdomain.LatestStatus, bool, string) {
+	next := cur
+	next.AgentID = payload.AgentID
+	next.MachineID = payload.MachineID
+	next.ClusterID = payload.ClusterID
+	next.Hostname = payload.Hostname
+	next.Version = payload.Version
+	next.LastHeartbeatAt = now
+	next.LastSeq = payload.Seq
+	next.LastBootID = payload.BootID
+	next.OverallHealth = payload.OverallHealth
+	next.Checks = payload.Checks
+	next.Metrics = payload.Metrics
+	next.UpdatedAt = now
+	next.ConsecutiveMisses = 0
+
+	hasBad := payload.OverallHealth != hbdomain.HealthHealthy
+	if hasBad {
+		next.ConsecutiveBadChecks++
+		next.LastErrorSummary = payload.Summary
+	} else {
+		next.ConsecutiveBadChecks = 0
+		next.LastErrorSummary = ""
+		t := now
+		next.LastHealthyAt = &t
+	}
+
+	prev := cur.CurrentState
+	if prev == "" {
+		prev = hbdomain.StateInit
+	}
+	if hasBad && next.ConsecutiveBadChecks >= s.cfg.DegradeAfter {
+		next.CurrentState = hbdomain.StateDegraded
+	} else if hasBad && (prev == hbdomain.StateOffline || prev == hbdomain.StateSuspect || prev == hbdomain.StateInit) {
+		next.CurrentState = hbdomain.StateDegraded
+	} else if !hasBad {
+		next.CurrentState = hbdomain.StateOnline
+	} else {
+		next.CurrentState = prev
+	}
+
+	changed := next.CurrentState != prev
+	reason := "heartbeat accepted"
+	if changed {
+		next.LastStateChangeAt = now
+		reason = fmt.Sprintf("state changed from %s to %s", prev, next.CurrentState)
+	}
+	return next, changed, reason
+}
+
+func (s *HeartbeatService) onTick(cur hbdomain.LatestStatus, now time.Time) (hbdomain.LatestStatus, bool, string) {
+	if cur.LastHeartbeatAt.IsZero() {
+		return cur, false, ""
+	}
+	next := cur
+	next.UpdatedAt = now
+	elapsed := now.Sub(cur.LastHeartbeatAt)
+	switch {
+	case elapsed >= s.cfg.OfflineAfter && cur.CurrentState != hbdomain.StateOffline:
+		next.CurrentState = hbdomain.StateOffline
+		next.ConsecutiveMisses++
+	case elapsed >= s.cfg.SuspectAfter && cur.CurrentState != hbdomain.StateSuspect && cur.CurrentState != hbdomain.StateOffline:
+		next.CurrentState = hbdomain.StateSuspect
+		next.ConsecutiveMisses++
+	default:
+		return cur, false, ""
+	}
+	next.LastStateChangeAt = now
+	next.LastErrorSummary = fmt.Sprintf("heartbeat timeout after %s", elapsed.Round(time.Second))
+	return next, true, next.LastErrorSummary
+}
+
+func mapRequest(req *hbgrpc.HeartbeatRequest) hbdomain.HeartbeatPayload {
+	checks := make([]hbdomain.HealthCheck, 0, len(req.Health.Checks))
+	for _, item := range req.Health.Checks {
+		checks = append(checks, hbdomain.HealthCheck{
+			Name:      item.Name,
+			Status:    hbdomain.CheckStatus(item.Status),
+			Detail:    item.Detail,
+			CheckedAt: time.UnixMilli(item.CheckedAtUnixMS).UTC(),
+		})
+	}
+	metrics := []dynamicdomain.MetricResult(nil)
+	if req.Metrics != nil {
+		metrics = append(metrics, tagMetricScope(req.Metrics.Items, "machine_dynamic")...)
+	}
+	if req.MySQLMetrics != nil {
+		metrics = append(metrics, tagMetricScope(req.MySQLMetrics.Items, "mysql_dynamic")...)
+	}
+	return hbdomain.HeartbeatPayload{
+		AgentID:             req.Identity.AgentID,
+		MachineID:           req.Identity.MachineID,
+		ClusterID:           req.Identity.ClusterID,
+		Hostname:            req.Identity.Hostname,
+		Version:             req.Identity.Version,
+		BootID:              req.Identity.BootID,
+		StreamID:            req.Runtime.StreamID,
+		Seq:                 req.Runtime.Seq,
+		SentAt:              time.UnixMilli(req.Runtime.SentAtUnixMS).UTC(),
+		UptimeSec:           req.Runtime.UptimeSec,
+		HeartbeatIntervalMs: req.Runtime.HeartbeatIntervalMS,
+		OverallHealth:       hbdomain.HealthLevel(req.Health.Overall),
+		Summary:             req.Health.Summary,
+		Checks:              checks,
+		Metrics:             metrics,
+	}
+}
+
+func tagMetricScope(items []dynamicdomain.MetricResult, scope string) []dynamicdomain.MetricResult {
+	out := make([]dynamicdomain.MetricResult, 0, len(items))
+	for _, item := range items {
+		labels := make(map[string]string, len(item.Labels)+1)
+		for k, v := range item.Labels {
+			labels[k] = v
+		}
+		labels["metric_scope"] = scope
+		item.Labels = labels
+		out = append(out, item)
+	}
+	return out
+}
+
+func buildEvent(prev, next hbdomain.LatestStatus, reason string, payload hbdomain.HeartbeatPayload, now time.Time) hbdomain.StateEvent {
+	data, _ := json.Marshal(payload)
+	return hbdomain.StateEvent{
+		ID:           fmt.Sprintf("%s-%d", payload.AgentID, now.UnixNano()),
+		AgentID:      payload.AgentID,
+		MachineID:    payload.MachineID,
+		EventType:    "state_change",
+		PrevState:    prev.CurrentState,
+		NewState:     next.CurrentState,
+		Reason:       reason,
+		HeartbeatSeq: payload.Seq,
+		PayloadJSON:  string(data),
+		CreatedAt:    now,
+	}
+}
