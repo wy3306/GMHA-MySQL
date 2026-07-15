@@ -25,9 +25,9 @@ touch "$PACKAGE/data/.keep" "$PACKAGE/logs/.keep"
 
 tar -C "$ROOT/dist" -czf "$ARCHIVE" "$NAME"
 if command -v sha256sum >/dev/null 2>&1; then
-  sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+  (cd "$ROOT/dist" && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
 else
-  shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
+  (cd "$ROOT/dist" && shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
 fi
 
 echo "$ARCHIVE"
