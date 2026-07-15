@@ -2,10 +2,42 @@
 package mysql
 
 import (
+	"strings"
 	"testing"
 
 	collectdomain "gmha/internal/collect"
 )
+
+func TestApplyRuntimeParameters(t *testing.T) {
+	vars := ConfigVars{MaxConnections: 100, BufferPoolSize: "1G", BinlogFormat: "ROW", ReadOnly: 1}
+	err := ApplyRuntimeParameters(&vars, map[string]string{
+		"max_connections":         "250",
+		"innodb_buffer_pool_size": "4g",
+		"binlog_format":           "mixed",
+		"read_only":               "0",
+		"table_open_cache":        "", // empty keeps the calculated value
+	})
+	if err != nil {
+		t.Fatalf("apply runtime parameters: %v", err)
+	}
+	if vars.MaxConnections != 250 || vars.BufferPoolSize != "4G" || vars.BinlogFormat != "MIXED" || vars.ReadOnly != 0 {
+		t.Fatalf("unexpected overridden vars: %+v", vars)
+	}
+}
+
+func TestApplyRuntimeParametersRejectsUnsafeOrUnknownValues(t *testing.T) {
+	tests := []map[string]string{
+		{"unknown_parameter": "1"},
+		{"read_only": "2"},
+		{"innodb_buffer_pool_size": "four gigabytes"},
+		{"slow_query_log_file": "/data/slow.log\nmax_connections=9999"},
+	}
+	for _, parameters := range tests {
+		if err := ApplyRuntimeParameters(&ConfigVars{}, parameters); err == nil || !strings.Contains(err.Error(), "runtime parameter") {
+			t.Fatalf("expected runtime parameter validation error for %#v, got %v", parameters, err)
+		}
+	}
+}
 
 // TestCalculatorProdProfileGeneratesSafeReadableDefaults 测试生产环境配置档案的计算结果，验证缓冲池、Redo 日志、连接数等参数的正确性。
 func TestCalculatorProdProfileGeneratesSafeReadableDefaults(t *testing.T) {

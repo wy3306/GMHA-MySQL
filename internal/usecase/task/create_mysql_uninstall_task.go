@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -77,26 +78,7 @@ func (u *CreateMySQLUninstallTaskUsecase) Execute(ctx context.Context, req Creat
 	}
 	spec := defaultMySQLUninstallSpec(req.Port)
 	if ok {
-		spec = taskdomain.MySQLUninstallSpec{
-			Port:            instance.Port,
-			MySQLUser:       instance.MySQLUser,
-			InstanceDir:     instance.InstanceDir,
-			DataDir:         instance.DataDir,
-			BinlogDir:       instance.BinlogDir,
-			RedoDir:         instance.RedoDir,
-			UndoDir:         instance.UndoDir,
-			TmpDir:          instance.TmpDir,
-			BaseDir:         instance.BaseDir,
-			PackageName:     instance.PackageName,
-			SystemdUnitName: instance.SystemdUnit,
-			MyCnfPath:       instance.MyCnfPath,
-			SocketPath:      instance.SocketPath,
-			ExtraPaths: []string{
-				"/etc/profile.d/mysql.sh",
-				"/etc/security/limits.d/mysql.conf",
-				"/etc/sysctl.d/99-gmha-mysql.conf",
-			},
-		}
+		spec = mysqlUninstallSpecFromInstance(req.Port, instance)
 	}
 
 	specJSON, _ := json.Marshal(spec)
@@ -124,6 +106,63 @@ func (u *CreateMySQLUninstallTaskUsecase) Execute(ctx context.Context, req Creat
 		CreatedAt: now,
 	}}
 	return CreateMySQLUninstallTaskResult{Task: task, Steps: steps, Events: events}, nil
+}
+
+// mysqlUninstallSpecFromInstance 将可能来自“采纳已有实例”的不完整记录合并到
+// 安全默认值中。空字段不能覆盖默认值，否则 filepath.Clean("") 会变成 "."，
+// Agent 的路径保护会正确拒绝卸载。
+func mysqlUninstallSpecFromInstance(port int, instance mysqlapp.Instance) taskdomain.MySQLUninstallSpec {
+	spec := defaultMySQLUninstallSpec(port)
+	if instance.Port > 0 {
+		spec.Port = instance.Port
+	}
+	spec.MySQLUser = firstNonEmpty(instance.MySQLUser, spec.MySQLUser)
+	spec.DataDir = firstNonEmpty(instance.DataDir, spec.DataDir)
+	spec.BinlogDir = firstNonEmpty(instance.BinlogDir, spec.BinlogDir)
+	spec.RedoDir = firstNonEmpty(instance.RedoDir, spec.RedoDir)
+	spec.UndoDir = firstNonEmpty(instance.UndoDir, spec.UndoDir)
+	spec.TmpDir = firstNonEmpty(instance.TmpDir, spec.TmpDir)
+	spec.InstanceDir = firstNonEmpty(instance.InstanceDir, inferInstanceDir(spec), spec.InstanceDir)
+	spec.BaseDir = firstNonEmpty(instance.BaseDir, spec.BaseDir)
+	spec.PackageName = strings.TrimSpace(instance.PackageName)
+	spec.SystemdUnitName = firstNonEmpty(instance.SystemdUnit, spec.SystemdUnitName)
+	spec.MyCnfPath = firstNonEmpty(instance.MyCnfPath, filepath.Join(spec.InstanceDir, "my.cnf"))
+	spec.SocketPath = firstNonEmpty(instance.SocketPath, filepath.Join(spec.DataDir, "mysql.sock"))
+	return spec
+}
+
+func inferInstanceDir(spec taskdomain.MySQLUninstallSpec) string {
+	paths := []string{spec.DataDir, spec.BinlogDir, spec.RedoDir, spec.UndoDir, spec.TmpDir}
+	common := ""
+	for _, value := range paths {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		parent := filepath.Dir(filepath.Clean(value))
+		if common == "" {
+			common = parent
+			continue
+		}
+		if common != parent {
+			return ""
+		}
+	}
+	switch common {
+	case "", ".", "/", "/data", "/var", "/usr", "/usr/local", "/opt", "/home", "/tmp":
+		return ""
+	default:
+		return common
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // defaultMySQLUninstallSpec 根据端口号生成默认的 MySQL 卸载规格。

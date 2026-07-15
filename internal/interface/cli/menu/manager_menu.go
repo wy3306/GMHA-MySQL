@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"gmha/internal/app"
@@ -204,8 +205,23 @@ func (m *ManagerMenu) promptConfig(reader *bufio.Reader, cfg app.ManagerRuntimeC
 	if grpcPort, err = promptMenuWithDefault(reader, "Manager gRPC 端口", grpcPort); err != nil {
 		return cfg, err
 	}
-	if cfg.DBPath, err = promptMenuWithDefault(reader, "数据库路径", cfg.DBPath); err != nil {
+	previousDriver := cfg.DatabaseDriver
+	if cfg.DatabaseDriver, err = promptMenuWithDefault(reader, "数据库驱动 (sqlite/mysql/postgres)", cfg.DatabaseDriver); err != nil {
 		return cfg, err
+	}
+	if !strings.EqualFold(strings.TrimSpace(previousDriver), strings.TrimSpace(cfg.DatabaseDriver)) {
+		cfg.DatabaseDSN = ""
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.DatabaseDriver)) {
+	case "sqlite", "sqlite3":
+		cfg.DatabaseDSN = ""
+		if cfg.DBPath, err = promptMenuWithDefault(reader, "SQLite 数据库路径", cfg.DBPath); err != nil {
+			return cfg, err
+		}
+	default:
+		if cfg.DatabaseDSN, err = promptMenuWithDefault(reader, "数据库连接串", cfg.DatabaseDSN); err != nil {
+			return cfg, err
+		}
 	}
 	if cfg.AgentBinaryPath, err = promptMenuWithDefault(reader, "Agent 二进制路径", cfg.AgentBinaryPath); err != nil {
 		return cfg, err

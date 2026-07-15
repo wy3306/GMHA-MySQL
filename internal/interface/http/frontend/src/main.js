@@ -1,0 +1,2400 @@
+// 页面模板定义在本文件中，因此使用包含运行时模板编译器的 Vue 构建版本。
+import { computed, createApp, onMounted, onUnmounted, ref, watch } from 'vue/dist/vue.esm-bundler.js'
+import './style.css'
+import './manager.css'
+import './onboarding.css'
+import './flow-layout.css'
+import './enterprise-layout.css'
+import './cluster-overview.css'
+import './backup.css'
+import './architecture-run.css'
+import './architecture-process.css'
+import './architecture-topology.css'
+import './architecture-topology-risk.css'
+import './live-topology.css'
+import './machine-delete.css'
+import './machine-bulk.css'
+import InstanceManagement from './instance-management.js'
+import AlertManagement from './alert-management.js'
+import './instance-management.css'
+import './instance-management-extended.css'
+import './log-safety.css'
+import './alert-management.css'
+import './select-ui.css'
+
+const navGroups = [
+  { title: '工作台', icon: '▦', items: [{ id: 'overview', icon: '•', label: '运行概览' }] },
+  { title: '资源管理', icon: '▣', items: [
+    { id: 'machines', icon: '▣', label: '机器与凭证' },
+    { id: 'agents', icon: '◉', label: 'Agent 管理' }
+  ] },
+  { title: '集群运维', icon: '◇', items: [
+    { id: 'clusters', icon: '◇', label: '集群列表' },
+    { id: 'automation', icon: '⚙', label: '自动化任务' }
+  ] },
+  { title: '数据库管理', icon: '▤', items: [
+    { id: 'mysql', icon: '▤', label: 'MySQL 管理' },
+    { id: 'packages', icon: '⬒', label: '安装包管理' }
+  ] },
+  { title: '告警管理', icon: '!', items: [
+    { id: 'alerts', icon: '!', label: '告警中心' }
+  ] },
+  { title: '平台运维', icon: '✓', items: [
+    { id: 'tasks', icon: '✓', label: '任务中心' },
+    { id: 'manager', icon: '•', label: 'Manager 控制台' }
+  ] }
+]
+
+const api = async (path, options = {}) => {
+  const response = await fetch(`/api/v1${path}`, {
+    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+    ...options
+  })
+  const raw = await response.text()
+  let payload = {}
+  try { payload = raw ? JSON.parse(raw) : {} } catch (_) { payload = {} }
+  if (!response.ok) {
+    const detail = payload.error || raw.trim() || `HTTP ${response.status}`
+    const error = new Error(`请求失败（${response.status}）：${detail}`)
+    error.payload = payload
+    throw error
+  }
+  return payload
+}
+
+// List APIs historically returned both bare arrays and paged objects. Normalize
+// them at the UI boundary so an empty/null response cannot abort Vue rendering.
+const asList = (value, ...keys) => {
+  if (Array.isArray(value)) return value.filter(Boolean)
+  for (const key of keys) {
+    if (Array.isArray(value?.[key])) return value[key].filter(Boolean)
+  }
+  if (Array.isArray(value?.items)) return value.items.filter(Boolean)
+  return []
+}
+
+createApp({
+  components: { InstanceManagement, AlertManagement },
+  setup() {
+    const active = ref('overview')
+    const expandedNav = ref(Object.fromEntries(navGroups.map(group => [group.title, true])))
+    const loading = ref(false)
+    const error = ref('')
+    const notice = ref('')
+    const showOnboard = ref(false)
+    const showOnboardFlow = ref(false)
+    const showMachineDetail = ref(false)
+    const showMachineDelete = ref(false)
+    const machineDeleteForm = ref({ mode: 'cleanup', delete_mysql: false, delete_agent: true, confirmation: '' })
+    const machineDeleteSubmitting = ref(false)
+    const machineDeleteError = ref('')
+    const showCredential = ref(false)
+    const showAssign = ref(false)
+    const showQuickClusterAssign = ref(false)
+    const showAgentDetail = ref(false)
+    const showMySQLInstall = ref(false)
+    const showMySQLTask = ref(false)
+    const selectedTaskDetail = ref(null)
+    const selectedTaskStep = ref(null)
+    const taskDetailStack = ref([])
+    const taskReturnContext = ref(null)
+    const mysqlView = ref('overview')
+    const packageItems = ref([])
+    const packageSettings = ref({ categories: [], supported_architectures: [], catalog: [], bundles: [] })
+    const packageForm = ref({ category: 'mysql', arch: '未识别', file: null })
+    const packageKeyword = ref('')
+    const packageFetching = ref({})
+    const packageBundleID = ref('mysql-8.0.44-x86_64')
+    const packageBundleFetching = ref(false)
+    const selectedPackageBundle = computed(() => (packageSettings.value.bundles || []).find(item => item.id === packageBundleID.value) || (packageSettings.value.bundles || []).find(item => item.default) || null)
+    const taskFilter = ref('all')
+    const taskKeyword = ref('')
+    const taskTypeFilter = ref('all')
+    const taskPage = ref(1)
+    const taskPageSize = 50
+    const taskTotal = ref(0)
+    const recentTaskItems = ref([])
+    const showClusterEditor = ref(false)
+    const showClusterCleanup = ref(false)
+    const showClusterMembers = ref(false)
+    const mysqlTaskDetail = ref(null)
+    const clusterCleanupResult = ref(null)
+    const selectedClusterForMembers = ref(null)
+    const clusterCandidates = ref([])
+    const clusterCandidatePage = ref(1)
+    const clusterCandidateTotal = ref(0)
+    const selectedClusterMachineIDs = ref([])
+    const clusterMemberAssignResult = ref(null)
+    const clusterPage = ref(1)
+    const clusterTotal = ref(0)
+    const clusterKeyword = ref('')
+    const clusterPageItems = ref([])
+    const selectedClusterDetail = ref(null)
+    const clusterTopology = ref({ nodes: [], edges: [] })
+    const clusterTopologyError = ref('')
+    const clusterTopologyRefreshing = ref(false)
+    const clusterTopologyLastUpdated = ref('')
+    const clusterTopologyAutoRefresh = ref(true)
+    const clusterMachineItems = ref([])
+    const clusterMachineStaticInfo = ref({})
+    const clusterMachinePage = ref(1)
+    const clusterMachineTotal = ref(0)
+    const selectedClusterOperationMachineIDs = ref([])
+    const clusterMySQLDialog = ref(null)
+    const clusterMySQLForm = ref({ package_name: '', port: 3306, server_id_start: 1, mysql_user: 'mysql', root_password: '', profile: 'default' })
+    const clusterMySQLConfirm = ref('')
+    const automationSelectedClusters = ref([])
+    const automationForm = ref({ action: 'install', port: 3306, server_id_start: 1, mysql_user: 'root', mysql_password: '', root_password: '', profile: 'default', install_pt_tools: false, script: '', user_action: 'create', target_username: '', target_password: '', target_host: '%', privileges: ['SELECT'], parameter_name: '', parameter_value: '', apply_mode: 'dynamic', config_path: '/etc/my.cnf', systemd_unit: 'mysqld' })
+    const automationConfirm = ref('')
+    const automationRunning = ref(false)
+    const automationResults = ref([])
+    const backupPolicies = ref([])
+    const backupRuns = ref([])
+    const showBackupPolicyEditor = ref(false)
+    const backupPolicyForm = ref(newBackupPolicyForm())
+    const architectureForm = ref({ architecture: 'master_slave', primary_machine_id: '', move_vip: false, root_password: '', replication_user: 'repl', replication_password: '', nodes: [] })
+    const architectureCurrent = ref({ type: 'standalone', label: '独立实例', primary_machine_ids: [], nodes: [], edges: [] })
+    const architectureHasChanges = computed(() => architectureForm.value.move_vip || architectureForm.value.architecture !== architectureCurrent.value.type || (architectureCurrent.value.primary_machine_ids.length > 0 && !architectureCurrent.value.primary_machine_ids.includes(architectureForm.value.primary_machine_id)) || architectureForm.value.nodes.some(architectureNodeHasChanges))
+    const architecturePlan = ref(null)
+    const architectureRun = ref(null)
+    const architectureLinkSource = ref('')
+    const architectureSelectedNode = ref('')
+    const architectureRoleChangeDialog = ref(null)
+    const architectureDraggingNode = ref('')
+    const vipConfigs = ref([])
+    const vipForm = ref({ vip_name: '业务 VIP', vip_address: '', vip_prefix: 24, vip_route_mode: 'L2_ARP', default_interface: '', arping_count: 3, bgp_local_as: 65000, bgp_peer_as: 65001, bgp_peer_address: '', bgp_router_id: '', bgp_community: '' })
+    const architectureSubmitting = ref(false)
+    let architecturePollTimer = null
+    let clusterTopologyRefreshTimer = null
+    let managerStatusTimer = null
+    const data = ref({ manager: { running: false, config: {} }, machines: [], credentials: [], clusters: [], agents: [], agentTotal: 0, agentPage: 1, agentPageSize: 50, agentKeyword: '', agentStatus: 'all', agentCandidates: [], mysqlInstances: [], mysqlPackages: [], accountPresets: [], tasks: [], taskStats: { all: 0, running: 0, success: 0, failed: 0 }, recovery: [], clusterSection: 'overview', instanceView: 'overview' })
+    const machinePage = ref(1), credentialPage = ref(1), pageSize = 20, machineTotal = ref(0), credentialTotal = ref(0)
+    const machineKeyword = ref('')
+    const machineClusterFilter = ref('all')
+    const selectedMachineIDs = ref([])
+    const showBatchOnboard = ref(false)
+    const batchOnboardRows = ref([{ name: '', ip: '' }, { name: '', ip: '' }])
+    const batchOnboardShared = ref({ ssh_port: 22, ssh_user: 'root', ssh_password: '', credential_id: '', preserve_agent: true, preserve_mysql: true, concurrent: true, concurrency: 3 })
+    const batchOnboardRunning = ref(false)
+    const batchOnboardResults = ref([])
+    const showBulkDelete = ref(false)
+    const bulkDeleteForm = ref({ mode: 'cleanup', delete_mysql: true, delete_agent: true, concurrent: true, concurrency: 3, confirmation: '' })
+    const bulkDeleteRunning = ref(false)
+    const bulkDeleteResults = ref([])
+    const selectedMachine = ref(null)
+    const selectedAgent = ref(null)
+    const agentActionDialog = ref(null)
+    const agentActionInput = ref('')
+    const agentActionReturnToDetail = ref(false)
+    const selectedMachineErrorExpanded = ref(false)
+    const selectedMachineCluster = ref('')
+    const machineStaticInfo = ref(null)
+    const machineDynamicInfo = ref(null)
+    const machineInfoError = ref('')
+    const managerForm = ref({})
+    const form = ref({ name: '', ip: '', ssh_port: 22, ssh_user: 'root', ssh_password: '', credential_id: '', preserve_agent: true, preserve_mysql: true })
+    const credentialForm = ref({ name: '', ssh_user: 'root', type: 'password', ssh_password: '', private_key: '', passphrase: '' })
+    const mysqlRuntimeParameterGroups = [
+      { name: '连接、字符集与缓存', fields: [
+        { key: 'character_set_server', label: 'character_set_server', default: 'utf8mb4' }, { key: 'collation_server', label: 'collation_server', default: 'utf8mb4_0900_ai_ci' },
+        { key: 'skip_name_resolve', label: 'skip_name_resolve', default: '1', options: ['1','0'] }, { key: 'symbolic_links', label: 'symbolic_links', default: '0', options: ['0','1'] },
+        { key: 'autocommit', label: 'autocommit', default: '1', options: ['1','0'] }, { key: 'transaction_isolation', label: 'transaction_isolation', default: 'READ-COMMITTED', options: ['READ-COMMITTED','REPEATABLE-READ','READ-UNCOMMITTED','SERIALIZABLE'] },
+        { key: 'max_connections', label: 'max_connections', placeholder: '按机器内存与 Profile 自动计算' }, { key: 'max_connect_errors', label: 'max_connect_errors', default: '1000' }, { key: 'max_allowed_packet', label: 'max_allowed_packet', default: '64M' },
+        { key: 'interactive_timeout', label: 'interactive_timeout', default: '1800' }, { key: 'wait_timeout', label: 'wait_timeout', default: '1800' }, { key: 'lock_wait_timeout', label: 'lock_wait_timeout', default: '1800' },
+        { key: 'table_open_cache', label: 'table_open_cache', placeholder: '由 Profile 自动计算' }, { key: 'thread_cache_size', label: 'thread_cache_size', placeholder: '由 Profile 自动计算' }
+      ]},
+      { name: '慢查询与日志', fields: [
+        { key: 'log_timestamps', label: 'log_timestamps', default: 'SYSTEM', options: ['SYSTEM','UTC'] }, { key: 'slow_query_log', label: 'slow_query_log', default: '1', options: ['1','0'] },
+        { key: 'slow_query_log_file', label: 'slow_query_log_file', placeholder: '数据目录/slow.log' }, { key: 'long_query_time', label: 'long_query_time', default: '2' }, { key: 'min_examined_row_limit', label: 'min_examined_row_limit', default: '100' },
+        { key: 'log_slow_admin_statements', label: 'log_slow_admin_statements', default: '1', options: ['1','0'] }, { key: 'log_slow_replica_statements', label: 'log_slow_replica_statements', default: '1', options: ['1','0'] }, { key: 'log_throttle_queries_not_using_indexes', label: '无索引日志限流', default: '10' }
+      ]},
+      { name: 'Binlog、GTID 与只读', fields: [
+        { key: 'binlog_format', label: 'binlog_format', default: 'ROW', options: ['ROW','MIXED','STATEMENT'] }, { key: 'sync_binlog', label: 'sync_binlog', default: '1' }, { key: 'binlog_expire_logs_seconds', label: 'binlog 保留秒数', default: '604800' },
+        { key: 'binlog_rows_query_log_events', label: 'binlog_rows_query_log_events', default: '1', options: ['1','0'] }, { key: 'log_replica_updates', label: 'log_replica_updates', default: '1', options: ['1','0'] },
+        { key: 'gtid_mode', label: 'gtid_mode', default: 'ON', options: ['ON','OFF','ON_PERMISSIVE','OFF_PERMISSIVE'] }, { key: 'enforce_gtid_consistency', label: 'enforce_gtid_consistency', default: 'ON', options: ['ON','WARN','OFF'] },
+        { key: 'relay_log_recovery', label: 'relay_log_recovery', default: '1', options: ['1','0'] }, { key: 'read_only', label: 'read_only', default: '1', options: ['1','0'] }, { key: 'super_read_only', label: 'super_read_only', default: '1', options: ['1','0'] }
+      ]},
+      { name: 'InnoDB', fields: [
+        { key: 'default_storage_engine', label: 'default_storage_engine', default: 'InnoDB', options: ['InnoDB','MyISAM'] }, { key: 'innodb_data_file_path', label: 'innodb_data_file_path', default: 'ibdata1:128M:autoextend' }, { key: 'innodb_temp_data_file_path', label: 'innodb_temp_data_file_path', default: 'ibtmp1:128M:autoextend:max:30720M' },
+        { key: 'innodb_buffer_pool_size', label: 'innodb_buffer_pool_size', placeholder: '按机器内存与 Profile 自动计算' }, { key: 'innodb_buffer_pool_instances', label: 'buffer_pool_instances', placeholder: '按 Buffer Pool 自动计算' }, { key: 'innodb_redo_log_capacity', label: 'innodb_redo_log_capacity', placeholder: '按 Buffer Pool 自动计算' },
+        { key: 'innodb_flush_log_at_trx_commit', label: 'flush_log_at_trx_commit', default: '1', options: ['1','2','0'] }, { key: 'innodb_lock_wait_timeout', label: 'innodb_lock_wait_timeout', default: '600' }, { key: 'innodb_file_per_table', label: 'innodb_file_per_table', default: '1', options: ['1','0'] },
+        { key: 'innodb_flush_method', label: 'innodb_flush_method', default: 'O_DIRECT', options: ['O_DIRECT','O_DIRECT_NO_FSYNC','FSYNC','O_DSYNC'] }, { key: 'innodb_log_buffer_size', label: 'innodb_log_buffer_size', default: '16M' }, { key: 'innodb_read_io_threads', label: 'innodb_read_io_threads', default: '8' }, { key: 'innodb_write_io_threads', label: 'innodb_write_io_threads', default: '8' }
+      ]},
+      { name: '会话缓冲与系统限制', fields: [
+        { key: 'key_buffer_size', label: 'key_buffer_size', default: '32M' }, { key: 'myisam_sort_buffer_size', label: 'myisam_sort_buffer_size', default: '64M' },
+        { key: 'sort_buffer_size', label: 'sort_buffer_size', placeholder: '由 Profile 自动计算' }, { key: 'read_buffer_size', label: 'read_buffer_size', placeholder: '由 Profile 自动计算' }, { key: 'read_rnd_buffer_size', label: 'read_rnd_buffer_size', placeholder: '由 Profile 自动计算' }, { key: 'join_buffer_size', label: 'join_buffer_size', placeholder: '由 Profile 自动计算' },
+        { key: 'open_files_limit', label: 'open_files_limit', placeholder: '由 Profile 自动计算' }, { key: 'limit_nproc', label: 'systemd LimitNPROC', default: '65536' }, { key: 'sysctl_swappiness', label: 'vm.swappiness', placeholder: '由 Profile 自动计算' }
+      ]}
+    ]
+    // Empty means no override: the backend keeps the value calculated from the
+    // target machine resources and selected Profile. Defaults are display-only.
+    const mysqlRuntimeParameters = Object.fromEntries(mysqlRuntimeParameterGroups.flatMap(group => group.fields).map(field => [field.key, '']))
+    const mysqlInstallForm = ref({ machine: '', version: '', architecture: '', port: 3306, server_id: 1, mysql_user: 'mysql', root_password: '', profile: 'default', package_name: '', instance_dir: '', data_dir: '', binlog_dir: '', redo_dir: '', undo_dir: '', tmp_dir: '', base_dir: '/usr/local/mysql', my_cnf_path: '', socket_path: '', error_log: '', pid_file: '', character_sets_dir: '', plugin_dir: '', install_pt_tools: false, runtime_parameters: mysqlRuntimeParameters, _runtime_parameter_groups: mysqlRuntimeParameterGroups, accounts: [{ role: 'monitor', username: '', password: '', host: '', enabled: true, extended_backup: false, privileges: [] }, { role: 'mha', username: '', password: '', host: '', enabled: true, extended_backup: false, privileges: [] }, { role: 'backup', username: '', password: '', host: '', enabled: true, extended_backup: false, privileges: [] }] })
+    const normalizeMySQLArchitecture = architecture => {
+      const arch = String(architecture || '').toLowerCase()
+      if (['amd64', 'x64', 'x86-64', 'x86_64'].includes(arch)) return 'x86_64'
+      if (['arm64', 'armv8', 'aarch64'].includes(arch)) return 'aarch64'
+      return arch
+    }
+    const mysqlInstallArchitectures = computed(() => [...new Set((data.value.mysqlPackages || []).map(pkg => normalizeMySQLArchitecture(pkg.arch || pkg.Arch)).filter(Boolean))])
+    const mysqlInstallVersions = computed(() => [...new Map((data.value.mysqlPackages || [])
+      .filter(pkg => !mysqlInstallForm.value.architecture || normalizeMySQLArchitecture(pkg.arch || pkg.Arch) === normalizeMySQLArchitecture(mysqlInstallForm.value.architecture))
+      .map(pkg => [pkg.version || pkg.Version, pkg])).values()])
+    const selectedMySQLInstallPackage = computed(() => (data.value.mysqlPackages || []).find(pkg =>
+      (!mysqlInstallForm.value.version || (pkg.version || pkg.Version) === mysqlInstallForm.value.version) &&
+      (!mysqlInstallForm.value.architecture || normalizeMySQLArchitecture(pkg.arch || pkg.Arch) === normalizeMySQLArchitecture(mysqlInstallForm.value.architecture))) || null)
+    const mysqlVersionParameterGroups = computed(() => selectedMySQLInstallPackage.value?.runtime_parameter_groups || [])
+    const mysqlInstallParameterGroups = computed(() => [...mysqlRuntimeParameterGroups, ...mysqlVersionParameterGroups.value])
+    Object.defineProperties(mysqlInstallForm.value, {
+      _selected_package: { enumerable: false, get: () => selectedMySQLInstallPackage.value },
+      _version_parameter_groups: { enumerable: false, get: () => mysqlVersionParameterGroups.value },
+      _parameter_groups: { enumerable: false, get: () => mysqlInstallParameterGroups.value }
+    })
+    function mysqlInstallMachineChanged() {
+      const machine = data.value.machines.find(item => (item.IP || item.ip) === mysqlInstallForm.value.machine)
+      mysqlInstallForm.value.architecture = normalizeMySQLArchitecture(machine?.Architecture || machine?.architecture || machine?.Arch || machine?.arch) || mysqlInstallForm.value.architecture || mysqlInstallArchitectures.value[0] || ''
+      mysqlInstallArchitectureChanged()
+    }
+    function mysqlInstallArchitectureChanged() {
+      if (!mysqlInstallVersions.value.some(pkg => (pkg.version || pkg.Version) === mysqlInstallForm.value.version)) mysqlInstallForm.value.version = mysqlInstallVersions.value[0]?.version || ''
+      mysqlInstallForm.value.package_name = ''
+    }
+    const clusterForm = ref({ old_name: '', name: '', description: '' })
+    const selectedCredential = ref('')
+    const assignedMachineIDs = ref([])
+    const onboardingFlow = ref([])
+    const onboardingResult = ref(null)
+    const onboardingDetected = ref({ agent: false, mysql: false })
+    const canSkipPrecheck = ref(false)
+    const expandedFlowErrors = ref({})
+    const mysqlPrivilegeOptions = [
+      'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'SHOW VIEW', 'TRIGGER', 'EVENT',
+      'PROCESS', 'RELOAD', 'LOCK TABLES', 'REPLICATION CLIENT', 'REPLICATION SLAVE', 'CONNECTION_ADMIN', 'BACKUP_ADMIN', 'CLONE_ADMIN'
+    ]
+
+    function newBackupPolicyForm() {
+      const start = new Date(Date.now() + 3600000); start.setSeconds(0, 0)
+      return { id: '', name: '', machine_id: '', port: 3306, backup_type: 'full', weekday_backup_types: {'0':'full','1':'incremental','2':'incremental','3':'incremental','4':'incremental','5':'full','6':'full'}, disk_usage_threshold: 95, schedule_type: 'weekly', weekdays: [1,2,3,4,5], interval_minutes: 1440, start_at: start.toISOString().slice(0,16), retry_count: 5, retry_interval_seconds: 60, include_binlog: true, backup_location: '/data/gmha/backups', mysql_user: 'backup', mysql_password: '', enabled: true }
+    }
+
+    const current = computed(() => navGroups.flatMap(group => group.items).find(item => item.id === active.value))
+    function toggleNavGroup(title) { expandedNav.value[title] = !expandedNav.value[title] }
+    function chooseNavigation(id) {
+      if (selectedClusterDetail.value) closeClusterDetail()
+      if (selectedTaskDetail.value) clearTaskDetail()
+      active.value = id
+      error.value = ''
+    }
+    const metrics = computed(() => {
+      const agents = asList(data.value.agents)
+      const tasks = asList(data.value.tasks)
+      return [
+        { label: '已纳管机器', value: data.value.machines.length, hint: '资源池中的服务器', tone: 'blue' },
+        { label: '在线 Agent', value: agents.filter(item => String(item.State || item.state).toLowerCase() === 'online').length, hint: `共 ${agents.length} 个 Agent`, tone: 'green' },
+        { label: '运行中任务', value: Number(data.value.taskStats?.running || 0), hint: `全部 ${Number(data.value.taskStats?.all || tasks.length)} 个任务`, tone: 'amber' },
+        { label: '异常需关注', value: agents.filter(item => ['offline', 'error', 'degraded'].includes(String(item.State || item.state).toLowerCase())).length, hint: 'Agent 离线或安装失败', tone: 'red' }
+      ]
+    })
+    const unifiedTasks = computed(() => asList(data.value.tasks, 'tasks'))
+    const recentTasks = computed(() => recentTaskItems.value)
+    const filteredTasks = computed(() => unifiedTasks.value.filter(item => {
+      const status = String(item.Status || item.status || '').toLowerCase()
+      const statusMatch = taskFilter.value === 'all' ||
+        (taskFilter.value === 'running' && ['pending', 'sent', 'running'].includes(status)) ||
+        (taskFilter.value === 'success' && ['success', 'completed', 'succeeded'].includes(status)) ||
+        (taskFilter.value === 'failed' && ['failed', 'error', 'suppressed'].includes(status))
+      const typeMatch = taskTypeFilter.value === 'all' || String(item.Type || item.type || '').toLowerCase() === taskTypeFilter.value
+      const keyword = taskKeyword.value.toLowerCase()
+      const text = [item.ID, item.id, item.Type, item.type, taskTitle(item), item.MachineID, item.machine_id, item.Target, item.target].filter(Boolean).join(' ').toLowerCase()
+      return statusMatch && typeMatch && (!keyword || text.includes(keyword))
+    }))
+    function taskListPath() {
+      const query = new URLSearchParams({ page: String(taskPage.value), page_size: String(taskPageSize) })
+      if (taskFilter.value !== 'all') query.set('status', taskFilter.value)
+      if (taskTypeFilter.value !== 'all') query.set('type', taskTypeFilter.value)
+      if (taskKeyword.value.trim()) query.set('keyword', taskKeyword.value.trim())
+      return `/tasks?${query}`
+    }
+    async function loadTaskPage() {
+      try {
+        const result = await api(taskListPath())
+        data.value.tasks = asList(result, 'tasks')
+        taskTotal.value = Number(result?.total || data.value.tasks.length)
+      } catch (err) { error.value = err.message }
+    }
+    async function changeTaskPage(delta) {
+      const next = taskPage.value + delta
+      if (next < 1 || (next - 1) * taskPageSize >= taskTotal.value) return
+      taskPage.value = next
+      await loadTaskPage()
+    }
+    function canDeleteTask(item) {
+      return ['success', 'completed', 'succeeded', 'failed', 'error'].includes(state(item?.Status || item?.status))
+    }
+    async function deleteTaskRecord(item) {
+      const id = item?.ID || item?.id
+      if (!id) return
+      if (!canDeleteTask(item)) { error.value = '仅允许删除已成功或已失败的任务记录。'; return }
+      if (!confirm(`确认删除任务记录 ${id}？\n任务步骤和完整日志将同时删除，此操作不可恢复。`)) return
+      try {
+        await api(`/tasks?id=${encodeURIComponent(id)}`, { method: 'DELETE' })
+        if ((taskObject()?.ID || taskObject()?.id) === id) clearTaskDetail()
+        if (taskPage.value > 1 && data.value.tasks.length <= 1) taskPage.value -= 1
+        notice.value = `任务记录 ${id} 已删除。`
+        await refresh()
+      } catch (err) { error.value = err.message }
+    }
+    const selectedTaskEvents = computed(() => {
+      const events = asList(selectedTaskDetail.value?.events ?? selectedTaskDetail.value?.Events)
+      const stepID = selectedTaskStep.value?.ID || selectedTaskStep.value?.id
+      if (!stepID) return events
+      const matched = events.filter(event => (event.StepID || event.step_id) === stepID)
+      return matched.length ? matched : []
+    })
+    let taskRefreshTimer = null
+
+    function taskObject(detail = selectedTaskDetail.value) { return detail?.task || detail?.Task || null }
+    function taskSteps(detail = selectedTaskDetail.value) { return asList(detail?.steps ?? detail?.Steps) }
+    function taskEvents(detail = selectedTaskDetail.value) { return asList(detail?.events ?? detail?.Events) }
+    function taskTypeLabel(value) { return ({ exec: '远程命令执行', collect_machine_info: '采集机器信息', collect_static_info: '采集静态信息', mysql_install: '安装 MySQL', mysql_uninstall: '卸载 MySQL', mysql_topology: '配置 MySQL 拓扑', mysql_upgrade: '升级 MySQL', architecture_adjustment: '集群架构切换', agent_recovery: 'Agent 恢复', platform_operation: '平台操作' })[String(value || '').toLowerCase()] || value || '任务详情' }
+    function taskSpec(item = taskObject()) {
+      const raw = item?.SpecJSON || item?.spec_json
+      if (!raw) return {}
+      if (typeof raw === 'object') return raw
+      try { return JSON.parse(raw) || {} } catch (_) { return {} }
+    }
+    function relatedTaskIDs(item = taskObject()) { return asList(taskSpec(item).related_task_ids) }
+    function taskTitle(item) {
+      const type = String(item?.Type || item?.type || '').toLowerCase()
+      const rawSpec = item?.SpecJSON || item?.spec_json
+      let spec = {}
+      try { spec = typeof rawSpec === 'string' ? JSON.parse(rawSpec) : (rawSpec || {}) } catch (_) { spec = {} }
+      const port = spec.port ? ` · ${spec.port} 端口` : ''
+      return ({
+        exec: spec.display_name || '执行远程命令',
+        collect_machine_info: '采集机器运行信息',
+        collect_static_info: '采集机器静态资产',
+        mysql_install: `部署 MySQL${port}`,
+        mysql_uninstall: `卸载 MySQL${port}`,
+        mysql_topology: '采集 MySQL 拓扑',
+        architecture_adjustment: '执行集群架构切换',
+        platform_operation: spec.display_name || '平台操作'
+      })[type] || taskTypeLabel(type)
+    }
+    function taskStatusLabel(value) { return ({ pending: '等待执行', confirming: '确认状态', executing: '正在拉起', waiting_heartbeat: '等待心跳', sent: '已下发', running: '执行中', success: '执行成功', completed: '执行成功', succeeded: '恢复成功', failed: '执行失败', error: '执行失败', suppressed: '自动恢复已抑制' })[state(value)] || value || '未知' }
+    function stepStatusLabel(value) { return ({ pending: '等待', running: '执行中', success: '成功', completed: '成功', failed: '失败', error: '失败' })[state(value)] || value || '未知' }
+    function elapsed(start, end) {
+      if (!start) return '—'
+      const milliseconds = Math.max(0, new Date(end || Date.now()).getTime() - new Date(start).getTime())
+      const seconds = milliseconds / 1000
+      if (seconds < 1) return `${Math.round(milliseconds)}ms`
+      if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 2 : 1)}秒`
+      const minutes = Math.floor(seconds / 60); const remain = Math.round(seconds % 60)
+      return `${minutes}分${remain}秒`
+    }
+    function safeLog(value) {
+      return String(value || '').replace(/((?:root_)?password["']?\s*[:=]\s*)[^\s,;}]+/gi, '$1******').replace(/(-p)([^\s]+)/g, '$1******')
+    }
+    function chooseTaskStep(step) {
+      const name = step?.StepName || step?.step_name
+      const relatedID = step?.Message || step?.message
+      if (name === '关联执行任务' && String(relatedID || '').trim()) {
+        taskDetailStack.value.push({ detail: selectedTaskDetail.value, step: selectedTaskStep.value, context: taskReturnContext.value })
+        openTaskDetail({ id: relatedID, _related: true })
+        return
+      }
+      selectedTaskStep.value = step
+    }
+    function selectCurrentTaskStep() {
+      const task = taskObject(); const steps = taskSteps()
+      selectedTaskStep.value = steps.find(step => state(step.Status || step.status) === 'running') || steps.find(step => (step.StepName || step.step_name) === (task?.CurrentStep || task?.current_step)) || steps.find(step => ['failed', 'error'].includes(state(step.Status || step.status))) || steps[steps.length - 1] || null
+    }
+    function stopTaskPolling() { if (taskRefreshTimer) { clearInterval(taskRefreshTimer); taskRefreshTimer = null } }
+    function startTaskPolling() {
+      stopTaskPolling()
+      if (['pending', 'sent', 'running', 'confirming', 'executing', 'waiting_heartbeat'].includes(state(taskObject()?.Status || taskObject()?.status))) taskRefreshTimer = setInterval(() => refreshSelectedTaskDetail(true), 3000)
+    }
+    function applyTaskDetail(detail, preserveStep = false) {
+      const previousID = preserveStep ? (selectedTaskStep.value?.ID || selectedTaskStep.value?.id) : ''
+      selectedTaskDetail.value = detail
+      const steps = taskSteps(detail)
+      selectedTaskStep.value = steps.find(step => (step.ID || step.id) === previousID) || steps.find(step => state(step.Status || step.status) === 'running') || steps.find(step => ['failed', 'error'].includes(state(step.Status || step.status))) || steps[0] || null
+      startTaskPolling()
+    }
+    function currentTaskReturnContext(item) {
+      if (selectedTaskDetail.value && taskReturnContext.value) return { ...taskReturnContext.value }
+      const hinted = item?._taskOrigin || item?.task_origin || {}
+      return {
+        active: hinted.active || active.value,
+        clusterSection: hinted.clusterSection || hinted.cluster_section || data.value.clusterSection,
+        instanceView: hinted.instanceView || hinted.instance_view || data.value.instanceView,
+        mysqlView: hinted.mysqlView || hinted.mysql_view || mysqlView.value
+      }
+    }
+    function showTaskDetail(detail, context) {
+      taskReturnContext.value = context
+      applyTaskDetail(detail)
+      active.value = 'tasks'
+    }
+    function recoveryTaskDetail(item) {
+      const status = state(item?.status || item?.Status)
+      const active = ['pending', 'sent', 'running', 'confirming', 'executing', 'waiting_heartbeat'].includes(status)
+      const completed = status === 'succeeded'
+      const failed = ['failed', 'error', 'suppressed'].includes(status)
+      const stepStatus = (done) => completed ? 'success' : failed ? 'failed' : done ? 'success' : active ? 'running' : 'pending'
+      const task = { ...item, Type: 'agent_recovery', Status: status, ProgressPercent: completed || failed ? 100 : 50, StartedAt: item?.created_at || item?.CreatedAt, FinishedAt: completed || failed ? (item?.updated_at || item?.UpdatedAt) : '' }
+      const steps = [
+        { id: `${task.id || task.ID}-request`, step_name: 'manual_recovery_request', status: 'success', message: '已接受手动拉起请求', started_at: task.StartedAt, finished_at: task.StartedAt },
+        { id: `${task.id || task.ID}-start`, step_name: 'start_agent', status: stepStatus(completed || failed), message: failed ? 'Agent 拉起未完成' : completed ? 'Agent 服务已拉起' : '正在通过 SSH 拉起 Agent 服务', started_at: task.StartedAt, finished_at: task.FinishedAt },
+        { id: `${task.id || task.ID}-heartbeat`, step_name: 'wait_heartbeat', status: stepStatus(completed), message: failed ? (item?.last_error || item?.LastError || '等待 Agent 心跳超时') : completed ? '已收到 Agent 心跳，恢复完成' : '等待 Agent 心跳回连', started_at: task.StartedAt, finished_at: task.FinishedAt }
+      ]
+      const error = item?.last_error || item?.LastError
+      return { task, steps, events: error ? [{ id: `${task.id || task.ID}-error`, event_type: 'error', content: error, created_at: task.FinishedAt || task.StartedAt }] : [], machine_ip: item?.machine_ip || item?.MachineIP }
+    }
+    async function openTaskDetail(item) {
+      const embeddedTask = item?.task || item?.Task
+      const id = embeddedTask?.ID || embeddedTask?.id || item?.ID || item?.id
+      if (!id) return
+      error.value = ''
+      const context = currentTaskReturnContext(item)
+      if (item?.recovery_task || String(item?.type || item?.Type).toLowerCase() === 'agent_recovery') { showTaskDetail(recoveryTaskDetail(item), context); return }
+      if (embeddedTask && (Array.isArray(item?.steps) || Array.isArray(item?.Steps))) { showTaskDetail(item, context); return }
+      try { showTaskDetail(await api(`/tasks?id=${encodeURIComponent(id)}`), context) } catch (err) { if (item?._related) taskDetailStack.value.pop(); error.value = err.message }
+    }
+    async function refreshSelectedTaskDetail(silent = false) {
+      const id = taskObject()?.ID || taskObject()?.id
+      if (!id) return
+      try {
+        if (String(taskObject()?.Type || taskObject()?.type).toLowerCase() === 'agent_recovery') {
+          const tasks = asList(await api('/agents/recovery-tasks'), 'tasks')
+          const task = tasks.find(entry => (entry.id || entry.ID) === id)
+          if (task) applyTaskDetail(recoveryTaskDetail({ ...task, recovery_task: true }), true)
+          return
+        }
+        applyTaskDetail(await api(`/tasks?id=${encodeURIComponent(id)}`), true)
+      } catch (err) { if (!silent) error.value = err.message }
+    }
+    function clearTaskDetail() {
+      stopTaskPolling()
+      selectedTaskDetail.value = null
+      selectedTaskStep.value = null
+      taskReturnContext.value = null
+      taskDetailStack.value = []
+    }
+    function closeTaskDetail() {
+      if (taskDetailStack.value.length) {
+        const parent = taskDetailStack.value.pop()
+        taskReturnContext.value = parent.context
+        selectedTaskDetail.value = parent.detail
+        selectedTaskStep.value = parent.step
+        startTaskPolling()
+        return
+      }
+      const context = taskReturnContext.value
+      clearTaskDetail()
+      if (!context) return
+      if (context.clusterSection) data.value.clusterSection = context.clusterSection
+      if (context.instanceView) data.value.instanceView = context.instanceView
+      if (context.mysqlView) mysqlView.value = context.mysqlView
+      active.value = context.active || 'tasks'
+    }
+
+    async function refresh() {
+      loading.value = true; error.value = ''
+      try {
+        const [manager, machines, credentials, clusters, agents, agentCandidates, mysqlInstances, mysqlPackages, accountPresets, tasks, taskStats, recentTaskResponse, recovery, packages] = await Promise.all([
+          api('/manager/status').catch(err => ({ ...data.value.manager, running: false, unreachable: true, last_error: err.message, last_checked_at: new Date().toISOString() })), api(`/machines?page=${machinePage.value}&page_size=${pageSize}&keyword=${encodeURIComponent(machineKeyword.value)}&cluster=${encodeURIComponent(machineClusterFilter.value)}`), api(`/ssh-credentials?page=${credentialPage.value}&page_size=${pageSize}`), api('/clusters'), api(`/agents?page=${data.value.agentPage}&page_size=${data.value.agentPageSize}&keyword=${encodeURIComponent(data.value.agentKeyword)}&status=${encodeURIComponent(data.value.agentStatus)}`), api('/agents?pending=true'), api('/mysql/instances'), api('/mysql/packages'), api('/mysql/account-presets'), api(taskListPath()), api('/tasks?stats=true'), api('/tasks?limit=6'), api('/agents/recovery-tasks').catch(() => []), api('/packages').catch(() => ({ items: [], settings: {} }))
+        ])
+        machineTotal.value = machines.total || 0; credentialTotal.value = credentials.total || 0
+        const agentItems = asList(agents, 'agents')
+        taskTotal.value = Number(tasks?.total || asList(tasks, 'tasks').length)
+        recentTaskItems.value = asList(recentTaskResponse, 'tasks')
+        data.value = { ...data.value, manager: manager || { running: false, config: {} }, machines: asList(machines), credentials: asList(credentials), clusters: asList(clusters, 'clusters'), agents: agentItems, agentTotal: agents?.total || agentItems.length, agentCandidates: asList(agentCandidates, 'agents'), mysqlInstances: asList(mysqlInstances, 'instances'), mysqlPackages: asList(mysqlPackages, 'packages'), accountPresets: asList(accountPresets, 'presets'), tasks: asList(tasks, 'tasks'), taskStats: taskStats || data.value.taskStats, recovery: asList(recovery, 'tasks'), packageItems: asList(packages), packageSettings: packages?.settings || {} }
+        packageItems.value = packages.items || []
+        packageSettings.value = packages.settings || { categories: [], supported_architectures: [] }
+        managerForm.value = { ...(manager?.config || {}) }
+        await loadClusterPage()
+      } catch (err) { error.value = err.message }
+      finally { loading.value = false }
+    }
+    async function refreshManagerStatus() {
+      try {
+        const status = await api('/manager/status')
+        data.value.manager = { ...status, unreachable: false, last_error: '', last_checked_at: new Date().toISOString() }
+      } catch (err) {
+        data.value.manager = { ...data.value.manager, running: false, unreachable: true, last_error: err.message, last_checked_at: new Date().toISOString() }
+      }
+    }
+    async function searchMachines() {
+      machinePage.value = 1
+      selectedMachineIDs.value = []
+      await refresh()
+    }
+    function toggleCurrentMachinePage() {
+      const ids = data.value.machines.map(item => item.ID || item.id)
+      const allSelected = ids.length && ids.every(id => selectedMachineIDs.value.includes(id))
+      selectedMachineIDs.value = allSelected
+        ? selectedMachineIDs.value.filter(id => !ids.includes(id))
+        : [...new Set([...selectedMachineIDs.value, ...ids])]
+    }
+    async function changeMachinePage(delta) {
+      const next = machinePage.value + delta
+      if (next < 1 || (next - 1) * pageSize >= machineTotal.value) return
+      machinePage.value = next
+      await refresh()
+    }
+    function openBatchOnboard() {
+      batchOnboardRows.value = [{ name: '', ip: '' }, { name: '', ip: '' }]
+      batchOnboardShared.value = { ssh_port: 22, ssh_user: 'root', ssh_password: '', credential_id: '', preserve_agent: true, preserve_mysql: true, concurrent: true, concurrency: 3 }
+      batchOnboardResults.value = []
+      showBatchOnboard.value = true
+    }
+    function addBatchOnboardRow() { batchOnboardRows.value.push({ name: '', ip: '' }) }
+    function removeBatchOnboardRow(index) { if (batchOnboardRows.value.length > 1) batchOnboardRows.value.splice(index, 1) }
+    function batchOnboardCredentialChanged() {
+      const credential = data.value.credentials.find(item => (item.id || item.ID) === batchOnboardShared.value.credential_id)
+      if (credential) batchOnboardShared.value.ssh_user = credential.ssh_user || credential.SSHUser || 'root'
+    }
+    function updateBulkResult(target, index, patch) {
+      target.value[index] = { ...target.value[index], ...patch }
+    }
+    function updateBulkStep(target, index, key, state, detail = '') {
+      const item = target.value[index]
+      updateBulkResult(target, index, { steps: item.steps.map(step => step.key === key ? { ...step, state, detail: detail || step.detail } : step) })
+    }
+    async function runWithConcurrency(items, concurrency, worker) {
+      let cursor = 0
+      const count = Math.max(1, Math.min(Number(concurrency) || 1, items.length))
+      await Promise.all(Array.from({ length: count }, async () => {
+        while (cursor < items.length) {
+          const index = cursor++
+          await worker(items[index], index)
+        }
+      }))
+    }
+    function onboardResultSteps() {
+      return [
+        { key: 'precheck', title: 'SSH 与环境预检查', state: 'pending', detail: '检查连接、systemd、磁盘和已有组件' },
+        { key: 'register', title: '登记机器与建立互信', state: 'pending', detail: '写入平台记录并建立 SSH 管理通道' },
+        { key: 'agent', title: '部署或接管 Agent', state: 'pending', detail: '部署新 Agent，或保留并重新登记已有 Agent' },
+        { key: 'finish', title: '完成纳管', state: 'pending', detail: '同步机器、Agent 与 MySQL 记录' }
+      ]
+    }
+    async function submitBatchOnboard() {
+      const rows = batchOnboardRows.value.map(item => ({ name: item.name.trim(), ip: item.ip.trim() })).filter(item => item.name || item.ip)
+      if (!rows.length || rows.some(item => !item.name || !item.ip)) { error.value = '请完整填写每台机器的名称和 IP。'; return }
+      batchOnboardRunning.value = true; error.value = ''; notice.value = ''
+      batchOnboardResults.value = rows.map(item => ({ ...item, status: 'pending', message: '等待调度', steps: onboardResultSteps() }))
+      const shared = batchOnboardShared.value
+      const concurrency = shared.concurrent ? Math.min(10, Math.max(2, Number(shared.concurrency) || 3)) : 1
+      await runWithConcurrency(rows, concurrency, async (row, index) => {
+        const { concurrent, concurrency: ignoredConcurrency, ...connection } = shared
+        const payload = { ...connection, name: row.name, ip: row.ip }
+        updateBulkResult(batchOnboardResults, index, { status: 'running', message: '正在执行 SSH 与环境预检查' })
+        updateBulkStep(batchOnboardResults, index, 'precheck', 'running')
+        try {
+          const precheck = await api('/machines/precheck', { method: 'POST', body: JSON.stringify(payload) })
+          const componentRisk = precheck.agent_detected || precheck.mysql_detected
+          if (precheck.warning) throw new Error(precheck.warning)
+          const preservationReady = (!precheck.agent_detected || shared.preserve_agent) && (!precheck.mysql_detected || shared.preserve_mysql)
+          if (componentRisk && !preservationReady) throw new Error('检测到已有组件；请选择保留已有 Agent/MySQL，或先执行清理。')
+          updateBulkStep(batchOnboardResults, index, 'precheck', 'success', componentRisk ? '检查通过，检测到已有组件并将按选择保留' : 'SSH、systemd、磁盘与组件检查通过')
+          updateBulkStep(batchOnboardResults, index, 'register', 'running')
+          updateBulkResult(batchOnboardResults, index, { message: '正在登记机器并建立 SSH 管理通道' })
+          const result = await api('/machines', { method: 'POST', body: JSON.stringify(payload) })
+          updateBulkStep(batchOnboardResults, index, 'register', 'success')
+          updateBulkStep(batchOnboardResults, index, 'agent', 'running')
+          updateBulkResult(batchOnboardResults, index, { message: precheck.agent_detected ? '正在接管已有 Agent' : '正在部署 Agent' })
+          if (!precheck.agent_detected) await api('/agents/retry-install', { method: 'POST', body: JSON.stringify({ ip: result.ip || result.IP || row.ip, ssh_user: shared.ssh_user, ssh_password: shared.ssh_password }) })
+          updateBulkStep(batchOnboardResults, index, 'agent', 'success', precheck.agent_detected ? '已有 Agent 已保留并重新登记' : 'Agent 已安装、配置并启动')
+          updateBulkStep(batchOnboardResults, index, 'finish', 'success')
+          updateBulkResult(batchOnboardResults, index, { status: 'success', message: precheck.agent_detected ? '重新纳管完成，已有 Agent/MySQL 已保留' : '纳管完成，Agent 已部署' })
+        } catch (err) {
+          const item = batchOnboardResults.value[index]
+          const registeredButAgentFailed = /machine registered but preserved components could not be adopted/i.test(String(err.message || ''))
+          if (registeredButAgentFailed) {
+            updateBulkStep(batchOnboardResults, index, 'register', 'success', '机器已登记，SSH 管理通道已建立')
+            updateBulkStep(batchOnboardResults, index, 'agent', 'failed', errorSummary(err.message, 160))
+          } else {
+            const runningKey = item.steps.find(step => step.state === 'running')?.key || 'precheck'
+            updateBulkStep(batchOnboardResults, index, runningKey, 'failed', errorSummary(err.message, 160))
+          }
+          updateBulkResult(batchOnboardResults, index, { status: 'failed', message: err.message, steps: batchOnboardResults.value[index].steps.map(step => step.state === 'pending' ? { ...step, state: 'skipped' } : step) })
+        }
+      })
+      const succeeded = batchOnboardResults.value.filter(item => item.status === 'success').length
+      notice.value = `批量纳管完成：${succeeded}/${rows.length} 台成功。`
+      if (succeeded !== rows.length) error.value = '部分机器纳管失败，请查看弹窗内结果。'
+      batchOnboardRunning.value = false
+      await refresh()
+    }
+    function bulkDeleteExpected() { return `${bulkDeleteForm.value.mode === 'detach' ? 'DETACH' : 'DELETE'} ${selectedMachineIDs.value.length} MACHINES` }
+    function bulkDeleteClusterMembers() {
+      const selected = new Set(selectedMachineIDs.value)
+      return data.value.machines.filter(item => selected.has(item.ID || item.id) && String(item.Cluster || item.cluster || '').trim())
+    }
+    function bulkDeleteClusterSummary() {
+      return bulkDeleteClusterMembers().map(item => `${item.Name || item.name}（${item.Cluster || item.cluster}）`).join('、')
+    }
+    function leaveBulkDeleteForClusters() {
+      showBulkDelete.value = false
+      active.value = 'clusters'
+      data.value.clusterSection = 'overview'
+      error.value = '请先在集群的“机器管理”中将所选机器移出集群，再执行删除。'
+    }
+    function openBulkDelete() {
+      if (!selectedMachineIDs.value.length) { error.value = '请先选择需要删除的机器。'; return }
+      bulkDeleteForm.value = { mode: 'cleanup', delete_mysql: true, delete_agent: true, concurrent: true, concurrency: 3, confirmation: '' }
+      bulkDeleteResults.value = []
+      showBulkDelete.value = true
+    }
+    function deleteResultSteps(detachOnly, form) {
+      return [
+        { key: 'validate', title: '校验机器与集群归属', state: 'pending', detail: '确认机器已移出集群并锁定清理范围' },
+        { key: 'mysql', title: '卸载 MySQL 与清理数据', state: detachOnly || !form.delete_mysql ? 'skipped' : 'pending', detail: 'Agent 在线走任务通道，离线自动回退 SSH' },
+        { key: 'agent', title: '卸载 Agent 与 systemd', state: detachOnly || !form.delete_agent ? 'skipped' : 'pending', detail: '停止服务并删除 unit 与安装目录' },
+        { key: 'local', title: '清理平台关联记录', state: 'pending', detail: '清理心跳、任务、静态信息、实例和机器记录' }
+      ]
+    }
+    async function submitBulkDelete() {
+      if (bulkDeleteClusterMembers().length) { error.value = '所选机器仍属于集群，请先移出集群后再删除。'; return }
+      if (bulkDeleteForm.value.confirmation !== bulkDeleteExpected()) { error.value = '批量删除确认内容不匹配。'; return }
+      const ids = selectedMachineIDs.value.slice()
+      const form = { ...bulkDeleteForm.value }
+      const detachOnly = form.mode === 'detach'
+      bulkDeleteRunning.value = true
+      bulkDeleteResults.value = ids.map(id => {
+        const machine = data.value.machines.find(item => (item.ID || item.id) === id)
+        return { id, name: machine?.Name || machine?.name || id, ip: machine?.IP || machine?.ip || '', status: 'pending', message: '等待调度', steps: deleteResultSteps(detachOnly, form) }
+      })
+      error.value = ''; notice.value = ''
+      const concurrency = form.concurrent ? Math.min(10, Math.max(2, Number(form.concurrency) || 3)) : 1
+      await runWithConcurrency(ids, concurrency, async (id, index) => {
+        updateBulkStep(bulkDeleteResults, index, 'validate', 'success')
+        updateBulkResult(bulkDeleteResults, index, { status: 'running', message: detachOnly ? '正在从平台剔除' : '正在执行远端清理与平台删除', steps: bulkDeleteResults.value[index].steps.map(step => step.state === 'pending' ? { ...step, state: 'running' } : step) })
+        try {
+          const result = await api(`/machines/${encodeURIComponent(id)}`, { method: 'DELETE', body: JSON.stringify({ detach_only: detachOnly, delete_mysql: detachOnly ? false : form.delete_mysql, delete_agent: detachOnly ? false : form.delete_agent }) })
+          const sshPorts = result.mysql_ssh_ports || result.MySQLSSHPorts || []
+          updateBulkResult(bulkDeleteResults, index, { status: 'success', message: detachOnly ? '已从平台直接剔除，未连接目标机器' : (sshPorts.length ? `清理并删除成功；MySQL ${sshPorts.join('、')} 通过 SSH 清理` : '清理并删除成功'), steps: bulkDeleteResults.value[index].steps.map(step => step.state === 'running' ? { ...step, state: 'success' } : step) })
+        } catch (err) {
+          const message = String(err.message || '')
+          const failedKey = /mysql/i.test(message) ? 'mysql' : /agent/i.test(message) ? 'agent' : 'local'
+          let reachedFailure = false
+          const steps = bulkDeleteResults.value[index].steps.map(step => {
+            if (step.state === 'skipped' || step.key === 'validate') return step
+            if (step.key === failedKey) { reachedFailure = true; return { ...step, state: 'failed', detail: errorSummary(message, 160) } }
+            if (reachedFailure) return { ...step, state: 'skipped' }
+            return { ...step, state: 'success' }
+          })
+          updateBulkResult(bulkDeleteResults, index, { status: 'failed', message, steps })
+        }
+      })
+      const succeeded = bulkDeleteResults.value.filter(item => item.status === 'success').length
+      selectedMachineIDs.value = bulkDeleteResults.value.filter(item => item.status === 'failed').map(item => item.id)
+      notice.value = `批量删除完成：${succeeded}/${ids.length} 台成功。`
+      if (succeeded !== ids.length) error.value = '部分机器删除失败，失败项已保持选中。'
+      bulkDeleteRunning.value = false
+      await refresh()
+    }
+    async function onboard(skipComponentRisk = false) {
+      notice.value = ''; error.value = ''
+      expandedFlowErrors.value = {}
+      onboardingFlow.value = [
+        { title: '预检查目标机器', detail: '正在检查 SSH、系统权限、磁盘、已有 Agent 和 MySQL…', state: 'running', details: [
+          { title: '验证 SSH 凭证与远程命令执行', state: 'running' }, { title: '检查 systemd 写入权限与磁盘空间', state: 'pending' }, { title: '检测已有 GMHA Agent', state: 'pending' }, { title: '检测已有 MySQL', state: 'pending' }
+        ] },
+        { title: '建立 SSH 互信并登记机器', detail: '等待预检查通过…', state: 'pending' },
+        { title: '部署 GMHA Agent', detail: '空机器将自动部署 Agent；如失败会显示原因。', state: 'pending', details: [
+          { title: '准备安装目录与系统权限', state: 'pending' },
+          { title: '上传 Agent 二进制文件', state: 'pending' },
+          { title: '写入 agent.yaml 与 systemd 服务单元', state: 'pending' },
+          { title: '启动 gmha-agent 服务', state: 'pending' },
+          { title: '等待 Agent 心跳注册', state: 'pending' }
+        ] }
+      ]
+      onboardingDetected.value = { agent: false, mysql: false }
+      showOnboard.value = false; showOnboardFlow.value = true
+      canSkipPrecheck.value = false
+      try {
+        const precheck = await api('/machines/precheck', { method: 'POST', body: JSON.stringify(form.value) })
+        const precheckStep = onboardingFlow.value[0]
+        precheckStep.details[0].state = precheck.remote_command ? 'success' : 'error'
+        precheckStep.details[1].state = precheck.systemd_ready ? 'success' : 'error'
+        const componentRisk = precheck.agent_detected || precheck.mysql_detected
+        onboardingDetected.value = { agent: !!precheck.agent_detected, mysql: !!precheck.mysql_detected }
+        precheckStep.details[2].state = precheck.agent_detected ? 'error' : 'success'
+        precheckStep.details[3].state = precheck.mysql_detected ? 'error' : 'success'
+        const risks = [precheck.warning, precheck.agent_detected ? '检测到已有 GMHA Agent，需要人工确认后处理。' : '', precheck.mysql_detected ? '检测到已有 MySQL，纳管流程不会自动修改数据库。' : ''].filter(Boolean)
+        const blockingRisk = precheck.warning
+        // 只要任一旧组件存在就提供处理入口；基础环境问题仍由后续流程阻断。
+        canSkipPrecheck.value = componentRisk
+        if (blockingRisk || (componentRisk && !skipComponentRisk)) {
+          precheckStep.state = 'error'; precheckStep.detail = risks.join(' ')
+          throw new Error(precheckStep.detail)
+        }
+        if (componentRisk && skipComponentRisk) precheckStep.detail = `检测到已有组件，将保留${precheck.agent_detected && form.value.preserve_agent ? ' Agent' : ''}${precheck.mysql_detected && form.value.preserve_mysql ? ' MySQL' : ''} 并重新接入平台。`
+        precheckStep.state = 'success'; precheckStep.detail = `SSH=${precheck.identity || '已认证'}；系统=${precheck.os || '已识别'}；磁盘=${precheck.disk || '已检查'}`
+        const retryMachine = data.value.machines.find(item => {
+          const name = item.Name || item.name
+          const status = state(item.Status || item.status)
+          return name === form.value.name && ['agent_error', 'ssh_failed'].includes(status)
+        })
+        const result = await api('/machines', { method: 'POST', body: JSON.stringify({ ...form.value, preserve_agent: !!(precheck.agent_detected && form.value.preserve_agent), preserve_mysql: !!(precheck.mysql_detected && form.value.preserve_mysql), machine_id: retryMachine?.ID || retryMachine?.id || '' }) })
+        onboardingResult.value = result
+        onboardingFlow.value[1] = { title: '建立 SSH 互信并登记机器', detail: `SSH 互信已就绪，机器 ${result.name || form.value.name} 已纳入 Manager。`, state: 'success' }
+        onboardingFlow.value[2].detail = precheck.agent_detected && form.value.preserve_agent ? '正在重新登记并连接已有 Agent…' : '安装器正在依次执行下列步骤…'; onboardingFlow.value[2].state = 'running'
+        onboardingFlow.value[2].details[0].state = 'running'
+        const install = precheck.agent_detected && form.value.preserve_agent ? { install_dir: '原安装目录', final_state: '已保留并重启' } : await api('/agents/retry-install', { method: 'POST', body: JSON.stringify({ ip: result.ip || result.IP || form.value.ip, ssh_user: form.value.ssh_user, ssh_password: form.value.ssh_password }) })
+        onboardingFlow.value[2].details.forEach(item => { item.state = 'success' })
+        onboardingFlow.value[2].detail = `Agent 已部署至 ${install.install_dir || '目标机器'}，状态：${install.final_state || '已提交'}`
+        onboardingFlow.value[2].state = 'success'
+        notice.value = componentRisk ? '机器已重新纳管，选择保留的 Agent 与 MySQL 已重新接入。' : '机器已纳管，并已提交 Agent 自动部署。'
+        form.value = { name: '', ip: '', ssh_port: 22, ssh_user: 'root', ssh_password: '', credential_id: '', preserve_agent: true, preserve_mysql: true }; await refresh()
+      } catch (err) {
+        const running = onboardingFlow.value.find(item => item.state === 'running')
+        if (running) {
+          running.state = 'error'; running.detail = err.message
+          const currentDetail = resolveFailedDetail(running, err.message)
+          if (currentDetail) {
+            currentDetail.state = 'error'
+            currentDetail.error = err.message
+            currentDetail.errorSummary = errorSummary(err.message)
+          }
+        }
+        error.value = err.message
+      }
+    }
+    async function cleanupTarget() {
+      const target = form.value.ip
+      if (!confirm(`高风险操作：将停止 ${target} 上的 gmha-agent、mysql/mysqld 服务，并删除 GMHA Agent 文件。MySQL 数据目录不会删除。是否继续？`)) return
+      const phrase = prompt(`二次确认：请输入 CLEAN ${target} 执行清理`)
+      if (phrase !== `CLEAN ${target}`) { error.value = '二次确认内容不匹配，已取消清理。'; return }
+      try { await api('/machines/cleanup', { method:'POST', body:JSON.stringify({ ...form.value, confirm_phrase: phrase }) }); notice.value = '目标机器的旧 Agent 已清理，MySQL 服务已停止。请重新开始纳管。'; showOnboardFlow.value = false }
+      catch (err) { error.value = `清理失败：${err.message}` }
+    }
+    function openAgentAction(type, item) {
+      const ip = item?.IP || item?.ip || ''
+      const name = item?.Name || item?.name || ip
+      const definitions = {
+        recover: { title: '手动拉起 Agent', description: `将在 ${name}（${ip}）上创建恢复任务，并持续更新恢复结果。`, confirm: '创建恢复任务' },
+        retry: { title: '重试安装 Agent', description: `重新向 ${name}（${ip}）下发 Agent 安装任务。请确认安装目录。`, confirm: '开始重试', inputLabel: 'Agent 安装目录', inputValue: item?.InstallDir || item?.install_dir || '/home/gmha/agent' },
+        upgrade: { title: '升级 Agent', description: `将在 ${name}（${ip}）上执行 Agent 升级。升级期间会短暂重启 Agent 服务。`, confirm: '确认升级' },
+        repair: { title: '修复 MySQL 采集', description: `将在 ${name}（${ip}）上修复 mysql-heartbeat.json 采集配置并创建修复任务。`, confirm: '提交修复' },
+        uninstall: { title: '卸载 Agent', description: `高风险操作：将从 ${name}（${ip}）卸载 GMHA Agent，Manager 将不再接收其心跳。`, confirm: '确认卸载', danger: true, inputLabel: '二次确认口令', inputValue: '', expected: `UNINSTALL ${ip}` }
+      }
+      const definition = definitions[type]
+      if (!definition) return
+      agentActionReturnToDetail.value = showAgentDetail.value
+      showAgentDetail.value = false
+      agentActionInput.value = definition.inputValue || ''
+      agentActionDialog.value = { ...definition, type, ip, name }
+    }
+    function closeAgentAction(restoreDetail = true) {
+      agentActionDialog.value = null
+      agentActionInput.value = ''
+      if (restoreDetail && agentActionReturnToDetail.value && selectedAgent.value) showAgentDetail.value = true
+      agentActionReturnToDetail.value = false
+    }
+    function recover(ip) { openAgentAction('recover', data.value.agents.find(item => (item.IP || item.ip) === ip) || { ip }) }
+    async function performAgentRecovery(ip) {
+      error.value = ''; notice.value = ''
+      try {
+        const task = await api('/agents/recover', { method: 'POST', body: JSON.stringify({ ip }) })
+        data.value.manualRecovery = { ...task, status: task.status || 'pending' }
+        notice.value = `已创建 ${ip} 的恢复任务，正在执行。`
+        pollManualRecovery(task.id, ip)
+      } catch (err) { error.value = err.message }
+    }
+    async function pollManualRecovery(taskID, ip) {
+      try {
+        const [agent, recovery] = await Promise.all([api(`/agents?ip=${encodeURIComponent(ip)}`), api('/agents/recovery-tasks')])
+        const task = recovery.find(item => (item.id || item.ID) === taskID) || data.value.manualRecovery
+        data.value = { ...data.value, agents: data.value.agents.map(item => (item.IP || item.ip) === ip ? agent : item), recovery, manualRecovery: { ...task, status: task.status || task.Status || 'pending' } }
+        const status = String(task.status || task.Status || '').toLowerCase()
+        if (['succeeded', 'failed', 'suppressed'].includes(status)) {
+          if (status === 'succeeded') notice.value = `${ip} 的 Agent 已恢复在线。`
+          return
+        }
+        setTimeout(() => pollManualRecovery(taskID, ip), 1000)
+      } catch (err) { error.value = err.message }
+    }
+    async function showAgent(ip) {
+      try { selectedAgent.value = await api(`/agents?ip=${encodeURIComponent(ip)}`); showAgentDetail.value = true }
+      catch (err) { error.value = err.message }
+    }
+    function retryAgent(item) { openAgentAction('retry', item) }
+    function upgradeAgent(item) { openAgentAction('upgrade', item) }
+    function uninstallAgent(item) { openAgentAction('uninstall', item) }
+    function repairMySQLAgentConfig(item) { openAgentAction('repair', item) }
+    async function submitAgentAction() {
+      const dialog = agentActionDialog.value
+      if (!dialog) return
+      error.value = ''; notice.value = ''
+      if (dialog.expected && agentActionInput.value !== dialog.expected) { error.value = '二次确认口令不匹配，未执行操作。'; return }
+      try {
+        if (dialog.type === 'recover') await performAgentRecovery(dialog.ip)
+        if (dialog.type === 'retry') { if (!agentActionInput.value.trim()) throw new Error('请输入 Agent 安装目录。'); await api('/agents/retry-install', { method: 'POST', body: JSON.stringify({ ip: dialog.ip, install_dir: agentActionInput.value.trim() }) }); notice.value = `已完成 ${dialog.ip} 的 Agent 重试安装。`; await refresh() }
+        if (dialog.type === 'upgrade') { await api('/agents/upgrade', { method: 'POST', body: JSON.stringify({ ip: dialog.ip }) }); notice.value = `已完成 ${dialog.ip} 的 Agent 升级。`; await refresh() }
+        if (dialog.type === 'repair') { const result = await api('/agents/repair-mysql-config', { method: 'POST', body: JSON.stringify({ ip: dialog.ip }) }); notice.value = `已提交 MySQL 采集配置修复任务：${result.task_id}`; await refresh() }
+        if (dialog.type === 'uninstall') { await api('/agents/uninstall', { method: 'POST', body: JSON.stringify({ ip: dialog.ip }) }); notice.value = `已卸载 ${dialog.ip} 上的 Agent。`; showAgentDetail.value = false; await refresh() }
+        closeAgentAction(dialog.type !== 'uninstall')
+      } catch (err) { error.value = err.message }
+    }
+    async function saveManagerConfig() {
+      try { await api('/manager/config', { method: 'PUT', body: JSON.stringify(managerForm.value) }); notice.value = 'Manager 启动参数已保存。重启后生效。'; await refresh() }
+      catch (err) { error.value = err.message }
+    }
+    async function testManagerDatabase() {
+      error.value = ''; notice.value = ''
+      try { const result = await api('/manager/database/test', { method: 'POST', body: JSON.stringify(managerForm.value) }); notice.value = result.message || '数据库连接成功。' }
+      catch (err) { error.value = err.message }
+    }
+    async function managerAction(action) {
+      const labels = { start: '启动', restart: '重启', stop: '停止' }
+      if (!confirm(`确认${labels[action]} Manager 服务？`)) return
+      try {
+        const result = await api(`/manager/${action}`, { method: 'POST', body: JSON.stringify({ config: managerForm.value }) })
+        notice.value = `Manager 已${labels[action]}。`
+        if (action === 'stop') { data.value.manager = result || { running: false, config: { ...managerForm.value } }; return }
+        if (action === 'restart') {
+          for (let attempt = 0; attempt < 20; attempt++) {
+            await new Promise(resolve => setTimeout(resolve, 500))
+            try { const status = await api('/manager/status'); if (status?.running && (!result?.pid || status.pid === result.pid)) { await refresh(); return } } catch (_) { /* 切换监听期间继续等待 */ }
+          }
+          throw new Error('新 Manager 未在 10 秒内就绪，请检查 Manager 日志。')
+        }
+        await refresh()
+      }
+      catch (err) { error.value = err.message }
+    }
+    async function showMachine(id) {
+      try {
+        selectedMachine.value = await api(`/machines/${id}`)
+        selectedMachineCluster.value = selectedMachine.value.Cluster || selectedMachine.value.cluster || ''
+        selectedMachineErrorExpanded.value = false; machineStaticInfo.value = null; machineDynamicInfo.value = null; machineInfoError.value = ''
+        showMachineDetail.value = true
+        try { machineStaticInfo.value = await api(`/machines/${id}/static-info`) } catch (_) { /* 未采集静态信息时由用户主动采集 */ }
+        try { machineDynamicInfo.value = await api(`/machines/${id}/dynamic-metrics`) }
+        catch (err) { machineInfoError.value = `获取动态指标失败：${err.message}` }
+      } catch (err) { error.value = err.message }
+    }
+    async function saveMachine() { try { const m = selectedMachine.value; await api(`/machines/${m.ID || m.id}`, { method: 'PUT', body: JSON.stringify({ name: m.Name || m.name, ip: m.IP || m.ip, ssh_port: m.SSHPort || m.ssh_port, ssh_user: m.SSHUser || m.ssh_user }) }); notice.value = '机器基本信息已更新。'; showMachineDetail.value = false; await refresh() } catch (err) { error.value = err.message } }
+    function machineDeleteExpected() { const m = selectedMachine.value; return m ? `${machineDeleteForm.value.mode === 'detach' ? 'DETACH' : 'DELETE'} ${m.Name || m.name}` : '' }
+    function machineDeleteClusterName() { return String(selectedMachine.value?.Cluster || selectedMachine.value?.cluster || '').trim() }
+    async function leaveMachineDeleteForCluster() {
+      const clusterName = machineDeleteClusterName()
+      showMachineDelete.value = false
+      showMachineDetail.value = false
+      active.value = 'clusters'
+      const cluster = data.value.clusters.find(item => (item.Name || item.name) === clusterName)
+      if (cluster) {
+        data.value.clusterSection = 'machines'
+        await openClusterDetail(cluster)
+      }
+      error.value = `请先将机器从集群 ${clusterName} 移出，再执行删除。`
+    }
+    function openMachineDelete() {
+      const hasMySQL = mysqlInstancesOnMachine(selectedMachine.value).length > 0
+      machineDeleteForm.value = { mode: 'cleanup', delete_mysql: hasMySQL, delete_agent: true, confirmation: '' }
+      machineDeleteError.value = ''
+      showMachineDelete.value = true
+    }
+    function machineDeleteSteps() {
+      const mysqlCount = mysqlInstancesOnMachine(selectedMachine.value).length
+      return [
+        { key: 'validate', enabled: machineDeleteForm.value.mode !== 'detach', title: '校验清理范围', detail: '确认机器身份、已登记实例和 Agent 状态' },
+        { key: 'mysql', enabled: machineDeleteForm.value.mode !== 'detach' && machineDeleteForm.value.delete_mysql && mysqlCount > 0, title: '卸载 MySQL 并清理数据', detail: `${mysqlCount} 个实例依次停止服务、禁用并删除 systemd unit，清理 data/binlog/redo/undo/tmp 目录` },
+        { key: 'agent', enabled: machineDeleteForm.value.mode !== 'detach' && machineDeleteForm.value.delete_agent, title: '卸载 Agent', detail: '停止并禁用 gmha-agent，删除 systemd unit 与安装目录' },
+        { key: 'local', enabled: true, title: '删除 Manager 本地记录', detail: '清理心跳、任务、静态信息、实例关联及机器记录' }
+      ]
+    }
+    async function deleteMachine() {
+      const m = selectedMachine.value
+      if (!showMachineDelete.value) { openMachineDelete(); return }
+      if (machineDeleteClusterName()) { error.value = `机器仍属于集群 ${machineDeleteClusterName()}，请先移出集群后再删除。`; return }
+      if (!m || machineDeleteForm.value.confirmation !== machineDeleteExpected()) { error.value = '二次确认内容不匹配，未执行删除。'; return }
+      machineDeleteSubmitting.value = true; machineDeleteError.value = ''; error.value = ''
+      try {
+        const detachOnly = machineDeleteForm.value.mode === 'detach'
+        const result = await api(`/machines/${m.ID || m.id}`, { method: 'DELETE', body: JSON.stringify({ detach_only: detachOnly, delete_mysql: detachOnly ? false : machineDeleteForm.value.delete_mysql, delete_agent: detachOnly ? false : machineDeleteForm.value.delete_agent }) })
+        const mysqlPorts = result.mysql_ports || result.MySQLPorts || []
+        const summaries = [detachOnly ? `机器 ${m.Name || m.name} 已从平台直接剔除，未连接目标机器` : `机器 ${m.Name || m.name} 已删除`]
+        if (mysqlPorts.length) summaries.push(`MySQL ${mysqlPorts.join('、')} 已卸载并清理数据目录与 systemd`)
+        const sshPorts = result.mysql_ssh_ports || result.MySQLSSHPorts || []
+        if (sshPorts.length) summaries.push(`MySQL ${sshPorts.join('、')} 通过 SSH 通道清理`)
+        if (result.agent_uninstalled ?? result.AgentUninstalled) summaries.push('Agent 已卸载')
+        notice.value = summaries.join('；') + '。'
+        showMachineDelete.value = false; showMachineDetail.value = false
+        if (data.value.machines.length === 1 && machinePage.value > 1) machinePage.value--
+        await refresh()
+      } catch (err) { machineDeleteError.value = err.message; error.value = `删除机器失败：${err.message}` }
+      finally { machineDeleteSubmitting.value = false }
+    }
+    async function assignMachineCluster() {
+      const m = selectedMachine.value; const cluster = selectedMachineCluster.value
+      if (!cluster) { error.value = '请选择目标集群。'; return }
+      if (!confirm(`确认将 ${m.Name || m.name} 分配至集群 ${cluster}？系统将按 CLI 流程安装 Agent 并采集静态信息。`)) return
+      try { await api(`/machines/${m.ID || m.id}/assign-cluster`, { method: 'POST', body: JSON.stringify({ cluster }) }); notice.value = `机器已分配至集群 ${cluster}。`; await refresh(); selectedMachine.value = await api(`/machines/${m.ID || m.id}`) }
+      catch (err) { error.value = err.message }
+    }
+    function openQuickClusterAssign(machine) {
+      if (!data.value.clusters.length) { error.value = '请先在“集群管理”中创建集群。'; return }
+      selectedMachine.value = machine
+      selectedMachineCluster.value = ''
+      showQuickClusterAssign.value = true
+    }
+    async function quickAssignMachineCluster() {
+      const m = selectedMachine.value; const cluster = selectedMachineCluster.value
+      if (!cluster) { error.value = '请选择目标集群。'; return }
+      try {
+        await api(`/machines/${m.ID || m.id}/assign-cluster`, { method: 'POST', body: JSON.stringify({ cluster }) })
+        notice.value = `机器已分配至集群 ${cluster}。`
+        showQuickClusterAssign.value = false
+        await refresh()
+      } catch (err) { error.value = err.message }
+    }
+    async function collectMachineStaticInfo() {
+      const m = selectedMachine.value; machineInfoError.value = ''
+      try { machineStaticInfo.value = await api(`/machines/${m.ID || m.id}/static-info`, { method: 'POST' }); notice.value = '机器静态信息采集完成。' }
+      catch (err) { machineInfoError.value = err.message }
+    }
+    async function loadMachineDynamicInfo() {
+      const m = selectedMachine.value; machineInfoError.value = ''
+      try { machineDynamicInfo.value = await api(`/machines/${m.ID || m.id}/dynamic-metrics`) }
+      catch (err) { machineInfoError.value = err.message }
+    }
+    function changePage(target, delta, total) { const next = target.value + delta; if (next >= 1 && (next - 1) * pageSize < total) { target.value = next; refresh() } }
+    async function createCredential() {
+      try {
+        await api('/ssh-credentials', { method: 'POST', body: JSON.stringify(credentialForm.value) })
+        notice.value = '凭证已保存，可立即分配给已纳管机器。'; showCredential.value = false
+        credentialForm.value = { name: '', ssh_user: 'root', type: 'password', ssh_password: '', private_key: '', passphrase: '' }; await refresh()
+      } catch (err) { error.value = err.message }
+    }
+    async function deleteCredential(item) {
+      if (!confirm(`确认删除 SSH 凭证 ${item.name}？已分配机器将不再关联该凭证。`)) return
+      try { await api(`/ssh-credentials/${item.id}`, { method: 'DELETE' }); notice.value = 'SSH 凭证已删除。'; await refresh() }
+      catch (err) { error.value = err.message }
+    }
+    async function createMySQLInstall() { try { const allowed = new Set(mysqlInstallParameterGroups.value.flatMap(group => group.fields || []).map(field => field.key)); const payload = { ...mysqlInstallForm.value, install_pt_tools: (!selectedMySQLInstallPackage.value || selectedMySQLInstallPackage.value.pt_tools_supported) && mysqlInstallForm.value.install_pt_tools, runtime_parameters: Object.fromEntries(Object.entries(mysqlInstallForm.value.runtime_parameters || {}).filter(([key,value]) => allowed.has(key) && String(value || '').trim() !== '')) }; delete payload._runtime_parameter_groups; const result = await api('/tasks/mysql-install', { method:'POST', body:JSON.stringify(payload) }); mysqlTaskDetail.value=result; showMySQLInstall.value=false; showMySQLTask.value=false; await openTaskDetail(result); notice.value = `MySQL 安装任务已创建：${result.Task?.ID || result.task?.ID || result.task?.id || '已提交'}`; await refresh() } catch(err) { error.value=err.message } }
+    function openMySQLInstall() { if (data.value.accountPresets.length) mysqlInstallForm.value.accounts = JSON.parse(JSON.stringify(data.value.accountPresets)); showMySQLInstall.value = false; mysqlView.value = 'install' }
+    function isCustomMySQLAccount(account) { return String(account?.role || '').startsWith('custom_') }
+    function addCustomMySQLAccount() {
+      mysqlInstallForm.value.accounts.push({ role: `custom_${Date.now()}_${mysqlInstallForm.value.accounts.length}`, username: '', password: '', host: '%', enabled: true, privileges: ['SELECT'] })
+    }
+    function removeCustomMySQLAccount(index) {
+      if (isCustomMySQLAccount(mysqlInstallForm.value.accounts[index])) mysqlInstallForm.value.accounts.splice(index, 1)
+    }
+    async function saveMySQLAccountPresets() { try { const items = await api('/mysql/account-presets', { method:'PUT', body:JSON.stringify(data.value.accountPresets) }); data.value.accountPresets = items; notice.value = 'MySQL 预设账号已保存，后续安装任务将自动带入。' } catch (err) { error.value = err.message } }
+    async function refreshMySQLTask() { const id=mysqlTaskDetail.value?.Task?.ID || mysqlTaskDetail.value?.task?.id; if(!id)return; try { mysqlTaskDetail.value=await api(`/tasks?id=${encodeURIComponent(id)}`) } catch(err) { error.value=err.message } }
+    async function uninstallMySQL(item) { const machine=item.MachineIP||item.machine_ip; const port=item.Port||item.port; if (!confirm(`确认卸载 ${machine}:${port} 的 MySQL？该操作会删除数据文件。`)) return; if (prompt(`请输入 UNINSTALL ${machine}:${port}`)!==`UNINSTALL ${machine}:${port}`) return; try { await api('/tasks/mysql-uninstall',{method:'POST',body:JSON.stringify({machine,port})}); notice.value='MySQL 卸载任务已创建。'; await refresh() } catch(err){error.value=err.message} }
+    async function forgetMySQL(item) { const machine=item.MachineIP||item.machine_ip; const port=item.Port||item.port; if(!confirm(`仅删除 Manager 中 ${machine}:${port} 的实例记录，不会连接目标机器。是否继续？`))return; try{await api('/mysql/instances',{method:'DELETE',body:JSON.stringify({machine,port})});notice.value='MySQL 实例记录已遗忘。';await refresh()}catch(err){error.value=err.message} }
+    function openCreateCluster() { clusterForm.value = { old_name: '', name: '', description: '' }; showClusterEditor.value = true }
+    function openEditCluster(item) { clusterForm.value = { old_name: item.Name || item.name, name: item.Name || item.name, description: item.Description || item.description || '' }; showClusterEditor.value = true }
+    async function openClusterDetail(item) {
+      const name = item.Name || item.name
+      data.value.clusterSection = 'overview'
+      data.value.instanceView = 'overview'
+      selectedClusterDetail.value = item
+      clusterTopology.value = { cluster: name, nodes: [], edges: [] }
+      clusterTopologyError.value = ''
+      selectedClusterOperationMachineIDs.value = []
+      clusterMachinePage.value = 1
+      try {
+        const [detail, topology] = await Promise.all([api(`/clusters/${encodeURIComponent(name)}`), api(`/clusters/${encodeURIComponent(name)}/topology`), loadClusterMachines(1, name)])
+        selectedClusterDetail.value = detail
+        clusterTopology.value = topology
+        clusterTopologyLastUpdated.value = new Date().toISOString()
+        startClusterTopologyAutoRefresh()
+      } catch (err) { clusterTopologyError.value = `获取集群拓扑失败：${err.message}` }
+    }
+    function closeClusterDetail() {
+      stopClusterTopologyAutoRefresh()
+      if (architecturePollTimer) { clearTimeout(architecturePollTimer); architecturePollTimer = null }
+      selectedClusterDetail.value = null
+      data.value.clusterSection = 'overview'
+      clusterTopologyError.value = ''
+      clusterTopologyLastUpdated.value = ''
+      clusterMachineItems.value = []
+      selectedClusterOperationMachineIDs.value = []
+      architecturePlan.value = null
+      architectureRun.value = null
+    }
+    async function loadClusterMachines(page = clusterMachinePage.value, clusterName = selectedClusterDetail.value?.Name || selectedClusterDetail.value?.name) {
+      if (!clusterName) return
+      const result = await api(`/clusters/${encodeURIComponent(clusterName)}/machines?page=${page}&page_size=50`)
+      clusterMachineItems.value = result.items || []
+      clusterMachinePage.value = result.page || page
+      clusterMachineTotal.value = result.total || 0
+      const staticInfoEntries = await Promise.all(clusterMachineItems.value.map(async machine => {
+        const id = machine.ID || machine.id
+        try { return [id, await api(`/machines/${encodeURIComponent(id)}/static-info`)] }
+        catch (_) { return [id, null] }
+      }))
+      clusterMachineStaticInfo.value = Object.fromEntries(staticInfoEntries)
+      // 进入集群机器管理页时默认选择当前页机器，避免批量操作按钮因未选择目标而没有任何反馈。
+      if (data.value.clusterSection === 'machines' && !selectedClusterOperationMachineIDs.value.length) {
+        selectedClusterOperationMachineIDs.value = clusterMachineItems.value.map(item => item.ID || item.id)
+      }
+    }
+    async function changeClusterMachinePage(delta) {
+      const next = clusterMachinePage.value + delta
+      if (next < 1 || (next - 1) * 50 >= clusterMachineTotal.value) return
+      selectedClusterOperationMachineIDs.value = []
+      try { await loadClusterMachines(next) } catch (err) { error.value = err.message }
+    }
+    async function refreshClusterTopology(options = {}) {
+      const name = selectedClusterDetail.value?.Name || selectedClusterDetail.value?.name
+      if (!name || clusterTopologyRefreshing.value) return
+      clusterTopologyRefreshing.value = true
+      try {
+        const requests = [api(`/clusters/${encodeURIComponent(name)}/topology`)]
+        if (options.includeMachines) requests.push(loadClusterMachines())
+        const [topology] = await Promise.all(requests)
+        clusterTopology.value = topology
+        clusterTopologyLastUpdated.value = new Date().toISOString()
+        clusterTopologyError.value = ''
+      } catch (err) {
+        if (!options.silent) clusterTopologyError.value = `获取集群拓扑失败：${err.message}`
+      } finally { clusterTopologyRefreshing.value = false }
+    }
+    function startClusterTopologyAutoRefresh() {
+      stopClusterTopologyAutoRefresh()
+      if (!clusterTopologyAutoRefresh.value) return
+      clusterTopologyRefreshTimer = setInterval(() => {
+        if (active.value === 'clusters' && selectedClusterDetail.value && (data.value.clusterSection || 'overview') === 'overview') refreshClusterTopology({ silent: true })
+      }, 5000)
+    }
+    function stopClusterTopologyAutoRefresh() {
+      if (clusterTopologyRefreshTimer) clearInterval(clusterTopologyRefreshTimer)
+      clusterTopologyRefreshTimer = null
+    }
+    function toggleClusterTopologyAutoRefresh() {
+      clusterTopologyAutoRefresh.value = !clusterTopologyAutoRefresh.value
+      if (clusterTopologyAutoRefresh.value) startClusterTopologyAutoRefresh()
+      else stopClusterTopologyAutoRefresh()
+    }
+    function overviewTopologyEndpoint(node) { return topologyEndpoint(node?.ip, node?.port) }
+    function overviewTopologyEdgeForReplica(node) {
+      const endpoint = overviewTopologyEndpoint(node)
+      return (clusterTopology.value.edges || []).find(edge => topologyEndpoint(edge.target_ip, edge.target_port) === endpoint)
+    }
+    function overviewTopologyRoots() {
+      const nodes = clusterTopology.value.nodes || []
+      const outgoing = new Set((clusterTopology.value.edges || []).map(edge => topologyEndpoint(edge.source_ip, edge.source_port)))
+      const roots = nodes.filter(node => outgoing.has(overviewTopologyEndpoint(node)) || ['m','m/s','master','primary'].includes(String(node.role || '').toLowerCase()))
+      return roots
+    }
+    function overviewTopologyReplicas() {
+      const rootEndpoints = new Set(overviewTopologyRoots().map(overviewTopologyEndpoint))
+      return (clusterTopology.value.nodes || []).filter(node => !rootEndpoints.has(overviewTopologyEndpoint(node)) && overviewTopologyEdgeForReplica(node))
+    }
+    function overviewTopologyStandalone() {
+      const rootEndpoints = new Set(overviewTopologyRoots().map(overviewTopologyEndpoint))
+      const replicaEndpoints = new Set(overviewTopologyReplicas().map(overviewTopologyEndpoint))
+      return (clusterTopology.value.nodes || []).filter(node => !rootEndpoints.has(overviewTopologyEndpoint(node)) && !replicaEndpoints.has(overviewTopologyEndpoint(node)))
+    }
+    function overviewTopologySourceName(node) {
+      const edge = overviewTopologyEdgeForReplica(node)
+      return edge?.source_name || edge?.source_ip || '未识别'
+    }
+    function topologyMetric(value, suffix = '') {
+      if (value === undefined || value === null || value === '') return '—'
+      const number = Number(value)
+      return Number.isFinite(number) ? `${number >= 100 ? Math.round(number) : Math.round(number * 10) / 10}${suffix}` : `${value}${suffix}`
+    }
+    async function openClusterBackup() {
+      stopClusterTopologyAutoRefresh()
+      data.value.clusterSection = 'backup'
+      showBackupPolicyEditor.value = false
+      await loadClusterBackups()
+    }
+    async function loadClusterBackups() {
+      const cluster = selectedClusterDetail.value?.Name || selectedClusterDetail.value?.name
+      if (!cluster) return
+      try {
+        const [policies, runs] = await Promise.all([api(`/backup/policies?cluster=${encodeURIComponent(cluster)}`), api(`/backup/runs?cluster=${encodeURIComponent(cluster)}&limit=100`)])
+        backupPolicies.value = policies || []; backupRuns.value = runs || []
+      } catch (err) { error.value = `读取备份配置失败：${err.message}` }
+    }
+    function openBackupPolicyEditor(policy = null) {
+      if (!policy) {
+        const form = newBackupPolicyForm()
+        const replica = clusterTopology.value.nodes.find(node => ['s','slave','replica','readonly'].includes(String(node.role||'').toLowerCase()))
+        const preferred = replica ? clusterMachineItems.value.find(machine => (machine.IP||machine.ip)===replica.ip) : clusterMachineItems.value.find(machine => mysqlInstancesOnMachine(machine).length)
+        if (preferred) { form.machine_id=preferred.ID||preferred.id; const instances=backupInstancesForMachine(form.machine_id); form.port=Number(replica?.port || instances[0]?.Port || instances[0]?.port || 3306) }
+        backupPolicyForm.value = form
+      } else backupPolicyForm.value = { ...policy, start_at: new Date(policy.start_at).toISOString().slice(0,16), mysql_password: '', weekdays: [...(policy.weekdays || [])], weekday_backup_types:{...(policy.weekday_backup_types||{})} }
+      showBackupPolicyEditor.value = true
+    }
+    function backupMachines() { return clusterMachineItems.value.filter(machine => mysqlInstancesOnMachine(machine).length) }
+    function backupInstancesForMachine(machineID) { const machine=clusterMachineItems.value.find(item=>(item.ID||item.id)===machineID); return machine ? mysqlInstancesOnMachine(machine) : [] }
+    function backupMachineChanged() { const instances=backupInstancesForMachine(backupPolicyForm.value.machine_id); if (instances.length) backupPolicyForm.value.port=Number(instances[0].Port||instances[0].port) }
+    function backupMachineRole(machine) { const instance=mysqlInstancesOnMachine(machine)[0]; return mysqlRoleLabel(mysqlTopologyNode(machine,instance)?.role) }
+    function weekdayName(day) { return ['周日','周一','周二','周三','周四','周五','周六'][Number(day)] }
+    function toggleAllBackupWeekdays(event) { backupPolicyForm.value.weekdays = event.target.checked ? [1,2,3,4,5,6,0] : [] }
+    async function saveBackupPolicy() {
+      const cluster = selectedClusterDetail.value?.Name || selectedClusterDetail.value?.name
+      const payload = { ...backupPolicyForm.value, cluster, start_at: new Date(backupPolicyForm.value.start_at).toISOString() }
+      try { await api('/backup/policies', { method:'POST', body:JSON.stringify(payload) }); notice.value = 'XtraBackup 备份策略已保存，Manager 调度器会按下一次执行时间下发给 Agent。'; showBackupPolicyEditor.value=false; await loadClusterBackups() }
+      catch (err) { error.value = err.message }
+    }
+    async function deleteBackupPolicy(item) {
+      if (!confirm(`确认删除备份策略“${item.name}”？已生成的备份记录不会删除。`)) return
+      try { await api(`/backup/policies/${item.id}`, {method:'DELETE'}); notice.value='备份策略已删除。'; await loadClusterBackups() } catch(err){error.value=err.message}
+    }
+    async function runBackupPolicy(item) {
+      if (!confirm(`立即在目标 Agent 上执行策略“${item.name}”？`)) return
+      try { const run=await api(`/backup/policies/${item.id}/run`,{method:'POST'}); notice.value=`备份任务已创建：${run.task_id}`; await loadClusterBackups(); await refresh() } catch(err){error.value=err.message}
+    }
+    function restoreBackup(run) {
+      const restoreAt = new Date(Date.now() - 5 * 60000); restoreAt.setSeconds(0, 0)
+      data.value.restoreDialog = run
+      data.value.restoreForm = { mode:'flashback', backup_path:run.backup_path, restore_time:restoreAt.toISOString().slice(0,16), mysql_user:'root', mysql_password:'', repair_replication:true, apply_flashback:false, database:'', tables:'', output_dir:'/data/gmha/recovery', confirmation:'' }
+    }
+    function restoreExpected() { return data.value.restoreDialog ? `${data.value.restoreForm.mode==='flashback'?'FLASHBACK':'RESTORE'} ${data.value.restoreDialog.id}` : '' }
+    async function submitRestore() {
+      if (!data.value.restoreDialog || data.value.restoreForm.confirmation !== restoreExpected()) { error.value='二次确认内容不匹配，未创建恢复任务。'; return }
+      const payload = { ...data.value.restoreForm, restore_time:new Date(data.value.restoreForm.restore_time).toISOString(), tables:String(data.value.restoreForm.tables||'').split(',').map(value=>value.trim()).filter(Boolean) }
+      try { const result=await api(`/backup/runs/${data.value.restoreDialog.id}/restore`,{method:'POST',body:JSON.stringify(payload)}); notice.value=`恢复任务已创建：${result.task?.ID || result.Task?.ID}`; data.value.restoreDialog=null; await loadClusterBackups(); await refresh() } catch(err){error.value=err.message}
+    }
+    data.value.submitRestore = submitRestore
+    data.value.restoreExpected = restoreExpected
+    function backupScheduleLabel(item) {
+      if (item.schedule_type==='once') return `仅一次 · ${date(item.start_at)}`
+      if (item.schedule_type==='custom') return `每 ${item.interval_minutes} 分钟 · ${date(item.start_at)} 起`
+      const names=['周日','周一','周二','周三','周四','周五','周六']; return `每周 ${item.weekdays.map(i=>names[i]).join('、')} · ${new Date(item.start_at).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'})}`
+    }
+    function backupTypeLabel(value){ return value==='incremental'?'增量备份':'全量备份' }
+    async function installClusterMySQL() {
+      const cluster = selectedClusterDetail.value?.Name || selectedClusterDetail.value?.name
+      const port = Number(prompt('MySQL 端口：', '3306')); if (!port) return
+      const rootPassword = prompt(`为集群 ${cluster} 创建 MySQL 安装任务。请输入 root 密码：`); if (!rootPassword) return
+if (!confirm(`确认向集群 ${cluster} 的集群内所有机器创建 MySQL 安装任务？`)) return
+      try { const result = await api('/tasks/cluster-mysql-install', { method:'POST', body:JSON.stringify({ cluster, port, server_id_start:1, mysql_user:'mysql', root_password:rootPassword, profile:'default', accounts:data.value.accountPresets }) }); notice.value=`已创建 ${result.created || 0} 个安装任务${result.failed ? `，${result.failed} 个失败` : ''}。`; await refresh(); await refreshClusterTopology() } catch (err) { error.value=err.message }
+    }
+    async function uninstallClusterMySQL() {
+      const cluster = selectedClusterDetail.value?.Name || selectedClusterDetail.value?.name
+      const port = Number(prompt(`高风险操作：将卸载集群 ${cluster} 中端口为多少的 MySQL（数据会被删除）？`, '3306')); if (!port) return
+      if (prompt(`二次确认：请输入 UNINSTALL ${cluster}:${port}`) !== `UNINSTALL ${cluster}:${port}`) return
+      try { const result = await api('/tasks/cluster-mysql-uninstall', { method:'POST', body:JSON.stringify({cluster,port}) }); notice.value=`已创建 ${result.created || 0} 个 MySQL 卸载任务${result.failed ? `，${result.failed} 个失败` : ''}。`; await refresh(); await refreshClusterTopology() } catch (err) { error.value=err.message }
+    }
+    function mysqlInstancesOnMachine(machine) {
+      const id = machine?.ID || machine?.id
+      const ip = machine?.IP || machine?.ip
+      return data.value.mysqlInstances.filter(item => (item.MachineID || item.machine_id) === id || (item.MachineIP || item.machine_ip) === ip)
+    }
+    function clusterMachineInterfaces(machine) {
+      const id = machine?.ID || machine?.id
+      const staticInfo = clusterMachineStaticInfo.value[id]
+      const host = staticInfo?.Host || staticInfo?.host || staticInfo
+      const interfaces = host?.Interfaces || host?.interfaces || []
+      const rows = interfaces.flatMap(item => {
+        const name = item.Name || item.name || '未知网卡'
+        const ips = item.IPs || item.ips || []
+        return ips.map(ip => ({ name, ip }))
+      })
+      if (rows.length) return rows
+      return [{ name: '网卡待采集', ip: machine?.IP || machine?.ip || '—' }]
+    }
+    function machineArchitecture(machine) {
+      return String(machine?.Architecture || machine?.architecture || machine?.Arch || machine?.arch || '').toLowerCase()
+    }
+    function compatibleMySQLPackage(machine, requestedName = '') {
+      if (requestedName) return requestedName
+      const arch = machineArchitecture(machine)
+      const packages = data.value.mysqlPackages || []
+      const match = packages.find(item => {
+        const packageArch = String(item.arch || item.Arch || '').toLowerCase()
+        return !arch || !packageArch || packageArch === arch || (arch === 'x86_64' && ['amd64', 'x86_64'].includes(packageArch)) || (arch === 'aarch64' && ['arm64', 'aarch64'].includes(packageArch))
+      })
+      return match?.file_name || match?.FileName || ''
+    }
+    function mysqlTopologyNode(machine, instance) {
+      const ip = machine?.IP || machine?.ip
+      const port = instance?.Port || instance?.port
+      return clusterTopology.value.nodes.find(node => node.ip === ip && (!port || Number(node.port) === Number(port))) || null
+    }
+    function mysqlRoleLabel(role) {
+      return ({ M: '主库', S: '从库', 'M/S': '主从节点', readonly: '只读实例', standalone: '独立实例' })[role] || '独立实例'
+    }
+    function openClusterMySQLWizard(action, singleMachine = null) {
+      const selectedIDs = singleMachine ? [singleMachine.ID || singleMachine.id] : selectedClusterOperationMachineIDs.value
+      const candidates = clusterMachineItems.value.filter(machine => !selectedIDs.length || selectedIDs.includes(machine.ID || machine.id)).filter(machine => action === 'install' ? !mysqlInstancesOnMachine(machine).length : mysqlInstancesOnMachine(machine).length)
+      if (!candidates.length) { error.value = action === 'install' ? '没有可安装 MySQL 的目标机器。' : '没有可卸载 MySQL 的目标实例。'; return }
+      const packageOptions = (data.value.mysqlPackages || []).map(pkg => `<option value="${pkg.file_name}">${pkg.version} · ${pkg.arch} · glibc ${pkg.glibc_version}</option>`).join('')
+      const rows = candidates.map((machine, index) => {
+        const ip = machine.IP || machine.ip; const name = machine.Name || machine.name; const arch = machineArchitecture(machine) || '自动识别'; const selected = compatibleMySQLPackage(machine)
+        const options = packageOptions.replace(`value="${selected}"`, `value="${selected}" selected`)
+        return `<tr data-ip="${ip}"><td><input class="batch-target" type="checkbox" checked></td><td><b>${name}</b><small>${ip}</small></td><td>${arch}</td>${action === 'install' ? `<td><select class="batch-package"><option value="">自动匹配兼容包</option>${options}</select></td><td><input class="batch-port" type="number" value="3306" min="1"></td><td><input class="batch-server-id" type="number" value="${index + 1}" min="1"></td>` : `<td colspan="3">将卸载：${mysqlInstancesOnMachine(machine).map(item => `${item.Port || item.port}`).join('、')} 端口实例</td>`}</tr>`
+      }).join('')
+      const host = document.createElement('div')
+      host.className = 'modal-mask cluster-batch-wizard-mask'
+      host.innerHTML = `<section class="modal cluster-mysql-batch-modal cluster-batch-wizard"><div class="modal-head"><div><p>集群 MySQL 运维</p><h2>${action === 'install' ? '批量安装 MySQL' : '批量卸载 MySQL'}</h2></div><button type="button" class="batch-close">×</button></div><p class="form-note">为每台机器单独选择安装包、端口和 server_id；不同架构与 MySQL 版本可同时提交。</p><div class="batch-global">${action === 'install' ? '<label>root 密码<input class="batch-root-password" type="password" required></label><label>MySQL 用户<input class="batch-mysql-user" value="mysql"></label><label>参数 Profile<input class="batch-profile" value="default"></label>' : '<label>二次确认<input class="batch-confirm" placeholder="UNINSTALL '+(selectedClusterDetail.value?.Name || selectedClusterDetail.value?.name)+'"></label>'}</div><div class="cluster-machine-table-wrap"><table class="cluster-machine-table"><thead><tr><th>选择</th><th>机器</th><th>架构</th>${action === 'install' ? '<th>MySQL 安装包</th><th>端口</th><th>server_id</th>' : '<th>卸载实例</th>'}</tr></thead><tbody>${rows}</tbody></table></div><div class="modal-actions"><button type="button" class="secondary batch-close">取消</button><button class="primary batch-submit">创建批量${action === 'install' ? '安装' : '卸载'}任务</button></div></section>`
+      const close = () => host.remove()
+      host.querySelectorAll('.batch-close').forEach(button => button.addEventListener('click', close))
+      host.addEventListener('click', event => { if (event.target === host) close() })
+      host.querySelector('.batch-submit').addEventListener('click', async () => {
+        const rows = [...host.querySelectorAll('tbody tr')].filter(row => row.querySelector('.batch-target').checked)
+        if (!rows.length) { alert('请至少选择一台机器。'); return }
+        const cluster = selectedClusterDetail.value?.Name || selectedClusterDetail.value?.name
+        if (action === 'uninstall' && host.querySelector('.batch-confirm').value !== `UNINSTALL ${cluster}`) { alert(`请输入 UNINSTALL ${cluster} 以确认卸载。`); return }
+        const password = host.querySelector('.batch-root-password')?.value
+        if (action === 'install' && !password) { alert('请填写 root 密码。'); return }
+        const user = host.querySelector('.batch-mysql-user')?.value || 'mysql'; const profile = host.querySelector('.batch-profile')?.value || 'default'
+        const requests = rows.flatMap(row => {
+          const ip = row.dataset.ip
+          if (action === 'uninstall') return mysqlInstancesOnMachine(candidates.find(item => (item.IP || item.ip) === ip)).map(instance => api('/tasks/mysql-uninstall', { method: 'POST', body: JSON.stringify({ machine: ip, port: instance.Port || instance.port }) }))
+          return [api('/tasks/mysql-install', { method: 'POST', body: JSON.stringify({ machine: ip, package_name: row.querySelector('.batch-package').value, port: Number(row.querySelector('.batch-port').value), server_id: Number(row.querySelector('.batch-server-id').value), mysql_user: user, root_password: password, profile, accounts: data.value.accountPresets }) })]
+        })
+        const result = await Promise.allSettled(requests); const succeeded = result.filter(item => item.status === 'fulfilled').length
+        close(); notice.value = `已创建 ${succeeded}/${result.length} 个 MySQL ${action === 'install' ? '安装' : '卸载'}任务。`; if (succeeded !== result.length) error.value = '部分任务创建失败，请在任务中心查看详情。'
+        await refresh(); await refreshClusterTopology(); await loadClusterMachines(1)
+      })
+      document.body.appendChild(host)
+    }
+    function openClusterMySQLBatch(action, machine = null) {
+      // MySQL 生命周期已迁入“实例管理”，机器管理不再创建 MySQL 任务。
+      data.value.clusterSection = 'instances'
+      notice.value = '请在“实例管理”中创建 MySQL 安装或卸载任务。'
+      return
+      const ids = machine ? [machine.ID || machine.id] : selectedClusterOperationMachineIDs.value.slice()
+      if (!ids.length) { error.value = '请先选择需要操作的机器。'; return }
+      const selected = clusterMachineItems.value.filter(item => ids.includes(item.ID || item.id))
+      const eligible = selected.filter(item => action === 'install' ? !mysqlInstancesOnMachine(item).length : mysqlInstancesOnMachine(item).length)
+      if (!eligible.length) {
+        error.value = action === 'install' ? '所选机器均已登记 MySQL 实例。' : '所选机器均未登记 MySQL 实例。'
+        return
+      }
+      clusterMySQLDialog.value = { action, machines: eligible, cluster: selectedClusterDetail.value?.Name || selectedClusterDetail.value?.name, targets: eligible.map((item, index) => ({ machine_id: item.ID || item.id, machine_ip: item.IP || item.ip, architecture: machineArchitecture(item) || '自动识别', package_name: compatibleMySQLPackage(item), port: 3306, server_id: index + 1 })) }
+      clusterMySQLConfirm.value = ''
+      clusterMySQLForm.value = { package_name: '', port: 3306, server_id_start: 1, mysql_user: 'mysql', root_password: '', profile: 'default' }
+    }
+    async function submitClusterMySQLBatch() {
+      const dialog = clusterMySQLDialog.value
+      if (!dialog) return
+      if (dialog.action === 'uninstall' && clusterMySQLConfirm.value !== `UNINSTALL ${dialog.cluster}`) {
+        error.value = '二次确认内容不匹配，未创建卸载任务。'
+        return
+      }
+      const requests = []
+      if (dialog.action === 'install') {
+        const targets = dialog.targets || dialog.machines.map((machine, index) => ({ machine_ip: machine.IP || machine.ip, package_name: compatibleMySQLPackage(machine, clusterMySQLForm.value.package_name), port: clusterMySQLForm.value.port, server_id: Number(clusterMySQLForm.value.server_id_start) + index }))
+        targets.forEach((target, index) => requests.push(api('/tasks/mysql-install', { method: 'POST', body: JSON.stringify({ ...clusterMySQLForm.value, machine: target.machine_ip, package_name: target.package_name || clusterMySQLForm.value.package_name, port: Number(target.port || clusterMySQLForm.value.port), server_id: Number(target.server_id || (Number(clusterMySQLForm.value.server_id_start) + index)), accounts: data.value.accountPresets }) })))
+      } else {
+        dialog.machines.forEach(machine => mysqlInstancesOnMachine(machine).forEach(instance => requests.push(api('/tasks/mysql-uninstall', { method: 'POST', body: JSON.stringify({ machine: machine.IP || machine.ip, port: instance.Port || instance.port }) }))))
+      }
+      const results = await Promise.allSettled(requests)
+      const succeeded = results.filter(item => item.status === 'fulfilled').length
+      const failed = results.length - succeeded
+      clusterMySQLDialog.value = null
+      selectedClusterOperationMachineIDs.value = []
+      notice.value = `已创建 ${succeeded} 个 MySQL ${dialog.action === 'install' ? '安装' : '卸载'}任务${failed ? `，${failed} 个创建失败` : ''}。`
+      if (failed) error.value = results.find(item => item.status === 'rejected')?.reason?.message || '部分任务创建失败。'
+      await refresh()
+      await refreshClusterTopology()
+      await loadClusterMachines(1)
+    }
+    function toggleAllAutomationClusters() {
+      const names = data.value.clusters.map(item => item.Name || item.name).filter(Boolean)
+      automationSelectedClusters.value = automationSelectedClusters.value.length === names.length ? [] : names
+    }
+    async function submitAutomationTask() {
+      const clusters = automationSelectedClusters.value.slice()
+      if (!clusters.length) { error.value = '请至少选择一个目标集群。'; return }
+      const form = automationForm.value
+      if (form.action === 'shell' && !String(form.script || '').trim()) { error.value = '请输入需要下发的 Shell 脚本。'; return }
+      if (['collect_mysql','mysql_user','mysql_parameter'].includes(form.action) && (!String(form.mysql_user || '').trim() || !String(form.mysql_password || '').trim())) { error.value = '数据库操作需要填写管理员用户名和密码。'; return }
+      if (form.action === 'mysql_user' && form.user_action !== 'list' && !String(form.target_username || '').trim()) { error.value = '请输入目标数据库用户名。'; return }
+      if (form.action === 'mysql_parameter' && (!String(form.parameter_name || '').trim() || !String(form.parameter_value || '').trim())) { error.value = '请输入参数名称和参数值。'; return }
+      if (form.action === 'install' && !String(form.root_password || '').trim()) { error.value = '批量安装需要填写 MySQL root 密码。'; return }
+      const confirmation = `UNINSTALL ${clusters.length} CLUSTERS`
+      if (form.action === 'uninstall' && automationConfirm.value !== confirmation) { error.value = `请输入 ${confirmation} 完成二次确认。`; return }
+      automationRunning.value = true
+      automationResults.value = []
+      error.value = ''
+      try {
+        if (form.action === 'backup') {
+          const result = await api('/backup/cluster-runs', { method: 'POST', body: JSON.stringify({ clusters }) })
+          automationResults.value = (result.items || []).map(item => ({ cluster: item.cluster, machine: item.policy, task_id: item.task_id, status: item.error ? 'failed' : 'success', created: item.task_id ? 1 : 0, failed: item.error ? 1 : 0, message: item.error || `已创建备份任务 ${item.run_id || ''}` }))
+          const succeeded = automationResults.value.filter(item => item.status === 'success').length
+          notice.value = `批量备份已提交：${succeeded}/${automationResults.value.length} 条策略成功。`
+          if (succeeded !== automationResults.value.length) error.value = '部分备份任务提交失败，请查看下方执行结果。'
+          await refresh()
+          return
+        }
+        if (['collect_machine','shell','collect_mysql','mysql_user','mysql_parameter'].includes(form.action)) {
+          const result = await api('/tasks/cluster-automation', { method: 'POST', body: JSON.stringify({ ...form, clusters, operation: form.action }) })
+          const messages = { collect_machine:'已创建机器信息采集任务', collect_mysql:'已创建 MySQL 数据采集任务', shell:'已创建 Shell 执行任务', mysql_user:'已创建数据库用户任务', mysql_parameter:'已创建数据库参数任务' }
+          automationResults.value = (result.items || []).map(item => ({ cluster: item.cluster, machine: item.machine, task_id: item.task_id, status: item.error ? 'failed' : 'success', created: item.task_id ? 1 : 0, failed: item.error ? 1 : 0, message: item.error || messages[form.action] }))
+          const succeeded = automationResults.value.filter(item => item.status === 'success').length
+          notice.value = `自动化任务已提交：${succeeded}/${automationResults.value.length} 台机器成功。`
+          if (succeeded !== automationResults.value.length) error.value = '部分机器提交失败，请查看下方执行结果。'
+          await refresh()
+          return
+        }
+        automationResults.value = await Promise.all(clusters.map(async cluster => {
+          try {
+            const endpoint = form.action === 'install' ? '/tasks/cluster-mysql-install' : '/tasks/cluster-mysql-uninstall'
+            const body = form.action === 'install'
+              ? { cluster, port: Number(form.port), server_id_start: Number(form.server_id_start), mysql_user: form.mysql_user, root_password: form.root_password, profile: form.profile, install_pt_tools: form.install_pt_tools, accounts: data.value.accountPresets }
+              : { cluster, port: Number(form.port) }
+            const result = await api(endpoint, { method: 'POST', body: JSON.stringify(body) })
+            return { cluster, status: 'success', created: result.created || 0, failed: result.failed || 0, message: `已创建 ${result.created || 0} 个任务${result.failed ? `，${result.failed} 个失败` : ''}` }
+          } catch (err) {
+            return { cluster, status: 'failed', created: 0, failed: 1, message: err.message }
+          }
+        }))
+        const succeeded = automationResults.value.filter(item => item.status === 'success').length
+        notice.value = `自动化任务已提交：${succeeded}/${clusters.length} 个集群成功。`
+        if (succeeded !== clusters.length) error.value = '部分集群提交失败，请查看下方执行结果。'
+        await refresh()
+      } finally {
+        automationRunning.value = false
+      }
+    }
+    async function removeMachineFromCluster(machine) {
+      const cluster = selectedClusterDetail.value?.Name || selectedClusterDetail.value?.name
+      const name = machine.Name || machine.name || machine.IP || machine.ip
+      if (!confirm(`确认将机器 ${name} 移出集群 ${cluster}？机器、Agent 和 MySQL 数据不会被删除。`)) return
+      try {
+        await api(`/machines/${machine.ID || machine.id}/assign-cluster`, { method: 'DELETE' })
+        notice.value = `机器 ${name} 已移出集群，现为未分配集群。`
+        selectedClusterOperationMachineIDs.value = selectedClusterOperationMachineIDs.value.filter(id => id !== (machine.ID || machine.id))
+        await refresh()
+        await openClusterDetail(selectedClusterDetail.value)
+      } catch (err) { error.value = err.message }
+    }
+    function topologyEndpoint(ip, port) { return `${String(ip || '').trim()}:${Number(port || 3306)}` }
+    function topologyEdgeForNode(node) {
+      const target = topologyEndpoint(node.ip, node.port)
+      return clusterTopology.value.edges.find(edge => topologyEndpoint(edge.target_ip, edge.target_port) === target)
+    }
+    function topologyMachineForEndpoint(ip, port) {
+      const endpoint = topologyEndpoint(ip, port)
+      return clusterTopology.value.nodes.find(node => topologyEndpoint(node.ip, node.port) === endpoint)?.machine_id || ''
+    }
+    function architectureTypeLabel(type) {
+      return ({ standalone: '独立实例', master_slave: '一主多从', dual_master: '双主架构', multi_master: '多主架构', keepalived_dual_master: 'Keepalived 双主' })[type] || type
+    }
+    function detectCurrentArchitecture() {
+      const nodes = clusterTopology.value.nodes || []
+      const edges = clusterTopology.value.edges || []
+      const edgeSet = new Set(edges.map(edge => `${topologyEndpoint(edge.source_ip, edge.source_port)}>${topologyEndpoint(edge.target_ip, edge.target_port)}`))
+      const mutualEdges = edges.filter(edge => edgeSet.has(`${topologyEndpoint(edge.target_ip, edge.target_port)}>${topologyEndpoint(edge.source_ip, edge.source_port)}`))
+      const reportedMasters = nodes.filter(node => node.role === 'M' || node.role === 'M/S')
+      let type = 'standalone'
+      if (reportedMasters.length >= 3) type = 'multi_master'
+      else if (mutualEdges.length >= 2) type = vipConfigs.value.some(item => item.vip_route_mode === 'KEEPALIVED') ? 'keepalived_dual_master' : 'dual_master'
+      else if (edges.length) type = 'master_slave'
+      const incoming = new Set(edges.map(edge => topologyEndpoint(edge.target_ip, edge.target_port)))
+      const outgoing = new Set(edges.map(edge => topologyEndpoint(edge.source_ip, edge.source_port)))
+      let primaryMachineIDs = []
+      if (type === 'multi_master') {
+        primaryMachineIDs = reportedMasters.map(node => node.machine_id)
+      } else if (type === 'dual_master' || type === 'keepalived_dual_master') {
+        const endpoints = new Set(mutualEdges.flatMap(edge => [topologyEndpoint(edge.source_ip, edge.source_port), topologyEndpoint(edge.target_ip, edge.target_port)]))
+        primaryMachineIDs = nodes.filter(node => endpoints.has(topologyEndpoint(node.ip, node.port))).map(node => node.machine_id)
+      } else if (type === 'master_slave') {
+        primaryMachineIDs = nodes.filter(node => outgoing.has(topologyEndpoint(node.ip, node.port)) && !incoming.has(topologyEndpoint(node.ip, node.port))).map(node => node.machine_id)
+        if (!primaryMachineIDs.length) primaryMachineIDs = nodes.filter(node => node.role === 'M').map(node => node.machine_id)
+      }
+      architectureCurrent.value = { type, label: architectureTypeLabel(type), primary_machine_ids: [...new Set(primaryMachineIDs)], nodes, edges }
+      return architectureCurrent.value
+    }
+    function architectureNodeChanged(node) {
+      if (node.role === 'M') {
+        node.delay_seconds = 0
+        node.source_machine_id = ''
+        architectureForm.value.primary_machine_id = node.machine_id
+      }
+      const masters = architectureForm.value.nodes.filter(item => item.role === 'M')
+      if (node.role === 'S' && architectureForm.value.primary_machine_id === node.machine_id) architectureForm.value.primary_machine_id = masters[0]?.machine_id || ''
+      if (masters.length === 1) architectureForm.value.architecture = 'master_slave'
+      if (masters.length === 2 && architectureForm.value.architecture !== 'keepalived_dual_master') architectureForm.value.architecture = 'dual_master'
+      if (masters.length >= 3) {
+        architectureForm.value.architecture = 'multi_master'
+        architectureForm.value.move_vip = false
+      }
+      architecturePlan.value = null
+    }
+    function architectureNodeHasChanges(node) {
+      const currentNode = clusterTopology.value.nodes.find(item => item.machine_id === node.machine_id && Number(item.port || 3306) === Number(node.port || 3306))
+      if (!currentNode) return true
+      const edge = topologyEdgeForNode(currentNode)
+      const currentRole = currentNode.role === 'M' || currentNode.role === 'M/S' ? 'M' : 'S'
+      const currentSource = edge ? topologyMachineForEndpoint(edge.source_ip, edge.source_port) : ''
+      return node.role !== currentRole || (node.role === 'S' && (node.source_machine_id || '') !== currentSource) || (node.role === 'S' && Number(node.delay_seconds || 0) !== Number(edge?.sql_delay || 0))
+    }
+    function architectureNodeName(machineID) {
+      const topologyNode = clusterTopology.value.nodes.find(item => item.machine_id === machineID)
+      const instance = data.value.mysqlInstances.find(item => (item.MachineID || item.machine_id) === machineID)
+      const machine = clusterMachineItems.value.find(item => (item.ID || item.id) === machineID)
+      return topologyNode?.name || instance?.MachineName || instance?.machine_name || machine?.Name || machine?.name || machineID || '未设置'
+    }
+    function architectureNodeMeta(machineID) {
+      const topologyNode = clusterTopology.value.nodes.find(item => item.machine_id === machineID)
+      const instance = data.value.mysqlInstances.find(item => (item.MachineID || item.machine_id) === machineID)
+      const machine = clusterMachineItems.value.find(item => (item.ID || item.id) === machineID)
+      return {
+        name: architectureNodeName(machineID),
+        ip: topologyNode?.ip || instance?.MachineIP || instance?.machine_ip || machine?.IP || machine?.ip || '待上报',
+        status: topologyNode?.error ? '心跳异常' : (instance?.Status || instance?.status || '正常运行')
+      }
+    }
+    function architectureAvailableInstances() {
+      const cluster = selectedClusterDetail.value?.Name || selectedClusterDetail.value?.name
+      const used = new Set(architectureForm.value.nodes.map(node => node.machine_id))
+      return data.value.mysqlInstances.filter(item => {
+        const machineID = item.MachineID || item.machine_id
+        return machineID && !used.has(machineID) && (!cluster || (item.Cluster || item.cluster) === cluster)
+      })
+    }
+    function addArchitectureInstance(instance) {
+      const machineID = instance.MachineID || instance.machine_id
+      if (!machineID || architectureForm.value.nodes.some(node => node.machine_id === machineID)) return
+      const source = architectureForm.value.primary_machine_id || architectureForm.value.nodes.find(node => node.role === 'M')?.machine_id || ''
+      architectureForm.value.nodes.push({ machine_id: machineID, port: Number(instance.Port || instance.port || 3306), role: 'S', source_machine_id: source, delay_seconds: 0, election_priority: 50 })
+      architectureSelectedNode.value = machineID
+      architecturePlan.value = null
+      notice.value = `已将 ${architectureNodeName(machineID)} 加入目标拓扑，默认作为从节点。`
+    }
+    function setArchitectureNodeRole(node, role) {
+      node.role = role
+      architectureNodeChanged(node)
+      if (role === 'S' && !node.source_machine_id) node.source_machine_id = architectureForm.value.primary_machine_id
+      architectureSelectedNode.value = node.machine_id
+    }
+    function requestArchitectureRoleChange(node, role) {
+      if (!node || role === node.role) return
+      const otherMasters = architectureForm.value.nodes.filter(item => item.role === 'M' && item.machine_id !== node.machine_id)
+      const replacement = architectureForm.value.nodes.filter(item => item.machine_id !== node.machine_id && item.role === 'S').sort((a, b) => Number(b.election_priority || 0) - Number(a.election_priority || 0))[0]
+      architectureRoleChangeDialog.value = { machine_id: node.machine_id, from_role: node.role, to_role: role, switchover: role === 'M' && otherMasters.length === 1, needs_replacement: role === 'S' && otherMasters.length === 0, replacement_machine_id: replacement?.machine_id || '' }
+    }
+    function confirmArchitectureRoleChange() {
+      const change = architectureRoleChangeDialog.value
+      if (!change) return
+      const node = architectureForm.value.nodes.find(item => item.machine_id === change.machine_id)
+      if (!node) return
+      if (change.needs_replacement) {
+        const replacement = architectureForm.value.nodes.find(item => item.machine_id === change.replacement_machine_id)
+        if (!replacement) { error.value = '请先选择接替的新主节点。'; return }
+        replacement.role = 'M'; replacement.source_machine_id = ''; replacement.delay_seconds = 0
+        node.role = 'S'; node.source_machine_id = replacement.machine_id
+        architectureForm.value.primary_machine_id = replacement.machine_id
+        architectureNodeChanged(node)
+      } else if (change.switchover) {
+        const oldMaster = architectureForm.value.nodes.find(item => item.role === 'M' && item.machine_id !== node.machine_id)
+        node.role = 'M'; node.source_machine_id = ''; node.delay_seconds = 0
+        if (oldMaster) { oldMaster.role = 'S'; oldMaster.source_machine_id = node.machine_id }
+        architectureForm.value.primary_machine_id = node.machine_id
+        architectureNodeChanged(node)
+      } else {
+        setArchitectureNodeRole(node, change.to_role)
+      }
+      architectureRoleChangeDialog.value = null
+      architecturePlan.value = null
+      notice.value = '角色变更已加入拓扑草稿，生成并执行计划后才会影响线上业务。'
+    }
+    function architectureDraftEdges() {
+      const nodes = architectureForm.value.nodes
+      const masters = nodes.filter(node => node.role === 'M')
+      const edges = []
+      if (masters.length === 2) {
+        edges.push({ source: masters[0].machine_id, target: masters[1].machine_id, mutual: true })
+      } else if (masters.length > 2) {
+        masters.forEach((master, index) => edges.push({ source: master.machine_id, target: masters[(index + 1) % masters.length].machine_id, mutual: false, root: true }))
+      }
+      nodes.filter(node => node.role === 'S').forEach(node => {
+        const source = node.source_machine_id || architectureForm.value.primary_machine_id || masters[0]?.machine_id
+        if (source && source !== node.machine_id) edges.push({ source, target: node.machine_id, mutual: false })
+      })
+      return edges
+    }
+    function startArchitectureNodeDrag(event, node) {
+      architectureDraggingNode.value = node.machine_id
+      architectureSelectedNode.value = node.machine_id
+      if (event?.dataTransfer) {
+        event.dataTransfer.effectAllowed = 'move'
+        event.dataTransfer.setData('text/plain', node.machine_id)
+      }
+    }
+    function finishArchitectureNodeDrag() {
+      architectureDraggingNode.value = ''
+    }
+    function reorderArchitectureNode(source, target) {
+      const nodes = architectureForm.value.nodes
+      const sourceIndex = nodes.findIndex(item => item.machine_id === source.machine_id)
+      const targetIndex = nodes.findIndex(item => item.machine_id === target.machine_id)
+      if (sourceIndex < 0 || targetIndex < 0 || sourceIndex === targetIndex) return
+      const [moved] = nodes.splice(sourceIndex, 1)
+      const insertionIndex = nodes.findIndex(item => item.machine_id === target.machine_id)
+      nodes.splice(insertionIndex, 0, moved)
+    }
+    function dropArchitectureNode(target) {
+      const source = architectureForm.value.nodes.find(item => item.machine_id === architectureDraggingNode.value)
+      if (!source || source.machine_id === target.machine_id) { finishArchitectureNodeDrag(); return }
+      if (source.role === target.role) {
+        reorderArchitectureNode(source, target)
+        notice.value = `已调整 ${architectureNodeName(source.machine_id)} 在${source.role === 'M' ? '根节点' : '叶子节点'}层的位置。`
+      } else if (source.role === 'S' && target.role === 'M') {
+        source.source_machine_id = target.machine_id
+        architecturePlan.value = null
+        notice.value = `已将 ${architectureNodeName(source.machine_id)} 的复制源设为 ${architectureNodeName(target.machine_id)}。`
+      } else {
+        requestArchitectureRoleChange(source, target.role)
+      }
+      finishArchitectureNodeDrag()
+    }
+    function dropArchitectureLayer(role) {
+      const source = architectureForm.value.nodes.find(item => item.machine_id === architectureDraggingNode.value)
+      if (!source) return
+      if (source.role !== role) {
+        requestArchitectureRoleChange(source, role)
+      } else {
+        const nodes = architectureForm.value.nodes
+        const sourceIndex = nodes.findIndex(item => item.machine_id === source.machine_id)
+        const [moved] = nodes.splice(sourceIndex, 1)
+        let lastRoleIndex = -1
+        nodes.forEach((item, index) => { if (item.role === role) lastRoleIndex = index })
+        nodes.splice(lastRoleIndex + 1, 0, moved)
+      }
+      finishArchitectureNodeDrag()
+    }
+    function startArchitectureLink(node) {
+      architectureLinkSource.value = node.machine_id
+      architectureSelectedNode.value = node.machine_id
+      notice.value = `已选择 ${architectureNodeName(node.machine_id)} 作为起点，请点击目标实例完成连线。`
+    }
+    function completeArchitectureLink(target) {
+      const source = architectureForm.value.nodes.find(node => node.machine_id === architectureLinkSource.value)
+      if (!source || source.machine_id === target.machine_id) { architectureLinkSource.value = ''; return }
+      const reverseExists = source.role === 'S' && source.source_machine_id === target.machine_id
+      if (reverseExists) {
+        source.role = 'M'; source.source_machine_id = ''; source.delay_seconds = 0
+        target.role = 'M'; target.source_machine_id = ''; target.delay_seconds = 0
+        architectureForm.value.architecture = 'dual_master'
+        architectureForm.value.primary_machine_id = target.machine_id
+        notice.value = '已建立双向复制，目标架构已自动切换为双主。'
+      } else {
+        source.role = 'M'; source.source_machine_id = ''; source.delay_seconds = 0
+        target.role = 'S'; target.source_machine_id = source.machine_id
+        architectureForm.value.primary_machine_id = source.machine_id
+        architectureForm.value.architecture = 'master_slave'
+        notice.value = `已设置 ${architectureNodeName(target.machine_id)} 跟随 ${architectureNodeName(source.machine_id)}。`
+      }
+      architectureLinkSource.value = ''
+      architectureSelectedNode.value = target.machine_id
+      architecturePlan.value = null
+    }
+    function addKeepalivedToTopology() {
+      const masters = architectureForm.value.nodes.filter(node => node.role === 'M')
+      if (masters.length !== 2) { error.value = '请先通过双向连线建立两个主节点。'; return }
+      architectureForm.value.architecture = 'keepalived_dual_master'
+      architectureForm.value.move_vip = true
+      vipForm.value.vip_route_mode = 'KEEPALIVED'
+      architecturePlan.value = null
+      notice.value = vipConfigs.value.length ? 'Keepalived 已加入双主拓扑。' : '已加入 Keepalived，请在右侧填写 VIP 后保存配置。'
+    }
+    function removeKeepalivedFromTopology() {
+      architectureForm.value.architecture = 'dual_master'
+      architectureForm.value.move_vip = false
+      architecturePlan.value = null
+    }
+    async function kickArchitectureNode(node) {
+      const machine = clusterMachineItems.value.find(item => (item.ID || item.id) === node.machine_id)
+      if (!machine) { error.value = '未找到该实例所属机器，无法移出集群。'; return }
+      architectureLinkSource.value = ''
+      await removeMachineFromCluster(machine)
+    }
+    function applyArchitectureRoles() {
+      const nodes = architectureForm.value.nodes
+      const dual = architectureForm.value.architecture !== 'master_slave'
+      if (!nodes.some(node => node.machine_id === architectureForm.value.primary_machine_id)) architectureForm.value.primary_machine_id = nodes[0]?.machine_id || ''
+      const primaryIndex = nodes.findIndex(node => node.machine_id === architectureForm.value.primary_machine_id)
+      nodes.forEach((node, index) => {
+        node.role = index === primaryIndex || (dual && index === (primaryIndex === 0 ? 1 : 0)) ? 'M' : 'S'
+        if (node.role === 'M') {
+          node.delay_seconds = 0
+          node.source_machine_id = ''
+        } else if (!node.source_machine_id || !nodes.some(source => source.machine_id === node.source_machine_id && source.role === 'M')) {
+          node.source_machine_id = nodes[primaryIndex]?.machine_id || ''
+        }
+      })
+      architectureForm.value.move_vip = architectureForm.value.architecture === 'keepalived_dual_master' || architectureForm.value.move_vip
+      architecturePlan.value = null
+    }
+    async function openArchitectureAdjustment() {
+      stopClusterTopologyAutoRefresh()
+      data.value.clusterSection = 'architecture'
+      architecturePlan.value = null
+      architectureRun.value = null
+      architectureLinkSource.value = ''
+      architectureSelectedNode.value = ''
+      architectureRoleChangeDialog.value = null
+      architectureDraggingNode.value = ''
+      await Promise.all([refreshClusterTopology(), loadClusterMachines(1), loadVIPConfigs()])
+      const current = detectCurrentArchitecture()
+      const nodes = clusterTopology.value.nodes.map((node, index) => {
+        const edge = topologyEdgeForNode(node)
+        const isCurrentMaster = node.role === 'M' || node.role === 'M/S'
+        return { machine_id: node.machine_id, port: Number(node.port || 3306), role: isCurrentMaster ? 'M' : 'S', source_machine_id: edge ? topologyMachineForEndpoint(edge.source_ip, edge.source_port) : '', delay_seconds: Number(edge?.sql_delay || 0), election_priority: Math.max(0, 100 - index) }
+      })
+      let currentMaster = current.primary_machine_ids[0] || ''
+      if (!currentMaster && nodes.length) {
+        currentMaster = nodes[0].machine_id
+        nodes[0].role = 'M'
+      }
+      architectureForm.value = { architecture: current.type === 'standalone' ? 'master_slave' : current.type, primary_machine_id: currentMaster, current_master_machine_id: current.type === 'standalone' ? '' : currentMaster, move_vip: false, root_password: '', replication_user: 'repl', replication_password: '', nodes }
+    }
+    async function loadVIPConfigs() {
+      const cluster = selectedClusterDetail.value?.Name || selectedClusterDetail.value?.name
+      if (!cluster) return
+      try { vipConfigs.value = (await api(`/clusters/${encodeURIComponent(cluster)}/vip/config`)) || [] } catch (err) { vipConfigs.value = []; error.value = err.message }
+    }
+    async function saveVIPConfig() {
+      const cluster = selectedClusterDetail.value?.Name || selectedClusterDetail.value?.name
+      try {
+        await api(`/clusters/${encodeURIComponent(cluster)}/vip/config`, { method: 'POST', body: JSON.stringify(vipForm.value) })
+        notice.value = `VIP ${vipForm.value.vip_address} 配置已保存。`
+        vipForm.value.vip_address = ''
+        architecturePlan.value = null
+        await loadVIPConfigs()
+      } catch (err) { error.value = err.message }
+    }
+    async function deleteVIPConfig(item) {
+      const cluster = selectedClusterDetail.value?.Name || selectedClusterDetail.value?.name
+      if (!confirm(`确认删除 VIP ${item.vip_address} 配置？`)) return
+      try { await api(`/clusters/${encodeURIComponent(cluster)}/vip/config?vip=${encodeURIComponent(item.vip_address)}`, { method: 'DELETE' }); architecturePlan.value = null; await loadVIPConfigs() } catch (err) { error.value = err.message }
+    }
+    async function previewArchitectureAdjustment() {
+      const cluster = selectedClusterDetail.value?.Name || selectedClusterDetail.value?.name
+      if (!cluster || architectureForm.value.nodes.length < 2) { error.value = '架构调整至少需要两个 MySQL 实例。'; return }
+      architectureSubmitting.value = true
+      try {
+        architecturePlan.value = await api(`/clusters/${encodeURIComponent(cluster)}/architecture/plan`, { method: 'POST', body: JSON.stringify({ architecture: architectureForm.value.architecture, current_master_machine_id: architectureForm.value.current_master_machine_id || '', preferred_new_master_machine_id: architectureForm.value.primary_machine_id, move_vip: architectureForm.value.move_vip, management_users: ['root','monitor','mha','backup','repl'], nodes: architectureForm.value.nodes }) })
+        notice.value = architecturePlan.value.executable ? '架构调整预检通过，请核对执行顺序。' : '预检完成，但存在阻断项，暂不能执行。'
+      } catch (err) { error.value = err.message } finally { architectureSubmitting.value = false }
+    }
+    async function submitArchitectureAdjustment() {
+      if (!architecturePlan.value) { error.value = '请先生成并检查架构调整计划。'; return }
+      if (!architecturePlan.value.executable) { error.value = '当前计划存在安全阻断项，不能执行。'; return }
+      if (!architectureForm.value.root_password || !architectureForm.value.replication_password) { error.value = '执行前需要填写 root 密码和复制账号密码。'; return }
+      if (!confirm('确认按照预检计划执行架构调整？系统将冻结旧主写入、清理业务会话并调整复制关系。')) return
+      const cluster = selectedClusterDetail.value?.Name || selectedClusterDetail.value?.name
+      architectureSubmitting.value = true
+      try {
+        architectureRun.value = await api(`/clusters/${encodeURIComponent(cluster)}/architecture/start`, { method: 'POST', body: JSON.stringify({ architecture: architectureForm.value.architecture, current_master_machine_id: architectureForm.value.current_master_machine_id || '', preferred_new_master_machine_id: architectureForm.value.primary_machine_id, move_vip: architectureForm.value.move_vip, management_users: ['root','monitor','mha','backup','repl'], root_password: architectureForm.value.root_password, replication_user: architectureForm.value.replication_user, replication_password: architectureForm.value.replication_password, nodes: architectureForm.value.nodes }) })
+        architectureForm.value.root_password = ''
+        architectureForm.value.replication_password = ''
+        notice.value = `安全架构调整已启动：${architectureRun.value.run_id}`
+        syncArchitectureRunTaskSummary()
+        pollArchitectureRun()
+      } catch (err) { error.value = err.message } finally { architectureSubmitting.value = false }
+    }
+    async function pollArchitectureRun() {
+      clearTimeout(architecturePollTimer)
+      const cluster = selectedClusterDetail.value?.Name || selectedClusterDetail.value?.name
+      const runID = architectureRun.value?.run_id
+      if (!cluster || !runID) return
+      try { architectureRun.value = await api(`/clusters/${encodeURIComponent(cluster)}/architecture/${encodeURIComponent(runID)}`) } catch (err) { error.value = err.message; return }
+      syncArchitectureRunTaskSummary()
+      if (!['success','failed'].includes(architectureRun.value.status)) architecturePollTimer = setTimeout(pollArchitectureRun, 2000)
+      else { notice.value = architectureRun.value.status === 'success' ? '架构调整执行成功。' : '架构调整执行失败，请查看步骤和 Agent 任务日志。'; await refreshClusterTopology(); await refresh() }
+    }
+    async function confirmArchitectureForce() {
+      const cluster = selectedClusterDetail.value?.Name || selectedClusterDetail.value?.name
+      if (!confirm('复制在 60 秒内未追平。强制切主可能造成数据丢失，确认继续？')) return
+      try {
+        architectureRun.value = await api(`/clusters/${encodeURIComponent(cluster)}/architecture/${encodeURIComponent(architectureRun.value.run_id)}/force`, { method: 'POST' })
+        notice.value = '已确认强制切主，状态机将继续执行。'
+        pollArchitectureRun()
+      } catch (err) { error.value = err.message }
+    }
+    function architectureRunStepResult(step) {
+      const matches = (architectureRun.value?.step_results || []).filter(item => item.code === step.code)
+      return matches[matches.length - 1] || null
+    }
+    function architectureRunStepStatus(step) {
+      const result = architectureRunStepResult(step)
+      if (result) return result.status
+      if (step.code === 'acquire_lock' && architectureRun.value && architectureRun.value.status !== 'pending') return 'success'
+      if (step.code === 'release_lock' && architectureRun.value?.status === 'success') return 'success'
+      if (architectureRun.value?.current_step === step.code) return 'running'
+      return 'pending'
+    }
+    function architectureRunProgress() {
+      const steps = architectureRun.value?.plan?.steps || []
+      if (!steps.length) return 0
+      if (architectureRun.value?.status === 'success') return 100
+      return Math.round(steps.filter(step => architectureRunStepStatus(step) === 'success').length * 100 / steps.length)
+    }
+    function syncArchitectureRunTaskSummary() {
+      const run = architectureRun.value
+      if (!run?.run_id) return
+      const cluster = selectedClusterDetail.value?.Name || selectedClusterDetail.value?.name || run.cluster_id
+      const summary = { ID: run.run_id, Type: 'architecture_adjustment', MachineID: cluster, MachineName: `集群 ${cluster}`, Cluster: cluster, Status: run.status === 'success' ? 'success' : run.status === 'failed' ? 'failed' : 'running', ProgressPercent: architectureRunProgress(), CurrentStep: run.current_step || '等待启动', CreatedAt: run.created_at }
+      const index = data.value.tasks.findIndex(item => (item.ID || item.id) === run.run_id)
+      if (index >= 0) data.value.tasks.splice(index, 1, summary)
+      else data.value.tasks.unshift(summary)
+    }
+    async function openArchitectureRunTask() {
+      if (!architectureRun.value?.run_id) return
+      await openTaskDetail({ id: architectureRun.value.run_id })
+    }
+    function showClusterCapability(name) {
+      notice.value = name === 'upgrade'
+        ? 'MySQL 内核升级任务接口尚未开发，当前入口仅用于能力预告。'
+        : name === 'ha'
+          ? '高可用与 VIP 属于当前集群的运维能力，配置接口尚未开发。'
+          : '集群备份任务接口尚未开发，当前入口仅用于能力预告。'
+    }
+    async function saveCluster() {
+      const form = clusterForm.value
+      try {
+        if (form.old_name) await api(`/clusters/${encodeURIComponent(form.old_name)}`, { method: 'PUT', body: JSON.stringify({ new_name: form.name, description: form.description }) })
+        else await api('/clusters', { method: 'POST', body: JSON.stringify({ name: form.name, description: form.description }) })
+        notice.value = form.old_name ? '集群信息已更新，机器归属已同步。' : '集群已创建。现在可在机器详情中分配机器。'
+        showClusterEditor.value = false
+        await refresh()
+      } catch (err) { error.value = err.message }
+    }
+    async function deleteCluster(item) {
+      const name = item.Name || item.name
+      const members = clusterMachines(item).length
+      if (!confirm(`确认删除集群 ${name}？${members ? `其中 ${members} 台机器将变为未分配集群。` : ''}`)) return
+      try { await api(`/clusters/${encodeURIComponent(name)}`, { method: 'DELETE' }); notice.value = `集群 ${name} 已删除，机器记录仍保留。`; closeClusterDetail(); await refresh() }
+      catch (err) { error.value = err.message }
+    }
+    async function cleanupCluster(item) {
+      const name = item.Name || item.name
+      const members = clusterMachines(item).length
+      if (!confirm(`高风险操作：将按 CLI“集群一键清理”流程卸载 ${name} 内机器的 MySQL 与 GMHA Agent，并清理关联记录。是否继续？`)) return
+      if (prompt(`二次确认：请输入 CLEAN CLUSTER ${name}`) !== `CLEAN CLUSTER ${name}`) { error.value = '二次确认内容不匹配，已取消集群清理。'; return }
+      clusterCleanupResult.value = null
+      try {
+        clusterCleanupResult.value = await api(`/clusters/${encodeURIComponent(name)}/cleanup`, { method: 'POST' })
+        showClusterCleanup.value = true
+        notice.value = `集群 ${name} 已完成清理。`
+        await refresh()
+      } catch (err) {
+        clusterCleanupResult.value = err.payload?.result || null
+        showClusterCleanup.value = !!clusterCleanupResult.value
+        error.value = `集群清理未完全成功：${err.message}`
+        await refresh()
+      }
+    }
+    function clusterMachines(item) { return item?.Machines || item?.machines || [] }
+    function clusterMachineCount(item) { return clusterMachines(item).length }
+    function clusterAgentCount(item) {
+      const name = item?.Name || item?.name
+      return data.value.agents.filter(agent => machineCluster(agent) === name).length
+    }
+    async function loadClusterPage(page = clusterPage.value) {
+      try {
+        const keyword = clusterKeyword.value.trim()
+        const result = await api(`/clusters?page=${page}&page_size=12&keyword=${encodeURIComponent(keyword)}`)
+        if (Array.isArray(result)) {
+          clusterPageItems.value = result
+          clusterTotal.value = result.length
+          clusterPage.value = 1
+          return
+        }
+        clusterPageItems.value = result.items || []
+        clusterTotal.value = result.total || 0
+        clusterPage.value = result.page || page
+      } catch (err) { error.value = err.message }
+    }
+    async function searchClusterPage() { clusterPage.value = 1; await loadClusterPage(1) }
+    async function changeClusterPage(delta) {
+      const next = clusterPage.value + delta
+      if (next < 1 || (next - 1) * 12 >= clusterTotal.value) return
+      await loadClusterPage(next)
+    }
+    async function loadClusterCandidates(page = clusterCandidatePage.value) {
+      try {
+        const result = await api(`/machines?page=${page}&page_size=${pageSize}`)
+        clusterCandidatePage.value = result.page || page
+        clusterCandidateTotal.value = result.total || 0
+        clusterCandidates.value = result.items || []
+      } catch (err) { error.value = err.message }
+    }
+    async function openClusterMembers(item) {
+      selectedClusterForMembers.value = item
+      selectedClusterMachineIDs.value = []
+      clusterMemberAssignResult.value = null
+      clusterCandidatePage.value = 1
+      await loadClusterCandidates(1)
+      showClusterMembers.value = true
+    }
+    async function changeClusterCandidatePage(delta) {
+      const next = clusterCandidatePage.value + delta
+      if (next < 1 || (next - 1) * pageSize >= clusterCandidateTotal.value) return
+      selectedClusterMachineIDs.value = []
+      await loadClusterCandidates(next)
+    }
+    async function assignClusterMembers() {
+      const cluster = selectedClusterForMembers.value?.Name || selectedClusterForMembers.value?.name
+      const ids = selectedClusterMachineIDs.value
+      if (!cluster || !ids.length) { error.value = '请选择至少一台机器。'; return }
+      if (!confirm(`确认将 ${ids.length} 台机器划入集群 ${cluster}？已有其他集群归属的机器会被移动。每台机器将执行 CLI 同一 Agent 检查与静态信息采集流程。`)) return
+      try {
+        clusterMemberAssignResult.value = await api(`/clusters/${encodeURIComponent(cluster)}/members`, { method: 'POST', body: JSON.stringify({ machine_ids: ids }) })
+        notice.value = `${ids.length} 台机器已划入集群 ${cluster}。`
+        selectedClusterMachineIDs.value = []
+        await Promise.all([refresh(), loadClusterCandidates(clusterCandidatePage.value)])
+        if (selectedClusterDetail.value) await openClusterDetail(selectedClusterDetail.value)
+      } catch (err) {
+        clusterMemberAssignResult.value = err.payload || null
+        error.value = err.message
+      }
+    }
+    function showMySQLMachine(item) { const ip=item.MachineIP||item.machine_ip; const machine=data.value.machines.find(m => (m.IP||m.ip)===ip); if (!machine) { error.value='未找到该实例关联的机器记录。'; return }; showMachine(machine.ID||machine.id) }
+    async function assignCredential() {
+      try {
+        await api(`/ssh-credentials/${selectedCredential.value}/assign`, { method: 'POST', body: JSON.stringify({ machine_ids: assignedMachineIDs.value }) })
+        notice.value = `凭证已分配给 ${assignedMachineIDs.value.length} 台机器。`; showAssign.value = false; await refresh()
+      } catch (err) { error.value = err.message }
+    }
+    function chooseCredential(id) { selectedCredential.value = id; assignedMachineIDs.value = data.value.machines.filter(item => (item.CredentialID || item.credential_id) === id).map(item => item.ID || item.id); showAssign.value = true }
+    function applyCredential() {
+      const credential = data.value.credentials.find(item => item.id === form.value.credential_id)
+      if (credential) { form.value.ssh_user = credential.ssh_user; form.value.ssh_password = '' }
+    }
+    function loadKeyFile(event) { const file = event.target.files?.[0]; if (!file) return; const reader = new FileReader(); reader.onload = () => { credentialForm.value.private_key = reader.result }; reader.readAsText(file) }
+    function errorSummary(message, limit = 180) {
+      const normalized = safeLog(message).replace(/\s+/g, ' ').trim()
+      if (!normalized) return ''
+      const first = normalized.split(/\s+\|\s+/).find(part => part.trim()) || '操作未完成'
+      const summary = first.trim()
+      return summary.length > limit ? `${summary.slice(0, Math.max(1, limit - 1))}…` : summary
+    }
+    function machineLastError(machine) { return machine?.LastError || machine?.last_error || '' }
+    function machineStatus(machine) {
+      const code = state(machine?.Status || machine?.status)
+      const labels = {
+        pending: '等待连接',
+        ssh_connected: 'SSH 已连接',
+        ssh_trust_ready: 'SSH 互信就绪',
+        agent_installing: 'Agent 安装中',
+        agent_online: 'Agent 在线',
+        agent_error: 'Agent 异常',
+        ssh_failed: 'SSH 失败'
+      }
+      return { code, label: labels[code] || '状态未知' }
+    }
+    function machineCluster(machine) { return machine?.Cluster || machine?.cluster || '未分配集群' }
+    function machineAgentInstallDir(machine) {
+      const direct = machine?.AgentInstallDir || machine?.agent_install_dir
+      if (direct) return direct
+      const ip = machine?.IP || machine?.ip
+      const agent = data.value.agents.find(item => (item.IP || item.ip) === ip)
+      return agent?.InstallDir || agent?.install_dir || '尚未安装'
+    }
+    function agentStatus(agent) {
+      const heartbeat = state(agent?.HeartbeatState || agent?.heartbeat_state)
+      const install = state(agent?.InstallState || agent?.install_state)
+      if (heartbeat === 'online' || install === 'online') return { code: 'agent_online', label: '在线' }
+      if (install === 'installing') return { code: 'agent_installing', label: '安装中' }
+      if (agent?.LastError || agent?.last_error || install === 'error') return { code: 'agent_error', label: '异常' }
+      if (heartbeat === 'offline' || heartbeat === 'suspect') return { code: 'agent_error', label: heartbeat === 'suspect' ? '疑似离线' : '离线' }
+      return { code: 'pending', label: '未安装' }
+    }
+    function staticHost(info) { return info?.Host || info?.host || {} }
+    function staticMySQL(info) { return info?.MySQL || info?.mysql || {} }
+    function staticRows(info) {
+      const host = staticHost(info); const mysql = staticMySQL(info)
+      return [
+        ['操作系统', host.OS || host.os || '—'], ['CPU 核数', host.CPUCores ?? host.cpu_cores ?? '—'],
+        ['内存', host.MemoryGB ? `${host.MemoryGB} GB` : (host.memory_gb ? `${host.memory_gb} GB` : '—')], ['glibc', host.GlibcVersion || host.glibc_version || '—'],
+        ['SSH', (host.SSHAvailable ?? host.ssh_available) ? `${host.SSHUser || host.ssh_user || '—'}:${host.SSHPort || host.ssh_port || 22}` : '不可用'],
+        ['网络地址', (host.IPs || host.ips || []).join('、') || '—'], ['SELinux', host.SELinux || host.selinux || '—'], ['防火墙', host.Firewall || host.firewall || '—'],
+        ['NTP', (host.NTPEnabled ?? host.ntp_enabled) ? '已启用' : '未启用'], ['Swap', (host.SwapEnabled ?? host.swap_enabled) ? '已启用' : '未启用'],
+        ['MySQL', (mysql.Installed ?? mysql.installed) ? `${mysql.Version || mysql.version || '已安装'} · ${mysql.Port || mysql.port || '—'}` : '未安装'],
+        ['采集时间', date(info?.CollectedAt || info?.collected_at || info?.UpdatedAt || info?.updated_at)]
+      ]
+    }
+    function dynamicMetrics(info) { return info?.Metrics || info?.metrics || [] }
+    function metricValue(metric) {
+      const value = metric?.Value ?? metric?.value
+      if (value === undefined || value === null) return '—'
+      if (typeof value === 'object') return JSON.stringify(value)
+      return String(value)
+    }
+    function resolveFailedDetail(step, message) {
+      const details = step.details || []
+      const text = String(message || '').toLowerCase()
+      let index = details.findIndex(item => item.state === 'running')
+      if (step.title === '部署 GMHA Agent') {
+        if (text.includes('heartbeat') || text.includes('deadline exceeded')) index = 4
+        else if (text.includes('upload agent binary')) index = 1
+        else if (text.includes('agent.yaml') || text.includes('systemd unit')) index = 2
+        else if (text.includes('systemctl') || text.includes('start gmha-agent')) index = 3
+        else if (text.includes('install dir') || text.includes('permission')) index = 0
+        if (index >= 0) details.forEach((item, itemIndex) => { if (itemIndex < index && item.state !== 'error') item.state = 'success' })
+      }
+      return details[index] || details.find(item => item.state === 'running')
+    }
+    function flowErrorKey(step, detail) { return `${step.title}:${detail.title}` }
+    function isFlowErrorExpanded(step, detail) { return !!expandedFlowErrors.value[flowErrorKey(step, detail)] }
+    function toggleFlowError(step, detail) { const key = flowErrorKey(step, detail); expandedFlowErrors.value = { ...expandedFlowErrors.value, [key]: !expandedFlowErrors.value[key] } }
+    function flowReport() {
+      const failed = onboardingFlow.value.find(item => item.state === 'error')
+      const detail = failed?.details?.find(item => item.state === 'error')
+      return `GMHA 纳管问题报告\n时间：${new Date().toLocaleString('zh-CN')}\n目标：${onboardingResult.value?.name || form.value.name} (${onboardingResult.value?.ip || form.value.ip})\n失败阶段：${failed?.title || '未知'}${detail ? ` / ${detail.title}` : ''}\n错误详情：${detail?.error || failed?.detail || error.value || '未知'}`
+    }
+    async function loadPackages() {
+      try {
+        const suffix = packageKeyword.value ? `?keyword=${encodeURIComponent(packageKeyword.value)}` : ''
+        const result = await api(`/packages${suffix}`)
+        packageItems.value = result.items || []; packageSettings.value = result.settings || {}
+        const bundles = packageSettings.value.bundles || []
+        if (!bundles.some(item => item.id === packageBundleID.value)) packageBundleID.value = bundles.find(item => item.default)?.id || bundles[0]?.id || ''
+      } catch (err) { error.value = err.message }
+    }
+    function choosePackageFile(event) { packageForm.value.file = event.target.files?.[0] || null }
+    async function uploadPackage() {
+      if (!packageForm.value.file) { error.value = '请选择要上传的安装包。'; return }
+      const form = new FormData(); form.set('category', packageForm.value.category); form.set('arch', packageForm.value.arch); form.set('file', packageForm.value.file)
+      try {
+        const response = await fetch('/api/v1/packages', { method: 'POST', body: form }); const result = await response.json().catch(() => ({}))
+        if (!response.ok) throw new Error(result.error || '上传失败')
+        notice.value = `安装包已上传：${result.name}`; packageForm.value.file = null; const input = document.getElementById('package-upload-file'); if (input) input.value = ''; await loadPackages()
+      } catch (err) { error.value = err.message }
+    }
+    async function deletePackage(item) {
+      if (!confirm(`确认删除安装包 ${item.name}？`)) return
+      try { await api(`/packages/${encodeURIComponent(item.category)}/${encodeURIComponent(item.name)}`, { method: 'DELETE' }); notice.value = `已删除 ${item.name}`; await loadPackages() } catch (err) { error.value = err.message }
+    }
+    function packageCatalogInstalled(item) { return packageItems.value.some(pkg => pkg.category === item.category && pkg.name === item.name) }
+    function packageCatalogByID(id) { return (packageSettings.value.catalog || []).find(item => item.id === id) }
+    function packageBundleCatalogItems(optional = false) {
+      const bundle = selectedPackageBundle.value
+      if (!bundle) return []
+      const ids = optional ? (bundle.optional_catalog_ids || []) : [bundle.mysql_catalog_id, ...(bundle.recommended_catalog_ids || [])]
+      return ids.map(packageCatalogByID).filter(Boolean)
+    }
+    function packageBundleInstalledCount() { return packageBundleCatalogItems().filter(packageCatalogInstalled).length }
+    function packageBundleAllInstalled() { const items = packageBundleCatalogItems(); return items.length > 0 && items.every(packageCatalogInstalled) }
+    async function fetchPackageBundle() {
+      if (!selectedPackageBundle.value || packageBundleFetching.value || packageBundleAllInstalled()) return
+      packageBundleFetching.value = true; error.value = ''; notice.value = '正在从官网准备 MySQL 与推荐工具，较大的安装包可能需要几分钟…'
+      try {
+        const result = await api('/packages/fetch-bundle', { method: 'POST', body: JSON.stringify({ bundle_id: selectedPackageBundle.value.id }) })
+        await loadPackages()
+        const downloaded = (result.results || []).filter(item => item.status === 'downloaded').length
+        const failed = (result.results || []).filter(item => item.status === 'failed')
+        if (failed.length) error.value = `已下载 ${downloaded} 个包，${failed.length} 个失败：${failed.map(item => item.error).join('；')}`
+        else notice.value = downloaded ? `推荐组合准备完成，新下载 ${downloaded} 个安装包。` : '推荐组合已经全部入库。'
+      } catch (err) { error.value = err.message }
+      finally { packageBundleFetching.value = false }
+    }
+    async function fetchCatalogPackage(item) {
+      if (packageCatalogInstalled(item) || packageFetching.value[item.id]) return
+      packageFetching.value = { ...packageFetching.value, [item.id]: true }
+      error.value = ''
+      try {
+        const result = await api('/packages/fetch', { method: 'POST', body: JSON.stringify({ catalog_id: item.id }) })
+        notice.value = `官方软件包已入库：${result.name}`
+        await loadPackages()
+      } catch (err) { error.value = err.message }
+      finally { packageFetching.value = { ...packageFetching.value, [item.id]: false } }
+    }
+    async function verifyPackage(item) {
+      const key = `${item.category}/${item.name}`
+      packageFetching.value = { ...packageFetching.value, [key]: true }
+      try {
+        await api('/packages/verify', { method: 'POST', body: JSON.stringify({ category: item.category, name: item.name }) })
+        notice.value = `SHA-256 校验完成：${item.name}`
+        await loadPackages()
+      } catch (err) { error.value = err.message }
+      finally { packageFetching.value = { ...packageFetching.value, [key]: false } }
+    }
+    async function savePackageStorage() {
+      const path = String(packageSettings.value.storage_path || '').trim()
+      if (!path) { error.value = '安装包存放目录不能为空。'; return }
+      try { packageSettings.value = await api('/package-settings', { method: 'PUT', body: JSON.stringify({ storage_path: path }) }); notice.value = '安装包存放位置已保存。'; await loadPackages() } catch (err) { error.value = err.message }
+    }
+    function packageDownloadURL(item) { return `/api/v1/packages/${encodeURIComponent(item.category)}/${encodeURIComponent(item.name)}` }
+    function packageCategoryLabel(category) {
+      return ({ mysql: 'MySQL', 'percona-toolkit': 'Percona Toolkit (PT)', keepalived: 'Keepalived', 'mysql-router': 'MySQL Router', xtrabackup: 'XtraBackup', binlog2sql: 'binlog2sql', mycat: 'Mycat', proxysql: 'ProxySQL', sysbench: 'Sysbench', other: '第三方软件' })[category] || category
+    }
+    function packageChecksum(value) { return value ? `${value.slice(0, 12)}…${value.slice(-8)}` : '计算中' }
+    function packageSize(value) { const size = Number(value || 0); return size < 1024 ? `${size} B` : size < 1048576 ? `${(size / 1024).toFixed(1)} KB` : `${(size / 1048576).toFixed(1)} MB` }
+    function state(value) { return String(value || 'unknown').toLowerCase() }
+    function label(value) { return value || '未知' }
+    function date(value) { return value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '—' }
+    const machineBulkBindings = { machineKeyword, machineClusterFilter, selectedMachineIDs, showBatchOnboard, batchOnboardRows, batchOnboardShared, batchOnboardRunning, batchOnboardResults, showBulkDelete, bulkDeleteForm, bulkDeleteRunning, bulkDeleteResults, searchMachines, toggleCurrentMachinePage, changeMachinePage, openBatchOnboard, addBatchOnboardRow, removeBatchOnboardRow, batchOnboardCredentialChanged, submitBatchOnboard, bulkDeleteExpected, bulkDeleteClusterMembers, bulkDeleteClusterSummary, leaveBulkDeleteForClusters, openBulkDelete, submitBulkDelete }
+    const topologyOverviewBindings = { clusterTopologyRefreshing, clusterTopologyLastUpdated, clusterTopologyAutoRefresh, startClusterTopologyAutoRefresh, stopClusterTopologyAutoRefresh, toggleClusterTopologyAutoRefresh, overviewTopologyRoots, overviewTopologyReplicas, overviewTopologyStandalone, overviewTopologyEdgeForReplica, overviewTopologySourceName, topologyMetric }
+    const architectureBindings = { testManagerDatabase, refreshManagerStatus, mysqlInstallArchitectures, mysqlInstallVersions, mysqlInstallMachineChanged, mysqlInstallArchitectureChanged, architectureLinkSource, architectureSelectedNode, architectureRoleChangeDialog, architectureDraggingNode, architectureNodeMeta, architectureAvailableInstances, addArchitectureInstance, setArchitectureNodeRole, requestArchitectureRoleChange, confirmArchitectureRoleChange, architectureDraftEdges, startArchitectureNodeDrag, finishArchitectureNodeDrag, dropArchitectureNode, dropArchitectureLayer, startArchitectureLink, completeArchitectureLink, addKeepalivedToTopology, removeKeepalivedFromTopology, kickArchitectureNode, architectureRunStepResult, architectureRunStepStatus, architectureRunProgress, openArchitectureRunTask, showMachineDelete, machineDeleteForm, machineDeleteSubmitting, machineDeleteError, machineDeleteExpected, machineDeleteClusterName, leaveMachineDeleteForCluster, machineDeleteSteps, openMachineDelete, ...topologyOverviewBindings, ...machineBulkBindings }
+    architectureBindings.taskSpec = taskSpec
+    architectureBindings.relatedTaskIDs = relatedTaskIDs
+    Object.assign(architectureBindings, { taskTypeFilter, taskPage, taskPageSize, taskTotal, taskDetailStack, changeTaskPage, canDeleteTask, deleteTaskRecord, packageBundleID, packageBundleFetching, selectedPackageBundle, packageBundleCatalogItems, packageBundleInstalledCount, packageBundleAllInstalled, fetchPackageBundle })
+    let taskFilterTimer = null
+    watch([taskFilter, taskTypeFilter, taskKeyword], () => {
+      taskPage.value = 1
+      clearTimeout(taskFilterTimer)
+      taskFilterTimer = setTimeout(loadTaskPage, 250)
+    })
+    onMounted(() => { refresh(); loadPackages(); managerStatusTimer = setInterval(refreshManagerStatus, 3000) })
+    onUnmounted(() => { stopTaskPolling(); clearTimeout(taskFilterTimer); clearTimeout(architecturePollTimer); clearInterval(managerStatusTimer); stopClusterTopologyAutoRefresh() })
+    return { active, current, navGroups, expandedNav, toggleNavGroup, chooseNavigation, data, managerForm, metrics, recentTasks, filteredTasks, taskFilter, taskKeyword, selectedTaskDetail, selectedTaskStep, selectedTaskEvents, taskObject, taskSteps, taskEvents, taskTitle, taskTypeLabel, taskStatusLabel, stepStatusLabel, elapsed, safeLog, chooseTaskStep, selectCurrentTaskStep, openTaskDetail, refreshSelectedTaskDetail, closeTaskDetail, loading, error, notice, showOnboard, showOnboardFlow, showMachineDetail, showCredential, showAssign, showQuickClusterAssign, showAgentDetail, agentActionDialog, agentActionInput, closeAgentAction, submitAgentAction, showMySQLInstall, showMySQLTask, mysqlView, packageItems, packageSettings, packageForm, packageKeyword, packageFetching, packageCatalogInstalled, fetchCatalogPackage, verifyPackage, packageChecksum, showClusterEditor, showClusterCleanup, showClusterMembers, mysqlTaskDetail, clusterCleanupResult, selectedClusterForMembers, clusterCandidates, clusterCandidatePage, clusterCandidateTotal, selectedClusterMachineIDs, clusterMemberAssignResult, clusterPage, clusterTotal, clusterKeyword, clusterPageItems, selectedClusterDetail, clusterTopology, clusterTopologyError, clusterMachineItems, clusterMachinePage, clusterMachineTotal, selectedClusterOperationMachineIDs, clusterMySQLDialog, clusterMySQLForm, clusterMySQLConfirm, automationSelectedClusters, automationForm, automationConfirm, automationRunning, automationResults, toggleAllAutomationClusters, submitAutomationTask, mysqlPrivilegeOptions, backupPolicies, backupRuns, showBackupPolicyEditor, backupPolicyForm, architectureForm, architectureCurrent, architectureHasChanges, architecturePlan, architectureRun, vipConfigs, vipForm, architectureSubmitting, applyArchitectureRoles, architectureNodeChanged, architectureNodeHasChanges, architectureNodeName, topologyEdgeForNode, openArchitectureAdjustment, previewArchitectureAdjustment, submitArchitectureAdjustment, confirmArchitectureForce, loadVIPConfigs, saveVIPConfig, deleteVIPConfig, openClusterBackup, loadClusterBackups, openBackupPolicyEditor, saveBackupPolicy, deleteBackupPolicy, runBackupPolicy, restoreBackup, backupScheduleLabel, backupMachines, backupInstancesForMachine, backupMachineChanged, backupMachineRole, weekdayName, toggleAllBackupWeekdays, backupTypeLabel, form, credentialForm, mysqlInstallForm, isCustomMySQLAccount, addCustomMySQLAccount, removeCustomMySQLAccount, clusterForm, selectedCredential, assignedMachineIDs, onboardingFlow, onboardingResult, onboardingDetected, canSkipPrecheck, machinePage, credentialPage, machineTotal, credentialTotal, pageSize, selectedMachine, selectedAgent, selectedMachineErrorExpanded, selectedMachineCluster, machineStaticInfo, machineDynamicInfo, machineInfoError, refresh, onboard, cleanupTarget, recover, showAgent, retryAgent, upgradeAgent, uninstallAgent, repairMySQLAgentConfig, saveManagerConfig, managerAction, showMachine, showMySQLMachine, saveMachine, deleteMachine, assignMachineCluster, openQuickClusterAssign, quickAssignMachineCluster, collectMachineStaticInfo, loadMachineDynamicInfo, changePage, createCredential, createMySQLInstall, openMySQLInstall, saveMySQLAccountPresets, refreshMySQLTask, uninstallMySQL, forgetMySQL, openCreateCluster, openEditCluster, openClusterDetail, closeClusterDetail, refreshClusterTopology, installClusterMySQL, uninstallClusterMySQL, mysqlInstancesOnMachine, clusterMachineInterfaces, mysqlTopologyNode, mysqlRoleLabel, openClusterMySQLBatch, submitClusterMySQLBatch, removeMachineFromCluster, changeClusterMachinePage, showClusterCapability, saveCluster, deleteCluster, cleanupCluster, clusterMachines, clusterMachineCount, clusterAgentCount, loadClusterPage, searchClusterPage, changeClusterPage, openClusterMembers, changeClusterCandidatePage, assignClusterMembers, deleteCredential, assignCredential, chooseCredential, applyCredential, loadKeyFile, loadPackages, choosePackageFile, uploadPackage, deletePackage, savePackageStorage, packageDownloadURL, packageCategoryLabel, packageSize, flowReport, toggleFlowError, isFlowErrorExpanded, machineLastError, machineStatus, machineCluster, machineAgentInstallDir, agentStatus, staticRows, dynamicMetrics, metricValue, errorSummary, ...architectureBindings, state, label, date }
+  },
+  template: `
+    <main class="shell">
+      <header class="global-header">
+        <div class="global-brand"><div class="brand-mark"><img src="/gmha-mark.svg" alt="GMHA" /></div><div><strong>GMHA 管理平台</strong><span>MySQL 高可用管理工具</span></div></div>
+        <div class="global-actions">
+          <button type="button" @click="chooseNavigation('tasks')"><span>☷</span>任务中心</button>
+        </div>
+      </header>
+      <aside class="sidebar">
+        <nav v-for="group in navGroups" :key="group.title" class="nav-group" :class="{ open: expandedNav[group.title], 'cluster-nav-group': group.title === '集群运维' }">
+          <button type="button" class="nav-parent" :class="{ active: group.items.some(item => item.id === active) }" @click="toggleNavGroup(group.title)">
+            <i>{{ group.icon }}</i><span>{{ group.title }}</span><b>⌄</b>
+          </button>
+          <div v-show="expandedNav[group.title]" class="nav-children">
+            <button v-for="item in group.items" :key="item.id" class="nav-item" :class="{ active: active === item.id }" @click="chooseNavigation(item.id)">
+              <i>{{ item.icon }}</i><span>{{ item.label }}</span><em v-if="item.soon">规划中</em>
+            </button>
+          </div>
+        </nav>
+        <div class="sidebar-footer"><span class="pulse"></span> Manager 服务已连接</div>
+      </aside>
+      <section class="content">
+        <header class="topbar"><div><h1>{{ current.label }}</h1><span class="title-refresh" :class="{ spinning: loading }" @click="refresh" title="刷新当前数据">↻</span></div>
+          <div class="top-actions"><span class="updated" v-if="loading">正在刷新…</span><button v-if="active === 'machines'" class="secondary top-secondary" @click="showCredential = true">＋ 添加凭证</button><button v-if="active === 'machines'" class="primary" @click="showOnboard = true">＋ 纳管机器</button><button v-if="active === 'mysql' && mysqlView !== 'install'" class="primary" @click="openMySQLInstall">＋ 安装 MySQL</button></div>
+        </header>
+        <div v-if="error" class="alert error"><b>操作未完成</b><span>{{ errorSummary(error) }}</span><small>完整执行日志请在任务中心对应任务详情中查看。</small><button @click="error = ''">×</button></div>
+        <div v-if="notice" class="alert success"><b>操作已提交</b><span>{{ errorSummary(notice, 240) }}</span><button @click="notice = ''">×</button></div>
+        <template v-if="active === 'alerts'"><AlertManagement :clusters="data.clusters" /></template>
+        <template v-else-if="active === 'manager'"><section class="manager-hero"><div><p>MANAGER RUNTIME</p><h2>管理端运行控制</h2><span>配置服务监听、数据库和 Agent 二进制，并在此管理后台进程。</span></div><div class="manager-state"><span :class="['status', data.manager.running ? 'online' : 'offline']">{{ data.manager.unreachable ? '连接中断' : data.manager.running ? '运行中' : '未运行' }}</span><b>{{ data.manager.unreachable ? '等待状态接口恢复' : data.manager.running ? 'PID ' + data.manager.pid : '等待启动' }}</b><small v-if="data.manager.started_at && !data.manager.unreachable">{{ date(data.manager.started_at) }} 启动</small><small v-if="data.manager.last_checked_at">{{ date(data.manager.last_checked_at) }} 检测</small></div></section><section class="manager-grid"><article class="panel manager-card"><div class="panel-head"><div><h3>服务控制</h3><p>操作由当前 Manager Runtime 执行</p></div></div><div class="control-body"><div><span>HTTP 监听</span><b>{{ managerForm.listen_http || '—' }}</b></div><div><span>gRPC 监听</span><b>{{ managerForm.listen_grpc || '—' }}</b></div><div><span>日志文件</span><small>{{ data.manager.log_path || '尚未生成' }}</small></div><div v-if="data.manager.unreachable" class="manager-offline-help"><b>Manager HTTP 服务不可达</b><small>Web 页面无法启动承载自身的后端，请在 Manager 主机执行：</small><code>./gmha serve --listen :8080 --grpc-listen :9100</code><small v-if="data.manager.last_error">{{ data.manager.last_error }}</small></div><div class="control-actions"><button v-if="data.manager.unreachable" class="secondary" type="button" @click="refreshManagerStatus">重新检测</button><button v-else class="secondary" @click="managerAction('restart')">重启 Manager</button></div></div></article><form class="panel manager-card" @submit.prevent="saveManagerConfig"><div class="panel-head"><div><h3>启动参数</h3><p>保存后，重启 Manager 生效</p></div><div class="manager-form-actions"><button type="button" class="secondary" @click="testManagerDatabase">测试连接</button><button class="text-button">保存配置</button></div></div><div class="config-form"><label>HTTP 监听<input v-model="managerForm.listen_http" placeholder=":8080"></label><label>gRPC 监听<input v-model="managerForm.listen_grpc" placeholder=":9100"></label><label>Manager HTTP 地址<input v-model="managerForm.manager_http_addr" placeholder="http://192.168.1.10:8080"></label><label>Manager gRPC 地址<input v-model="managerForm.manager_grpc_addr" placeholder="192.168.1.10:9100"></label><label>数据库驱动<select v-model="managerForm.database_driver" @change="managerForm.database_dsn = String()"><option value="sqlite">SQLite</option><option value="mysql">MySQL</option><option value="postgres">PostgreSQL</option></select></label><label v-if="managerForm.database_driver !== 'sqlite'" class="wide">数据库 DSN<input v-model="managerForm.database_dsn" :placeholder="managerForm.database_driver === 'mysql' ? 'gmha:password@tcp(127.0.0.1:3306)/gmha?parseTime=true' : 'postgres://gmha:password@127.0.0.1:5432/gmha?sslmode=disable'"></label><label v-else class="wide">SQLite 数据库路径<input v-model="managerForm.db_path" placeholder="./data/manager.db"></label><label class="wide">Agent 二进制路径<input v-model="managerForm.agent_binary_path" placeholder="./bin/agentd"></label></div></form></section></template>
+        <template v-else-if="active === 'overview'">
+          <section class="panel overview-profile"><div class="panel-head"><div><h3>基本运行信息</h3><p>Manager 服务、数据库和资源接入状态</p></div><span :class="['status', data.manager.running ? 'online' : 'offline']">{{ data.manager.running ? 'Manager 正常运行' : 'Manager 未运行' }}</span></div><div class="overview-kv-grid"><div><small>Manager HTTP 地址</small><b>{{ managerForm.manager_http_addr || managerForm.listen_http || '—' }}</b></div><div><small>Manager gRPC 地址</small><b>{{ managerForm.manager_grpc_addr || managerForm.listen_grpc || '—' }}</b></div><div><small>数据库类型</small><b>{{ managerForm.database_driver || 'SQLite' }}</b></div><div><small>集群数量</small><b>{{ data.clusters.length }}</b></div><div><small>受管机器</small><b>{{ machineTotal }}</b></div><div><small>Agent 总数</small><b>{{ data.agents.length }}</b></div></div></section>
+          <section class="metric-grid"><article v-for="item in metrics" :key="item.label" class="metric-card"><span :class="['metric-dot', item.tone]"></span><p>{{ item.label }}</p><strong>{{ item.value }}</strong><small>{{ item.hint }}</small></article></section>
+          <section class="panel"><div class="panel-head"><div><h3>最近任务</h3><p>查看最近提交的自动化运维任务</p></div><button class="text-button" @click="active = 'tasks'">查看全部 →</button></div><TaskTable :items="recentTasks" :machines="data.machines" :state="state" :date="date" @select="openTaskDetail" /></section>
+        </template>
+
+        <template v-else-if="active === 'machines'">
+          <section class="panel machine-management-panel">
+            <div class="panel-head"><div><h3>受管机器</h3><p>按机器或集群筛选，支持跨页选择并批量管理</p></div><span class="count">{{ machineTotal }} 台</span></div>
+            <form class="machine-filter-bar" @submit.prevent="searchMachines">
+              <input v-model.trim="machineKeyword" placeholder="搜索机器名称、IP、机器 ID 或 SSH 用户">
+              <select v-model="machineClusterFilter"><option value="all">全部集群</option><option value="__unassigned__">未分配集群</option><option v-for="cluster in data.clusters" :key="cluster.Name || cluster.name" :value="cluster.Name || cluster.name">{{ cluster.Name || cluster.name }}</option></select>
+              <button class="secondary">筛选</button><button type="button" class="text-button" @click="machineKeyword='';machineClusterFilter='all';searchMachines()">重置</button>
+            </form>
+            <div class="machine-bulk-toolbar"><div><button type="button" class="secondary" @click="toggleCurrentMachinePage">{{ data.machines.length && data.machines.every(item => selectedMachineIDs.includes(item.ID || item.id)) ? '取消当前页全选' : '当前页全选' }}</button><span>已选择 <b>{{ selectedMachineIDs.length }}</b> 台</span></div><div><button class="secondary" @click="openBatchOnboard">＋ 批量纳管</button><button class="danger-button" :disabled="!selectedMachineIDs.length" @click="openBulkDelete">批量删除</button></div></div>
+            <div class="machine-table-wrap"><table class="machine-pool-table"><thead><tr><th class="machine-check-column"><input type="checkbox" :checked="data.machines.length && data.machines.every(item => selectedMachineIDs.includes(item.ID || item.id))" @change="toggleCurrentMachinePage"></th><th>机器</th><th>地址</th><th>SSH</th><th>所属集群</th><th>凭证</th><th>状态</th><th>操作</th></tr></thead><tbody><tr v-for="item in data.machines" :key="item.ID || item.id" :class="{selected:selectedMachineIDs.includes(item.ID || item.id)}"><td class="machine-check-column"><input v-model="selectedMachineIDs" type="checkbox" :value="item.ID || item.id"></td><td><b>{{ label(item.Name || item.name) }}</b><small>{{ item.ID || item.id }}</small></td><td>{{ item.IP || item.ip }}</td><td>{{ item.SSHUser || item.ssh_user || 'root' }}:{{ item.SSHPort || item.ssh_port || 22 }}</td><td><button v-if="machineCluster(item) === '未分配集群'" class="cluster-label unassigned cluster-assign-button" @click="openQuickClusterAssign(item)">未分配集群</button><span v-else class="cluster-label">{{ machineCluster(item) }}</span></td><td>{{ data.credentials.find(c => c.id === (item.CredentialID || item.credential_id))?.name || (item.CredentialID || item.credential_id ? '已关联' : '未分配') }}</td><td><span :class="['status', machineStatus(item).code]">{{ machineStatus(item).label }}</span></td><td><button class="text-button" @click="showMachine(item.ID || item.id)">详情 / 编辑</button></td></tr><tr v-if="!data.machines.length"><td colspan="8" class="empty">{{ machineKeyword || machineClusterFilter !== 'all' ? '没有符合筛选条件的机器。' : '尚未纳管机器。点击“批量纳管”开始添加。' }}</td></tr></tbody></table></div>
+            <div class="pager"><button :disabled="machinePage === 1" @click="changeMachinePage(-1)">上一页</button><span>第 {{ machinePage }} 页 · 共 {{ machineTotal }} 台</span><button :disabled="machinePage * pageSize >= machineTotal" @click="changeMachinePage(1)">下一页</button></div>
+          </section>
+          <section class="panel credentials-panel"><div class="panel-head"><div><h3>SSH 凭证库</h3><p>凭证独立管理，可批量分配至一台或多台机器；敏感内容不会回显。</p></div><button class="text-button" @click="showCredential = true">添加凭证 →</button></div><table><thead><tr><th>凭证名称</th><th>认证方式</th><th>SSH 用户</th><th>更新时间</th><th></th></tr></thead><tbody><tr v-for="item in data.credentials" :key="item.id"><td><b>{{ item.name }}</b><small>{{ item.id }}</small></td><td><span class="credential-type">{{ item.type === 'private_key' ? 'SSH 私钥文件' : '密码' }}</span></td><td>{{ item.ssh_user }}</td><td>{{ item.updated_at }}</td><td><button class="text-button" @click="chooseCredential(item.id)">分配机器</button><button class="danger-link" @click="deleteCredential(item)">删除</button></td></tr><tr v-if="!data.credentials.length"><td colspan="5" class="empty">暂无凭证。请先添加密码或 SSH 私钥文件凭证。</td></tr></tbody></table><div class="pager"><button :disabled="credentialPage === 1" @click="changePage(credentialPage, -1, credentialTotal)">上一页</button><span>第 {{ credentialPage }} 页 · 共 {{ credentialTotal }} 条</span><button :disabled="credentialPage * pageSize >= credentialTotal" @click="changePage(credentialPage, 1, credentialTotal)">下一页</button></div></section>
+        </template>
+
+        <template v-else-if="active === 'automation'">
+          <section class="automation-page">
+            <header class="automation-hero"><div><p>MULTI-CLUSTER AUTOMATION</p><h2>多集群自动化任务</h2><span>一次选择多个集群，使用统一参数并行创建独立任务；执行进度可在任务中心持续跟踪。</span></div><strong>{{ automationSelectedClusters.length }}<small>已选集群</small></strong></header>
+            <form class="automation-workspace" @submit.prevent="submitAutomationTask">
+              <section class="panel automation-targets"><div class="panel-head"><div><h3>1. 选择目标集群</h3><p>任务将同时提交到所选集群</p></div><button type="button" class="text-button" @click="toggleAllAutomationClusters">{{ automationSelectedClusters.length === data.clusters.length && data.clusters.length ? '取消全选' : '选择全部' }}</button></div><div class="automation-cluster-list"><label v-for="item in data.clusters" :key="item.Name || item.name" :class="{selected:automationSelectedClusters.includes(item.Name || item.name)}"><input v-model="automationSelectedClusters" type="checkbox" :value="item.Name || item.name"><span><b>{{ item.Name || item.name }}</b><small>{{ item.Description || item.description || '暂无描述' }}</small></span><em>{{ clusterMachineCount(item) }} 台机器</em></label><div v-if="!data.clusters.length" class="empty">尚未创建集群，请先在“集群列表”中创建。</div></div></section>
+              <section class="panel automation-config">
+                <div class="panel-head"><div><h3>2. 配置自动化操作</h3><p>按集群展开为独立 Agent 任务；数据库操作使用结构化参数生成命令。</p></div></div>
+                <div class="automation-action-picker">
+                  <label :class="{selected:automationForm.action==='install'}"><input v-model="automationForm.action" type="radio" value="install"><span><b>批量安装 MySQL</b><small>为所选集群内的机器创建安装任务</small></span></label>
+                  <label class="danger" :class="{selected:automationForm.action==='uninstall'}"><input v-model="automationForm.action" type="radio" value="uninstall"><span><b>批量卸载 MySQL</b><small>卸载指定端口的已登记实例</small></span></label>
+                  <label :class="{selected:automationForm.action==='collect_machine'}"><input v-model="automationForm.action" type="radio" value="collect_machine"><span><b>采集机器信息</b><small>采集系统、CPU、内存、磁盘和网络信息</small></span></label>
+                  <label :class="{selected:automationForm.action==='collect_mysql'}"><input v-model="automationForm.action" type="radio" value="collect_mysql"><span><b>采集 MySQL 数据</b><small>采集版本、连接、QPS/状态等运行数据</small></span></label>
+                  <label :class="{selected:automationForm.action==='mysql_user'}"><input v-model="automationForm.action" type="radio" value="mysql_user"><span><b>数据库用户与权限</b><small>批量增删改查用户，授予或回收权限</small></span></label>
+                  <label :class="{selected:automationForm.action==='mysql_parameter'}"><input v-model="automationForm.action" type="radio" value="mysql_parameter"><span><b>修改数据库参数</b><small>选择动态生效或写配置后重启生效</small></span></label>
+                  <label :class="{selected:automationForm.action==='backup'}"><input v-model="automationForm.action" type="radio" value="backup"><span><b>批量执行备份</b><small>触发所选集群内已启用的备份策略</small></span></label>
+                  <label :class="{selected:automationForm.action==='shell'}"><input v-model="automationForm.action" type="radio" value="shell"><span><b>下发 Shell 脚本</b><small>在所选集群的全部在线 Agent 上执行脚本</small></span></label>
+                </div>
+                <div class="automation-form-grid">
+                  <template v-if="automationForm.action==='install'"><label>MySQL 端口<input v-model.number="automationForm.port" type="number" min="1" required></label><label>起始 server_id<input v-model.number="automationForm.server_id_start" type="number" min="1" required></label><label>MySQL 运行用户<input v-model.trim="automationForm.mysql_user" required></label><label>参数 Profile<input v-model.trim="automationForm.profile" required></label><label class="wide">root 密码<input v-model="automationForm.root_password" type="password" required></label><label class="automation-check wide"><input v-model="automationForm.install_pt_tools" type="checkbox"><span><b>安装 PT 工具</b><small>MySQL 验证成功后安装 Percona Toolkit，默认关闭</small></span></label></template>
+                  <template v-else-if="automationForm.action==='uninstall'"><label>MySQL 端口<input v-model.number="automationForm.port" type="number" min="1" required></label><div class="automation-danger wide"><b>高风险操作</b><p>将同时为 {{ automationSelectedClusters.length }} 个集群创建卸载任务。数据目录可能被删除，请确认已完成备份。</p></div><label class="wide">二次确认<input v-model="automationConfirm" :placeholder="'UNINSTALL '+automationSelectedClusters.length+' CLUSTERS'" required><small>请输入：<code>UNINSTALL {{ automationSelectedClusters.length }} CLUSTERS</code></small></label></template>
+                  <template v-else-if="automationForm.action==='collect_mysql'"><label>MySQL 端口<input v-model.number="automationForm.port" type="number" min="1"></label><label>管理员用户名<input v-model.trim="automationForm.mysql_user"></label><label>管理员密码<input v-model="automationForm.mysql_password" type="password"></label><div class="automation-info wide"><b>采集内容</b><p>版本、端口、连接数、QPS/Queries、运行时长等会保存到任务输出，可下载汇总报告。</p></div></template>
+                  <template v-else-if="automationForm.action==='mysql_user'"><label>MySQL 端口<input v-model.number="automationForm.port" type="number" min="1"></label><label>管理员用户名<input v-model.trim="automationForm.mysql_user"></label><label>管理员密码<input v-model="automationForm.mysql_password" type="password"></label><label>操作<select v-model="automationForm.user_action"><option value="create">创建或覆盖密码并授权</option><option value="update">修改密码</option><option value="delete">删除用户</option><option value="grant">增加权限</option><option value="revoke">回收权限</option><option value="query">查询用户授权</option><option value="list">列出全部用户</option></select></label><label v-if="automationForm.user_action!=='list'">目标用户名<input v-model.trim="automationForm.target_username" placeholder="app_user"></label><label v-if="automationForm.user_action!=='list'">来源 Host<input v-model.trim="automationForm.target_host" placeholder="%"></label><label v-if="['create','update'].includes(automationForm.user_action)">目标用户密码<input v-model="automationForm.target_password" type="password"></label><fieldset v-if="['create','grant','revoke'].includes(automationForm.user_action)" class="wide"><legend>权限选择</legend><label v-for="privilege in mysqlPrivilegeOptions" :key="privilege" class="check-label"><input v-model="automationForm.privileges" type="checkbox" :value="privilege">{{ privilege }}</label></fieldset><div v-if="automationForm.user_action==='list'" class="automation-info wide"><b>用户清单</b><p>会读取每台目标 MySQL 的用户、来源 Host 与锁定状态，并写入可下载的执行报告。</p></div></template>
+                  <template v-else-if="automationForm.action==='mysql_parameter'"><label>MySQL 端口<input v-model.number="automationForm.port" type="number" min="1"></label><label>管理员用户名<input v-model.trim="automationForm.mysql_user"></label><label>管理员密码<input v-model="automationForm.mysql_password" type="password"></label><label>参数名称<input v-model.trim="automationForm.parameter_name" placeholder="max_connections"></label><label>参数值<input v-model.trim="automationForm.parameter_value" placeholder="500"></label><label>生效方式<select v-model="automationForm.apply_mode"><option value="dynamic">动态生效（SET GLOBAL）</option><option value="restart">写入配置并重启生效</option><option value="both">动态生效并写入配置</option></select></label><template v-if="['restart','both'].includes(automationForm.apply_mode)"><label>配置文件路径<input v-model.trim="automationForm.config_path"></label><label>systemd 服务名<input v-model.trim="automationForm.systemd_unit"></label></template><div class="automation-danger wide" v-if="['restart','both'].includes(automationForm.apply_mode)"><b>重启提示</b><p>将修改配置文件并重启 MySQL 服务。请确认业务允许重启窗口。</p></div></template>
+                  <template v-else-if="automationForm.action==='shell'"><label class="wide">Shell 脚本<textarea v-model="automationForm.script" rows="10" spellcheck="false" placeholder="#!/usr/bin/env bash&#10;hostname&#10;df -h"></textarea><small>脚本会分别在各目标机器执行，标准输出和错误输出将保存到任务事件中。</small></label></template>
+                  <template v-else-if="automationForm.action==='backup'"><div class="automation-info wide"><b>批量备份</b><p>会立即触发所选集群内全部“已启用”的备份策略；策略中保存的备份账号、目标路径、调度和安全阈值将被复用。</p></div></template>
+                  <template v-else><div class="automation-info wide"><b>机器信息采集</b><p>将为所选集群内的每台机器创建采集任务。采集完成后可在机器详情与任务中心查看结果。</p></div></template>
+                </div>
+                <div class="automation-submit"><span>将操作 {{ automationSelectedClusters.length }} 个集群</span><button :class="automationForm.action==='uninstall' ? 'danger-button' : 'primary'" :disabled="automationRunning || !automationSelectedClusters.length">{{ automationRunning ? '正在提交…' : '创建自动化任务' }}</button></div>
+              </section>
+            </form>
+            <section v-if="automationResults.length" class="panel automation-results"><div class="panel-head"><div><h3>最近提交结果</h3><p>按集群与机器展示任务创建结果；Shell 输出可汇总下载。</p></div><div><a v-if="automationResults.some(item=>item.task_id)" class="text-button" :href="'/api/v1/tasks/cluster-automation/report?task_ids='+automationResults.map(item=>item.task_id).filter(Boolean).join(',')" download>下载执行报告</a><button class="text-button" @click="active='tasks'">前往任务中心 →</button></div></div><table><thead><tr><th>集群</th><th>目标机器</th><th>提交状态</th><th>任务 ID</th><th>结果说明</th></tr></thead><tbody><tr v-for="item in automationResults" :key="item.task_id || item.cluster+item.machine"><td><b>{{ item.cluster }}</b></td><td>{{ item.machine || '集群任务' }}</td><td><span :class="['status',item.status]">{{ item.status==='success' ? '提交成功' : '提交失败' }}</span></td><td>{{ item.task_id || '—' }}</td><td :class="{'error-cell':item.status==='failed'}">{{ errorSummary(item.message, 140) }}</td></tr></tbody></table></section>
+          </section>
+        </template>
+
+        <template v-else-if="active === 'agents'"><section class="metric-grid agent-metrics"><article class="metric-card"><span class="metric-dot green"></span><p>在线 Agent</p><strong>{{ data.agents.filter(item => agentStatus(item).code === 'agent_online').length }}</strong><small>心跳已正常注册</small></article><article class="metric-card"><span class="metric-dot amber"></span><p>待安装 / 安装中</p><strong>{{ data.agentCandidates.length }}</strong><small>可通过下方操作重试安装</small></article><article class="metric-card"><span class="metric-dot red"></span><p>异常需处理</p><strong>{{ data.agents.filter(item => agentStatus(item).code === 'agent_error').length }}</strong><small>支持恢复、升级、卸载与配置修复</small></article></section><section class="panel"><div class="panel-head"><div><h3>Agent 管理</h3><p>复用 CLI 内核能力：状态、安装重试、升级、卸载、恢复及 MySQL 采集配置修复</p></div><span class="count">{{ data.agents.length }} 个</span></div><table><thead><tr><th>机器</th><th>所属集群</th><th>安装目录</th><th>Agent 状态</th><th>心跳 / 健康</th><th>恢复状态</th><th>操作</th></tr></thead><tbody><tr v-for="item in data.agents" :key="item.IP || item.ip"><td><b>{{ item.Name || item.name || item.IP || item.ip }}</b><small>{{ item.IP || item.ip }}</small></td><td><span :class="['cluster-label', { unassigned: machineCluster(item) === '未分配集群' }]">{{ machineCluster(item) }}</span></td><td><small class="install-dir">{{ item.InstallDir || item.install_dir || '—' }}</small></td><td><span :class="['status', agentStatus(item).code]">{{ agentStatus(item).label }}</span></td><td><b>{{ item.HeartbeatState || item.heartbeat_state || 'INIT' }}</b><small>{{ item.OverallHealth || item.overall_health || '—' }} · {{ item.LastHeartbeatAt || item.last_heartbeat_at || '暂无心跳' }}</small></td><td>{{ item.RecoveryState || item.recovery_state || '—' }}</td><td class="agent-actions"><button class="text-button" @click="showAgent(item.IP || item.ip)">详情</button><button v-if="agentStatus(item).code !== 'agent_online'" class="text-button" @click="retryAgent(item)">重试安装</button><button v-if="agentStatus(item).code === 'agent_error'" class="danger-link" @click="recover(item.IP || item.ip)">手动拉起</button></td></tr><tr v-if="!data.agents.length"><td colspan="7" class="empty">暂无 Agent 信息。</td></tr></tbody></table></section><section class="panel recovery-panel"><div class="panel-head"><div><h3>最近恢复任务</h3><p>展示 CLI“查看恢复任务”相同的真实恢复记录</p></div><span class="count">最近 {{ data.recovery.length }} 条</span></div><table><thead><tr><th>机器</th><th>状态</th><th>触发方式</th><th>动作</th><th>次数</th><th>时间</th><th>错误</th></tr></thead><tbody><tr v-for="item in data.recovery" :key="item.ID || item.id"><td>{{ item.MachineIP || item.machine_ip }}</td><td><span :class="['status', state(item.Status || item.status)]">{{ label(item.Status || item.status) }}</span></td><td>{{ item.Trigger || item.trigger || '—' }}</td><td>{{ item.Action || item.action || '—' }}</td><td>{{ item.Attempt || item.attempt || 0 }}</td><td>{{ item.CreatedAt || item.created_at || '—' }}</td><td><small class="error-cell">{{ errorSummary(item.LastError || item.last_error || '') || '—' }}</small></td></tr><tr v-if="!data.recovery.length"><td colspan="7" class="empty">暂无恢复任务。</td></tr></tbody></table></section></template>
+
+        <template v-else-if="active === 'tasks'"><section v-if="selectedTaskDetail" class="task-detail-page"><div class="task-detail-titlebar"><div><button class="task-back" @click="closeTaskDetail">{{ taskDetailStack.length ? '← 返回父任务' : '← 返回任务列表' }}</button><h2>{{ taskTitle(taskObject()) }}</h2></div><div><button class="secondary" @click="selectCurrentTaskStep">定位当前进度</button><button class="primary" @click="refreshSelectedTaskDetail(false)">刷新进度</button></div></div><section class="task-meta-panel"><div><small>任务 ID</small><b>{{ taskObject()?.ID || taskObject()?.id }}</b></div><div><small>任务状态</small><span :class="['status', state(taskObject()?.Status || taskObject()?.status)]">{{ taskStatusLabel(taskObject()?.Status || taskObject()?.status) }}</span></div><div><small>操作对象</small><b>{{ selectedTaskDetail.machine_name || selectedTaskDetail.MachineName || taskObject()?.MachineID || taskObject()?.machine_id || '—' }}</b><em>{{ selectedTaskDetail.machine_ip || selectedTaskDetail.MachineIP || '' }}</em></div><div><small>开始时间</small><b>{{ date(taskObject()?.StartedAt || taskObject()?.started_at || taskObject()?.CreatedAt || taskObject()?.created_at) }}</b></div><div><small>任务耗时</small><b>{{ elapsed(taskObject()?.StartedAt || taskObject()?.started_at, taskObject()?.FinishedAt || taskObject()?.finished_at) }}</b></div><div><small>当前进度</small><b>{{ taskObject()?.ProgressPercent ?? taskObject()?.progress_percent ?? 0 }}% · {{ taskSteps().filter(step => ['success','completed'].includes(state(step.Status || step.status))).length }}/{{ taskSteps().length }}</b></div></section><div class="task-detail-progress"><i :style="{width:(taskObject()?.ProgressPercent ?? taskObject()?.progress_percent ?? 0)+'%'}"></i></div><div class="task-detail-workspace"><aside class="task-step-panel"><header><div><b>执行流程</b><small>{{ taskSteps().length }} 个子任务</small></div><span>{{ taskSteps().filter(step => ['success','completed'].includes(state(step.Status || step.status))).length }}/{{ taskSteps().length }}</span></header><div class="task-step-list"><button v-for="step in taskSteps()" :key="step.ID || step.id" :class="['task-step-item', state(step.Status || step.status), {active:(selectedTaskStep?.ID || selectedTaskStep?.id)===(step.ID || step.id)}]" @click="chooseTaskStep(step)"><i>{{ ['success','completed'].includes(state(step.Status || step.status)) ? '✓' : ['failed','error'].includes(state(step.Status || step.status)) ? '!' : state(step.Status || step.status)==='running' ? '…' : '' }}</i><span><b>{{ errorSummary(step.Message || step.message || step.StepName || step.step_name, 120) }}</b><small>{{ step.StepName || step.step_name }}</small></span><em>{{ stepStatusLabel(step.Status || step.status) }}</em><time>{{ elapsed(step.StartedAt || step.started_at, step.FinishedAt || step.finished_at) }}</time></button></div></aside><section class="task-log-panel"><header><div><b>{{ errorSummary(selectedTaskStep?.Message || selectedTaskStep?.message || selectedTaskStep?.StepName || selectedTaskStep?.step_name || '任务日志', 140) }}</b><small v-if="selectedTaskStep">{{ selectedTaskStep.StepName || selectedTaskStep.step_name }} · {{ stepStatusLabel(selectedTaskStep.Status || selectedTaskStep.status) }}</small></div><span>{{ selectedTaskEvents.length }} 条事件</span></header><div class="task-log-content"><article v-for="(event,index) in selectedTaskEvents" :key="event.ID || event.id || index" :class="['task-log-line', state(event.EventType || event.event_type)]"><i>{{ index + 1 }}</i><time>{{ date(event.CreatedAt || event.created_at) }}</time><b>{{ String(event.EventType || event.event_type || 'log').toUpperCase() }}</b><pre>{{ safeLog(event.Content || event.content) }}</pre></article><div v-if="!selectedTaskEvents.length" class="task-log-empty"><b>当前步骤暂无独立日志</b><p>{{ safeLog(selectedTaskStep?.Message || selectedTaskStep?.message || '步骤尚未开始，或 Agent 未上报日志事件。') }}</p></div></div></section></div></section><section v-else class="panel task-center-panel"><div class="panel-head"><div><h3>任务列表</h3><p>任务按 Agent 分发执行，展示执行进度与当前步骤</p></div><div class="task-toolbar"><select v-model="taskTypeFilter"><option value="all">全部类型</option><option value="collect_machine_info">机器信息采集</option><option value="collect_static_info">静态资产采集</option><option value="mysql_install">MySQL 安装</option><option value="mysql_uninstall">MySQL 卸载</option><option value="mysql_upgrade">MySQL 升级</option><option value="mysql_topology">MySQL 拓扑</option><option value="architecture_adjustment">架构调整</option><option value="exec">自动化命令</option><option value="platform_operation">平台操作</option></select><div class="task-status-filter"><button :class="{active:taskFilter==='all'}" @click="taskFilter='all'">全部</button><button :class="{active:taskFilter==='running'}" @click="taskFilter='running'">运行中</button><button :class="{active:taskFilter==='success'}" @click="taskFilter='success'">成功</button><button :class="{active:taskFilter==='failed'}" @click="taskFilter='failed'">失败</button></div><input v-model.trim="taskKeyword" placeholder="搜索任务 ID、类型或机器"></div></div><TaskTable :items="filteredTasks" :machines="data.machines" :state="state" :date="date" :page="taskPage" :total="taskTotal" :page-size="taskPageSize" @select="openTaskDetail" @page="changeTaskPage" /></section></template>
+        <template v-else-if="active === 'packages'">
+          <section class="panel package-panel">
+            <div class="panel-head"><div><h3>安装包仓库</h3><p>统一管理 MySQL、路由、中间件、备份和诊断工具，保存版本、来源与 SHA-256 校验信息。</p></div></div>
+            <div class="package-config-grid">
+              <section class="package-storage"><header><div><b>存储位置</b><small>系统按软件类型自动创建分类目录</small></div><span>{{ packageItems.length }} 个安装包</span></header><div class="storage-path-editor"><input v-model.trim="packageSettings.storage_path" required placeholder="/data/gmha/software"><button class="secondary" type="button" @click="savePackageStorage">保存目录</button></div><div class="architecture-list"><small>支持的 Linux 架构</small><span v-for="arch in (packageSettings.supported_architectures || [])" :key="arch">{{ arch }}</span></div></section>
+              <form class="package-upload" @submit.prevent="uploadPackage"><header><div><b>上传安装包</b><small>上传后计算 SHA-256 并持久化架构信息</small></div></header><div class="package-upload-fields"><label class="package-field">软件类型<span class="select-control"><select v-model="packageForm.category"><option v-for="category in (packageSettings.categories || [])" :key="category" :value="category">{{ packageCategoryLabel(category) }}</option></select></span></label><label class="package-field">Linux 架构<span class="select-control"><select v-model="packageForm.arch"><option value="未识别">自动识别</option><option value="x86_64">x86_64</option><option value="aarch64">aarch64</option><option value="noarch">noarch</option></select></span></label><div class="package-field package-file"><span>安装包文件</span><div class="file-picker"><input id="package-upload-file" type="file" required @change="choosePackageFile"><label for="package-upload-file" class="file-picker-button">选择文件</label><span class="file-picker-name" :title="packageForm.file?.name || ''">{{ packageForm.file?.name || '未选择文件' }}</span></div></div><button class="primary package-upload-button" :disabled="!packageForm.file"><span aria-hidden="true">↑</span>上传安装包</button></div></form>
+            </div>
+            <section class="package-quickstart">
+              <header><div><span>首次使用推荐</span><h3>一键准备 MySQL 与兼容工具</h3><p>选择 MySQL 版本后，系统会自动推荐并从各项目官网下载匹配的软件包。</p></div><div class="package-bundle-progress"><b>{{ packageBundleInstalledCount() }}/{{ packageBundleCatalogItems().length }}</b><small>推荐包已入库</small></div></header>
+              <div class="package-quickstart-controls"><label>MySQL 版本与架构<span class="select-control"><select v-model="packageBundleID"><option v-for="bundle in (packageSettings.bundles || [])" :key="bundle.id" :value="bundle.id">{{ bundle.label }}{{ bundle.default ? '（默认）' : '' }}</option></select></span></label><button class="primary" type="button" :disabled="packageBundleFetching || packageBundleAllInstalled()" @click="fetchPackageBundle"><span aria-hidden="true">↓</span>{{ packageBundleAllInstalled() ? '推荐组合已就绪' : packageBundleFetching ? '正在从官网下载…' : packageBundleInstalledCount() ? '一键补齐推荐工具' : '一键下载 MySQL 与推荐工具' }}</button></div>
+              <p v-if="selectedPackageBundle" class="package-compatibility-note"><b>版本推荐：</b>{{ selectedPackageBundle.compatibility_note }}</p>
+              <div class="package-recommendation-grid"><article v-for="item in packageBundleCatalogItems()" :key="item.id" :class="{installed:packageCatalogInstalled(item)}"><div><span class="package-category">{{ packageCategoryLabel(item.category) }}</span><em>{{ packageCatalogInstalled(item) ? '✓ 已入库' : item.arch }}</em></div><b>{{ item.category === 'mysql' ? 'MySQL Server ' + item.version : item.description }}</b><small>{{ item.name }}</small></article></div>
+              <details v-if="packageBundleCatalogItems(true).length" class="package-optional-tools"><summary>查看可选工具推荐</summary><div><span v-for="item in packageBundleCatalogItems(true)" :key="item.id">{{ packageCategoryLabel(item.category) }} {{ item.version }}{{ packageCatalogInstalled(item) ? ' · 已入库' : '' }}</span></div><small>ProxySQL/Mycat 属于路由或中间件替代方案，binlog2sql 为旧版脚本工具，因此不默认加入组合，可在下方按需下载。</small></details>
+            </section>
+            <section class="package-catalog"><header><div><b>官方软件源</b><small>从 Oracle MySQL 与项目官方 GitHub 发布源直接下载，入库后自动校验。</small></div><span>{{ (packageSettings.catalog || []).filter(packageCatalogInstalled).length }}/{{ (packageSettings.catalog || []).length }} 已入库</span></header><div class="package-catalog-grid"><article v-for="item in (packageSettings.catalog || [])" :key="item.id" :class="{installed:packageCatalogInstalled(item)}"><div><span class="package-category">{{ packageCategoryLabel(item.category) }}</span><em>{{ item.arch }}</em></div><b>{{ item.name }}</b><small>{{ item.description }}</small><footer><span>v{{ item.version }}</span><button type="button" :class="packageCatalogInstalled(item) ? 'secondary' : 'primary'" :disabled="packageCatalogInstalled(item) || packageFetching[item.id]" @click="fetchCatalogPackage(item)">{{ packageCatalogInstalled(item) ? '已入库' : packageFetching[item.id] ? '下载中…' : '下载入库' }}</button></footer></article></div></section>
+            <section class="package-list"><div class="package-list-toolbar"><div><b>安装包列表</b><small>支持查询、校验、下载和删除已入库文件</small></div><form @submit.prevent="loadPackages"><input v-model.trim="packageKeyword" placeholder="搜索文件名或软件类型"><button class="secondary">查询</button></form></div><div class="package-table-wrap"><table><thead><tr><th>软件类型</th><th>文件 / 版本</th><th>格式 / 架构</th><th>文件大小</th><th>SHA-256</th><th>来源 / 更新时间</th><th>操作</th></tr></thead><tbody><tr v-for="item in packageItems" :key="item.category + item.name"><td><span class="package-category">{{ packageCategoryLabel(item.category) }}</span></td><td><b class="package-name">{{ item.name }}</b><small>版本 {{ item.version || '未识别' }}</small></td><td><b>{{ item.format }}</b><small>{{ item.arch }}</small></td><td>{{ packageSize(item.size) }}</td><td><code class="package-checksum" :title="item.sha256">{{ packageChecksum(item.sha256) }}</code></td><td><a v-if="item.source_url" :href="item.source_url" target="_blank" rel="noreferrer">官方来源 ↗</a><span v-else>本地上传</span><small>{{ date(item.updated_at) }}</small></td><td class="package-actions"><button v-if="!item.sha256" type="button" class="text-button" :disabled="packageFetching[item.category + '/' + item.name]" @click="verifyPackage(item)">{{ packageFetching[item.category + '/' + item.name] ? '校验中…' : '计算校验' }}</button><a class="text-button" :href="packageDownloadURL(item)" download>下载</a><button type="button" class="danger-link" @click="deletePackage(item)">删除</button></td></tr><tr v-if="!packageItems.length"><td colspan="7" class="empty">暂无安装包，可从官方软件源一键下载或手动上传。</td></tr></tbody></table></div></section>
+          </section>
+        </template>
+        <template v-else-if="active === 'mysql'">
+          <section :class="['mysql-page', { 'install-mode': mysqlView === 'install' }]">
+            <section v-if="mysqlView === 'install'" class="mysql-install-page">
+              <header class="mysql-install-page-head"><div><p>MySQL 管理 / 创建安装</p><h2><button type="button" class="mysql-install-back" aria-label="返回 MySQL 概览" @click="mysqlView='overview'">←</button>创建 MySQL 安装任务</h2><span>选择目标机器与安装版本，配置实例参数后由 Agent 异步执行完整安装流程。</span></div></header>
+              <form class="mysql-install-form" @submit.prevent="createMySQLInstall">
+                <section class="install-section"><h3>实例基础信息</h3><p>版本与 CPU 架构独立选择；提交后由后端结合目标机器 glibc 确定具体安装包。</p><label>目标机器<select v-model="mysqlInstallForm.machine" required @change="mysqlInstallMachineChanged"><option value="">选择机器</option><option v-for="m in data.machines" :key="m.ID||m.id" :value="m.IP||m.ip">{{ m.Name||m.name }} · {{ m.IP||m.ip }}</option></select></label><div class="form-row"><label>目标架构<select v-model="mysqlInstallForm.architecture" @change="mysqlInstallArchitectureChanged"><option value="">自动匹配机器架构</option><option v-for="arch in mysqlInstallArchitectures" :key="arch" :value="arch">{{ arch }}</option></select></label><label>MySQL 版本<select v-model="mysqlInstallForm.version"><option value="">自动选择兼容版本</option><option v-for="pkg in mysqlInstallVersions" :key="pkg.version" :value="pkg.version">{{ pkg.version }} · {{ pkg.release_track }}</option></select><small v-if="mysqlInstallForm._selected_package">具体制品按 glibc 自动匹配；版本专属参数 {{ mysqlInstallForm._version_parameter_groups.reduce((total,group)=>total+(group.fields||[]).length,0) }} 项</small></label></div><p v-if="!data.mysqlPackages.length" class="form-note">安装包库中没有可选 MySQL 包，请先在安装包管理中上传。</p><div class="form-row"><label>MySQL 端口<input v-model.number="mysqlInstallForm.port" type="number" min="1" required></label><label>server_id<input v-model.number="mysqlInstallForm.server_id" type="number" min="1" required></label></div><div class="form-row"><label>MySQL 运行用户<input v-model="mysqlInstallForm.mysql_user" required></label><label>参数 Profile<input v-model="mysqlInstallForm.profile" required></label></div><label>root 密码<input v-model="mysqlInstallForm.root_password" type="password" required></label></section>
+                <section class="install-section install-directory"><h3>目录与运行文件</h3><p>全部路径均可选；留空时按安装逻辑自动生成。</p><div class="directory-grid"><label>实例根目录<input v-model="mysqlInstallForm.instance_dir" placeholder="/data/3306"></label><label>数据目录<input v-model="mysqlInstallForm.data_dir" placeholder="实例根目录/data"></label><label>binlog 目录<input v-model="mysqlInstallForm.binlog_dir" placeholder="实例根目录/binlog"></label><label>redo 目录<input v-model="mysqlInstallForm.redo_dir" placeholder="实例根目录/redo"></label><label>undo 目录<input v-model="mysqlInstallForm.undo_dir" placeholder="实例根目录/undo"></label><label>tmp 目录<input v-model="mysqlInstallForm.tmp_dir" placeholder="实例根目录/tmp"></label><label>安装目录<input v-model="mysqlInstallForm.base_dir" placeholder="/usr/local/mysql"></label><label>my.cnf 路径<input v-model="mysqlInstallForm.my_cnf_path" placeholder="实例根目录/my.cnf"></label><label>Socket 文件<input v-model="mysqlInstallForm.socket_path" placeholder="数据目录/mysql.sock"></label><label>错误日志<input v-model="mysqlInstallForm.error_log" placeholder="数据目录/mysqld.log"></label><label>PID 文件<input v-model="mysqlInstallForm.pid_file" placeholder="数据目录/mysqld.pid"></label><label>字符集目录<input v-model="mysqlInstallForm.character_sets_dir" placeholder="安装目录/share/charsets"></label><label>插件目录<input v-model="mysqlInstallForm.plugin_dir" placeholder="安装目录/lib/plugin"></label></div></section>
+                <details class="install-section install-runtime"><summary>MySQL 运行参数调整（可选）</summary><p>参数留空时沿用安装逻辑自动生成的配置；选择版本后，会追加该版本独有且经官方文档核验的参数。</p><p v-if="!mysqlInstallForm.version" class="version-parameter-note">当前为自动选版：通用参数可编辑；如需版本专属参数，请先明确选择版本。</p><article v-for="group in mysqlInstallForm._parameter_groups" :key="group.name" :class="['runtime-parameter-group', {'version-specific': mysqlInstallForm._version_parameter_groups.includes(group)}]"><header><b>{{ group.name }}</b><small>{{ group.fields.length }} 项</small></header><div class="runtime-parameter-grid"><label v-for="field in group.fields" :key="field.key">{{ field.label }}<select v-if="field.options" v-model="mysqlInstallForm.runtime_parameters[field.key]"><option value=""></option><option v-for="option in field.options" :key="option" :value="option">{{ option }}</option></select><input v-else v-model.trim="mysqlInstallForm.runtime_parameters[field.key]" :placeholder="field.placeholder || ''"><small v-if="field.description || field.placeholder">{{ field.description || field.placeholder }}</small></label></div></article></details>
+                <section class="install-section install-tools"><h3>可选工具</h3><p>PT 工具默认不安装；启用后由 Manager 根据目标机器架构和最终选中的 MySQL 版本自动匹配本地工具包。</p><label class="install-option"><input v-model="mysqlInstallForm.install_pt_tools" type="checkbox" :disabled="!!mysqlInstallForm._selected_package && !mysqlInstallForm._selected_package.pt_tools_supported"><span><b>安装 PT 工具</b><small v-if="!mysqlInstallForm._selected_package">自动兼容模式：任务创建时确定 MySQL 版本并校验 PT 兼容性</small><small v-else-if="!mysqlInstallForm._selected_package.pt_tools_supported">MySQL {{ mysqlInstallForm._selected_package.version }} 不支持自动 PT 安装</small><small v-else>使用安装包仓库中的 Percona Toolkit，提供 pt-online-schema-change、pt-query-digest 等命令</small></span></label></section>
+                <section class="install-section install-accounts"><header class="install-section-title"><div><h3>初始化账号与权限</h3><p>预设账号默认显示；自定义账号仅在点击添加后出现，并可添加多个。</p></div><button type="button" class="secondary add-account-button" @click="addCustomMySQLAccount">＋ 增加自定义用户</button></header><article v-for="(account,index) in mysqlInstallForm.accounts" :key="account.role" :class="['mysql-account', {custom:isCustomMySQLAccount(account)}]"><header><div><b>{{ isCustomMySQLAccount(account) ? '自定义数据库用户' : ({monitor:'监控账号',mha:'MHA 管理账号',backup:'备份账号'})[account.role] }}</b><small>{{ isCustomMySQLAccount(account) ? '自定义名称、权限与访问白名单' : account.role }}</small></div><button v-if="isCustomMySQLAccount(account)" type="button" class="danger-link" @click="removeCustomMySQLAccount(index)">删除</button><label v-else class="switch"><input v-model="account.enabled" type="checkbox"><span>启用</span></label></header><div class="account-inputs"><label>用户名<input v-model.trim="account.username" :placeholder="isCustomMySQLAccount(account) ? '输入新用户名' : account.role" :required="isCustomMySQLAccount(account)"></label><label>密码<input v-model="account.password" type="password" :placeholder="isCustomMySQLAccount(account) ? '输入用户密码' : '默认 3306niubi'" :required="isCustomMySQLAccount(account)"></label><label>访问白名单（Host）<input v-model.trim="account.host" :placeholder="isCustomMySQLAccount(account) ? '例如 10.0.0.% 或 %' : '默认 %'" :required="isCustomMySQLAccount(account)"></label></div><div class="privilege-picker"><b>权限选择</b><div><label v-for="privilege in mysqlPrivilegeOptions" :key="privilege"><input v-model="account.privileges" type="checkbox" :value="privilege"> {{ privilege }}</label></div></div></article></section>
+                <div class="mysql-install-actions"><button type="button" class="secondary" @click="mysqlView='overview'">取消</button><button class="primary">创建安装任务</button></div>
+              </form>
+            </section>
+            <nav v-if="mysqlView !== 'install'" class="mysql-tabs"><button :class="{active:mysqlView==='overview'}" @click="mysqlView='overview'">概览</button><button :class="{active:mysqlView==='instances'}" @click="mysqlView='instances'">实例 <span>{{ data.mysqlInstances.length }}</span></button><button @click="openMySQLInstall">创建安装</button><button :class="{active:mysqlView==='tasks'}" @click="mysqlView='tasks'">安装任务</button><button :class="{active:mysqlView==='accounts'}" @click="mysqlView='accounts'">预设账号</button></nav>
+            <template v-if="mysqlView === 'overview'"><div class="mysql-summary"><article><small>已登记实例</small><b>{{ data.mysqlInstances.length }}</b></article><article><small>在线心跳</small><b>{{ data.mysqlInstances.filter(i => ['ok','success'].includes(state(i.HeartbeatStatus || i.heartbeat_status))).length }}</b></article><article><small>关联集群</small><b>{{ new Set(data.mysqlInstances.map(i => i.Cluster || i.cluster).filter(Boolean)).size }}</b></article></div><div class="mysql-shortcuts"><button @click="mysqlView='instances'"><b>实例管理</b><span>查看运行状态、配置和实例操作</span><i>→</i></button><button @click="mysqlView='tasks'"><b>安装任务</b><span>跟踪 MySQL 安装的执行进度</span><i>→</i></button></div></template>
+            <section v-else-if="mysqlView === 'instances'" class="mysql-workspace"><div class="panel-head"><div><h3>MySQL 实例</h3><p>状态由 Manager 记录与 Agent 心跳共同提供。</p></div><button class="icon-button" @click="refresh">↻</button></div><table v-if="data.mysqlInstances.length"><thead><tr><th>实例</th><th>机器</th><th>集群</th><th>版本 / 端口</th><th>心跳</th><th>操作</th></tr></thead><tbody><tr v-for="item in data.mysqlInstances" :key="item.MachineID + ':' + item.Port"><td><b>{{ item.Name || item.name || 'MySQL' }}</b><small>{{ item.InstanceDir || item.instance_dir || '—' }}</small></td><td>{{ item.MachineName || item.machine_name || item.MachineIP || item.machine_ip }}</td><td>{{ item.Cluster || item.cluster || '未分配集群' }}</td><td>{{ item.Version || item.version || '—' }} · {{ item.Port || item.port }}</td><td><span :class="['status', state(item.HeartbeatStatus || item.heartbeat_status)]">{{ item.HeartbeatStatus || item.heartbeat_status || '—' }}</span></td><td class="mysql-ops"><button class="text-button" @click="showMySQLMachine(item)">数据</button><button class="danger-link" @click="uninstallMySQL(item)">卸载</button><button class="text-button" @click="forgetMySQL(item)">遗忘</button></td></tr></tbody></table><div v-else class="mysql-empty"><b>暂未发现 MySQL 实例</b><small>选择已纳管且 Agent 在线的机器，创建真实安装任务后将在此展示实例与心跳。</small><button class="primary" @click="openMySQLInstall">创建安装任务</button></div></section>
+            <section v-else-if="mysqlView === 'tasks'" class="panel mysql-task-panel"><div class="panel-head"><div><h3>MySQL 安装任务</h3><p>仅展示 MySQL 安装任务；全部任务可在任务中心查看。</p></div><button class="text-button" @click="active='tasks'">前往任务中心 →</button></div><TaskTable :items="data.tasks.filter(item => String(item.Type || item.type || '').toLowerCase().includes('mysql'))" :machines="data.machines" :state="state" :date="date" @select="openTaskDetail" /></section>
+            <section v-else-if="mysqlView === 'accounts'" class="panel mysql-preset-panel"><div class="panel-head"><div><h3>预设账号</h3><p>保存后，新建 MySQL 安装任务会自动带入账号、连接范围与权限选择。</p></div><button class="primary" @click="saveMySQLAccountPresets">保存预设</button></div><div class="mysql-preset-list"><article v-for="account in data.accountPresets" :key="account.role"><header><div><b>{{ ({monitor:'监控账号',mha:'MHA 管理账号',backup:'备份账号'})[account.role] }}</b><small>{{ account.role }}</small></div><label class="switch"><input v-model="account.enabled" type="checkbox"><span>启用</span></label></header><p>{{ account.role === 'monitor' ? '用于监控和健康检查。' : account.role === 'mha' ? '用于 MHA 拓扑管理和切换。' : '用于备份任务。' }}</p><div class="form-row"><label>账号名称<input v-model="account.username" required></label><label>密码<input v-model="account.password" type="password" required></label></div><label>允许来源 Host<input v-model="account.host" required></label><div class="privilege-picker"><b>授权权限</b><small>仅允许选择 GMHA 支持的权限；保存后将生成对应 GRANT 语句。</small><div><label v-for="privilege in mysqlPrivilegeOptions" :key="privilege"><input v-model="account.privileges" type="checkbox" :value="privilege"> {{ privilege }}</label></div></div></article></div></section>
+          </section>
+        </template><template v-else><section class="coming"><div class="coming-icon">↯</div><p>模块已规划</p><h2>{{ current.label }}</h2></section></template>
+      </section>
+      <div v-if="showOnboard" class="modal-mask" @click.self="showOnboard = false"><form class="modal" @submit.prevent="onboard"><div class="modal-head"><div><p>资源管理</p><h2>纳管机器</h2></div><button type="button" @click="showOnboard = false">×</button></div><label>机器名称<input v-model="form.name" required placeholder="mysql-prod-01"></label><label>IP 地址<input v-model="form.ip" required placeholder="10.0.0.11"></label><label>已有 SSH 凭证<select v-model="form.credential_id" @change="applyCredential"><option value="">不使用已有凭证（直接输入密码）</option><option v-for="item in data.credentials" :key="item.id" :value="item.id">{{ item.name }} · {{ item.ssh_user }} · {{ item.type === 'private_key' ? '私钥文件' : '密码' }}</option></select></label><div class="form-row"><label>SSH 端口<input v-model.number="form.ssh_port" type="number" required></label><label>SSH 用户<input v-model="form.ssh_user" required :readonly="!!form.credential_id"></label></div><label v-if="!form.credential_id">SSH 密码<input v-model="form.ssh_password" type="password" required autocomplete="new-password"></label><p class="form-note" v-if="form.credential_id">将使用所选凭证完成连接与纳管；密码、私钥和口令均不会在此页面显示。</p><p class="form-note" v-else>直接输入的密码仅用于本次纳管。建议常用凭证先保存到凭证库。</p><section class="onboard-preserve-options"><b>发现已有组件时</b><label><input v-model="form.preserve_agent" type="checkbox"><span><strong>保留现有 Agent</strong><small>不卸载、不覆盖；重新登记并重启现有 gmha-agent。</small></span></label><label><input v-model="form.preserve_mysql" type="checkbox"><span><strong>保留现有 MySQL 实例</strong><small>不停止服务、不删除数据；从现有 Agent 配置恢复实例记录。</small></span></label></section><div class="modal-actions"><button type="button" class="secondary" @click="showOnboard = false">取消</button><button class="primary">开始纳管</button></div></form></div>
+      <div v-if="showOnboardFlow" class="modal-mask"><section class="modal flow-modal"><div class="modal-head"><div><p>纳管流程</p><h2>{{ onboardingResult ? '纳管结果' : '正在接入机器' }}</h2></div></div><div class="flow-step" v-for="item in onboardingFlow" :key="item.title"><i :class="item.state">{{ item.state === 'success' ? '✓' : item.state === 'error' ? '!' : item.state === 'running' ? '…' : '○' }}</i><div class="flow-content"><b>{{ item.title }}</b><span>{{ item.state === 'error' ? errorSummary(item.detail) : item.detail }}</span><div v-if="item.details" class="agent-details"><div v-for="detail in item.details" :key="detail.title" :class="['agent-detail', detail.state]"><i>{{ detail.state === 'success' ? '✓' : detail.state === 'error' ? '!' : detail.state === 'running' ? '…' : '○' }}</i><span>{{ detail.title }}</span><div v-if="detail.error" class="flow-error"><small>{{ errorSummary(detail.errorSummary || detail.error) }}</small></div></div></div></div></div><div v-if="onboardingFlow.some(item => item.state === 'error')" class="flow-warning">检测到已有组件时，可选择保留并重新纳管；基础环境错误仍需先处理。</div><section v-if="canSkipPrecheck" class="flow-preserve-options"><label v-if="onboardingDetected.agent"><input v-model="form.preserve_agent" type="checkbox"><span><b>保留现有 Agent</b><small>重新登记并重启，不卸载、不覆盖。</small></span></label><label v-if="onboardingDetected.mysql"><input v-model="form.preserve_mysql" type="checkbox"><span><b>保留现有 MySQL</b><small>恢复实例记录，不停止服务、不删除数据。</small></span></label></section><p v-if="onboardingFlow.some(item => item.state === 'error')" class="flow-log-hint">完整执行日志请在任务中心对应任务详情中查看。</p><div class="modal-actions"><button v-if="canSkipPrecheck" class="danger-button" @click="cleanupTarget">清理目标机器</button><button v-if="canSkipPrecheck" class="secondary" :disabled="(onboardingDetected.agent && !form.preserve_agent) || (onboardingDetected.mysql && !form.preserve_mysql)" @click="onboard(true)">保留所选组件并重新纳管</button><button class="primary" @click="showOnboardFlow = false">完成</button></div></section></div>
+      <div v-if="showMachineDetail && selectedMachine" class="modal-mask" @click.self="showMachineDetail = false"><form class="modal machine-detail-modal" @submit.prevent="saveMachine"><div class="modal-head"><div><p>机器详情</p><h2>{{ selectedMachine.Name || selectedMachine.name }}</h2></div><button type="button" @click="showMachineDetail = false">×</button></div><div class="machine-detail-body"><div class="machine-profile-grid"><p><small>机器状态</small><span :class="['status', machineStatus(selectedMachine).code]">{{ machineStatus(selectedMachine).label }}</span></p><p><small>所属集群</small><b>{{ machineCluster(selectedMachine) }}</b></p><p><small>关联凭证</small><b>{{ selectedMachine.CredentialID || selectedMachine.credential_id || '未分配' }}</b></p><p><small>Agent 安装目录</small><b>{{ machineAgentInstallDir(selectedMachine) }}</b></p><p><small>创建时间</small><b>{{ date(selectedMachine.CreatedAt || selectedMachine.created_at) }}</b></p><p><small>更新时间</small><b>{{ date(selectedMachine.UpdatedAt || selectedMachine.updated_at) }}</b></p></div><label>机器名称<input v-model="selectedMachine.Name" required></label><label>IP 地址<input v-model="selectedMachine.IP" required></label><div class="form-row"><label>SSH 端口<input v-model.number="selectedMachine.SSHPort" type="number" required></label><label>SSH 用户<input v-model="selectedMachine.SSHUser" required></label></div><div class="machine-tools"><label>分配至集群<select v-model="selectedMachineCluster"><option value="">选择集群</option><option v-for="cluster in data.clusters" :key="cluster.Name || cluster.name" :value="cluster.Name || cluster.name">{{ cluster.Name || cluster.name }}</option></select></label><button type="button" class="secondary" :disabled="!selectedMachineCluster" @click="assignMachineCluster">分配集群</button></div><section class="machine-data"><div><b>静态信息</b><button type="button" class="text-button" @click="collectMachineStaticInfo">重新采集</button></div><pre v-if="machineStaticInfo">{{ JSON.stringify(machineStaticInfo, null, 2) }}</pre><p v-else>尚未采集静态信息。</p></section><section class="machine-data"><div><b>动态指标</b><button type="button" class="text-button" @click="loadMachineDynamicInfo">查看动态数据</button></div><pre v-if="machineDynamicInfo">{{ JSON.stringify(machineDynamicInfo, null, 2) }}</pre><p v-else>点击按钮从 Agent 获取最新动态指标。</p></section><p v-if="machineInfoError" class="machine-info-error">{{ errorSummary(machineInfoError) }}</p><p class="form-note">机器 ID：{{ selectedMachine.ID || selectedMachine.id }}</p><div v-if="machineLastError(selectedMachine)" class="machine-last-error"><b>最后错误</b><p>{{ errorSummary(machineLastError(selectedMachine)) }}</p><small>完整日志请到任务中心对应任务详情查看。</small></div><p v-else class="form-note">最后错误：无</p></div><div class="modal-actions"><button type="button" class="danger-button" @click="deleteMachine">删除机器</button><button type="button" class="secondary" @click="showMachineDetail = false">取消</button><button class="primary">保存修改</button></div></form></div>
+      <div v-if="showAgentDetail && selectedAgent && !agentActionDialog" class="modal-mask" @click.self="showAgentDetail = false"><section class="modal agent-detail-modal"><div class="modal-head"><div><p>Agent 管理</p><h2>{{ selectedAgent.Name || selectedAgent.name || selectedAgent.IP || selectedAgent.ip }}</h2></div><button type="button" @click="showAgentDetail = false">×</button></div><div class="agent-detail-body"><div class="agent-info-grid"><p><small>IP 地址</small><b>{{ selectedAgent.IP || selectedAgent.ip }}</b></p><p><small>所属集群</small><b>{{ machineCluster(selectedAgent) }}</b></p><p><small>安装目录</small><b>{{ selectedAgent.InstallDir || selectedAgent.install_dir || '—' }}</b></p><p><small>心跳状态</small><b>{{ selectedAgent.HeartbeatState || selectedAgent.heartbeat_state || 'INIT' }}</b></p><p><small>整体健康</small><b>{{ selectedAgent.OverallHealth || selectedAgent.overall_health || '—' }}</b></p><p><small>最近心跳</small><b>{{ selectedAgent.LastHeartbeatAt || selectedAgent.last_heartbeat_at || '暂无' }}</b></p></div><div v-if="selectedAgent.Checks?.length" class="agent-check-list"><b>健康检查</b><p v-for="check in selectedAgent.Checks" :key="check.Name"><span :class="['status', state(check.Status)]">{{ check.Status }}</span>{{ check.Name }}<small>{{ errorSummary(check.Detail, 140) }}</small></p></div><div v-if="selectedAgent.LastError || selectedAgent.last_error" class="machine-last-error"><b>最近错误</b><p>{{ errorSummary(selectedAgent.LastError || selectedAgent.last_error) }}</p><small>完整日志请到任务中心对应任务详情查看。</small></div></div><div class="modal-actions"><button class="danger-button" @click="uninstallAgent(selectedAgent)">卸载 Agent</button><button class="secondary" @click="repairMySQLAgentConfig(selectedAgent)">修复 MySQL 采集</button><button class="secondary" @click="upgradeAgent(selectedAgent)">升级 Agent</button><button class="primary" @click="recover(selectedAgent.IP || selectedAgent.ip)">手动拉起</button></div></section></div>
+      <div v-if="showCredential" class="modal-mask" @click.self="showCredential = false"><form class="modal" @submit.prevent="createCredential"><div class="modal-head"><div><p>凭证库</p><h2>添加 SSH 凭证</h2></div><button type="button" @click="showCredential = false">×</button></div><label>凭证名称<input v-model="credentialForm.name" required placeholder="生产环境 root 密钥"></label><label>SSH 用户<input v-model="credentialForm.ssh_user" required></label><label>认证方式<select v-model="credentialForm.type"><option value="password">密码</option><option value="private_key">SSH 私钥文件</option></select></label><label v-if="credentialForm.type === 'password'">密码<input v-model="credentialForm.ssh_password" type="password" required></label><template v-else><label>私钥文件<input type="file" accept=".pem,.key,.ppk,*" required @change="loadKeyFile"></label><label>私钥口令（可选）<input v-model="credentialForm.passphrase" type="password"></label></template><p class="form-note">凭证内容仅发送至本机 Manager 数据库，列表中不会返回或显示密码、私钥和口令。</p><div class="modal-actions"><button type="button" class="secondary" @click="showCredential = false">取消</button><button class="primary">保存凭证</button></div></form></div>
+      <div v-if="showAssign" class="modal-mask" @click.self="showAssign = false"><form class="modal" @submit.prevent="assignCredential"><div class="modal-head"><div><p>凭证分配</p><h2>选择机器</h2></div><button type="button" @click="showAssign = false">×</button></div><p class="form-note">可选择一台或多台机器。分配会同步该凭证的 SSH 用户，不会建立远程连接。</p><label v-for="item in data.machines" :key="item.ID || item.id" class="machine-choice"><input type="checkbox" :value="item.ID || item.id" v-model="assignedMachineIDs"><span><b>{{ item.Name || item.name }}</b><small>{{ item.IP || item.ip }}</small></span></label><p v-if="!data.machines.length" class="form-note">请先完成机器纳管。</p><div class="modal-actions"><button type="button" class="secondary" @click="showAssign = false">取消</button><button class="primary" :disabled="!assignedMachineIDs.length">分配凭证</button></div></form></div>
+      <div v-if="showQuickClusterAssign && selectedMachine" class="modal-mask" @click.self="showQuickClusterAssign=false"><form class="modal quick-cluster-modal" @submit.prevent="quickAssignMachineCluster"><div class="modal-head"><div><p>集群分配</p><h2>分配机器到集群</h2></div><button type="button" @click="showQuickClusterAssign=false">×</button></div><p class="form-note"><b>{{ selectedMachine.Name || selectedMachine.name }}</b> · {{ selectedMachine.IP || selectedMachine.ip }}</p><label>目标集群<select v-model="selectedMachineCluster" required><option value="">请选择集群</option><option v-for="cluster in data.clusters" :key="cluster.Name || cluster.name" :value="cluster.Name || cluster.name">{{ cluster.Name || cluster.name }}</option></select></label><p class="form-note">分配后将按既有流程同步机器的集群归属。</p><div class="modal-actions"><button type="button" class="secondary" @click="showQuickClusterAssign=false">取消</button><button class="primary" :disabled="!selectedMachineCluster">确认分配</button></div></form></div>
+      <div v-if="showMachineDetail && selectedMachine" class="modal-mask machine-detail-dashboard-mask"><form class="modal machine-detail-dashboard" @submit.prevent="saveMachine"><div class="modal-head"><div><p>机器详情</p><h2>{{ selectedMachine.Name || selectedMachine.name }}</h2></div><button type="button" @click="showMachineDetail = false">×</button></div><div class="dashboard-body"><section class="machine-profile-grid"><p><small>机器状态</small><span :class="['status', machineStatus(selectedMachine).code]">{{ machineStatus(selectedMachine).label }}</span></p><p><small>所属集群</small><b>{{ machineCluster(selectedMachine) }}</b></p><p><small>关联凭证</small><b>{{ selectedMachine.CredentialID || selectedMachine.credential_id || '未分配' }}</b></p><p><small>Agent 安装目录</small><b>{{ machineAgentInstallDir(selectedMachine) }}</b></p></section><section class="machine-data"><div><span><b>静态资产</b><small>主机与 MySQL 配置快照</small></span><button type="button" class="text-button" @click="collectMachineStaticInfo">重新采集</button></div><dl v-if="machineStaticInfo" class="asset-grid"><template v-for="row in staticRows(machineStaticInfo)" :key="row[0]"><dt>{{ row[0] }}</dt><dd>{{ row[1] }}</dd></template></dl><p v-else>尚未采集静态信息。</p></section><section class="machine-data"><div><span><b>动态指标</b><small>Agent 最近一次上报的数据</small></span><button type="button" class="text-button" @click="loadMachineDynamicInfo">刷新指标</button></div><div v-if="machineDynamicInfo" class="metric-summary"><span>心跳：{{ machineDynamicInfo.HeartbeatState || machineDynamicInfo.heartbeat_state || '—' }}</span><span>{{ dynamicMetrics(machineDynamicInfo).length }} 项指标</span></div><table v-if="machineDynamicInfo && dynamicMetrics(machineDynamicInfo).length" class="metric-table"><thead><tr><th>指标</th><th>分类</th><th>值</th><th>状态</th><th>采集时间</th></tr></thead><tbody><tr v-for="metric in dynamicMetrics(machineDynamicInfo)" :key="metric.Name || metric.name"><td>{{ metric.Name || metric.name }}</td><td>{{ metric.Category || metric.category || '主机' }}</td><td class="metric-value">{{ metricValue(metric) }}</td><td><span :class="['status', (metric.Success ?? metric.success) ? 'success' : 'error']">{{ (metric.Success ?? metric.success) ? '成功' : '失败' }}</span></td><td>{{ date(metric.CollectedAt || metric.collected_at) }}</td></tr></tbody></table><p v-else-if="machineDynamicInfo">当前 Agent 未上报动态指标。</p><p v-else>点击“刷新指标”从 Agent 获取最新动态数据。</p></section><section class="edit-section"><b>连接与归属</b><label>机器名称<input v-model="selectedMachine.Name" required></label><label>IP 地址<input v-model="selectedMachine.IP" required></label><div class="form-row"><label>SSH 端口<input v-model.number="selectedMachine.SSHPort" type="number" required></label><label>SSH 用户<input v-model="selectedMachine.SSHUser" required></label></div><div class="machine-tools"><label>分配至集群<select v-model="selectedMachineCluster"><option value="">选择集群</option><option v-for="cluster in data.clusters" :key="cluster.Name || cluster.name" :value="cluster.Name || cluster.name">{{ cluster.Name || cluster.name }}</option></select></label><button type="button" class="secondary" :disabled="!selectedMachineCluster" @click="assignMachineCluster">分配集群</button></div></section><p v-if="machineInfoError" class="machine-info-error">{{ errorSummary(machineInfoError) }}</p></div><div class="modal-actions"><button type="button" class="danger-button" @click="deleteMachine">删除机器</button><button type="button" class="secondary" @click="showMachineDetail = false">取消</button><button class="primary">保存修改</button></div></form></div>
+      <div v-if="showMySQLInstall" class="modal-mask" @click.self="showMySQLInstall=false"><form class="modal mysql-install-modal" @submit.prevent="createMySQLInstall"><div class="modal-head"><div><p>MySQL 管理</p><h2>创建安装任务</h2></div><button type="button" @click="showMySQLInstall=false">×</button></div><p class="form-note">安装版本来自 Manager 当前 MySQL 安装包库；提交时仍会校验目标机器的 Linux 架构与 glibc 兼容性。</p><section class="install-section"><h3>实例基础信息</h3><label>目标机器<select v-model="mysqlInstallForm.machine" required><option value="">选择机器</option><option v-for="m in data.machines" :key="m.ID||m.id" :value="m.IP||m.ip">{{ m.Name||m.name }} · {{ m.IP||m.ip }}</option></select></label><label>MySQL 安装版本<select v-model="mysqlInstallForm.package_name"><option value="">自动选择兼容版本</option><option v-for="pkg in data.mysqlPackages" :key="pkg.file_name" :value="pkg.file_name">{{ pkg.version }} · {{ pkg.arch }} · glibc {{ pkg.glibc_version }}</option></select></label><p v-if="!data.mysqlPackages.length" class="form-note">安装包库中没有可选 MySQL 包，请先在安装包管理中上传。</p><div class="form-row"><label>MySQL 端口<input v-model.number="mysqlInstallForm.port" type="number" min="1" required></label><label>server_id<input v-model.number="mysqlInstallForm.server_id" type="number" min="1" required></label></div><div class="form-row"><label>MySQL 运行用户<input v-model="mysqlInstallForm.mysql_user" required></label><label>参数 Profile<input v-model="mysqlInstallForm.profile" required></label></div><label>root 密码<input v-model="mysqlInstallForm.root_password" type="password" required></label></section><details class="install-section" open><summary>目录与运行文件</summary><p>所有路径均可选；留空时使用 CLI 的默认规则。</p><label>实例根目录<input v-model="mysqlInstallForm.instance_dir" placeholder="/data/3306"></label><div class="form-row"><label>数据目录<input v-model="mysqlInstallForm.data_dir" placeholder="实例根目录/data"></label><label>binlog 目录<input v-model="mysqlInstallForm.binlog_dir" placeholder="实例根目录/binlog"></label></div><div class="form-row"><label>redo 目录<input v-model="mysqlInstallForm.redo_dir" placeholder="实例根目录/redo"></label><label>undo 目录<input v-model="mysqlInstallForm.undo_dir" placeholder="实例根目录/undo"></label></div><div class="form-row"><label>tmp 目录<input v-model="mysqlInstallForm.tmp_dir" placeholder="实例根目录/tmp"></label><label>安装目录<input v-model="mysqlInstallForm.base_dir" placeholder="/usr/local/mysql"></label></div><label>my.cnf 路径<input v-model="mysqlInstallForm.my_cnf_path" placeholder="实例根目录/my.cnf"></label><div class="form-row"><label>Socket 文件<input v-model="mysqlInstallForm.socket_path" placeholder="数据目录/mysql.sock"></label><label>错误日志<input v-model="mysqlInstallForm.error_log" placeholder="数据目录/mysqld.log"></label></div><div class="form-row"><label>PID 文件<input v-model="mysqlInstallForm.pid_file" placeholder="数据目录/mysqld.pid"></label><label>字符集目录<input v-model="mysqlInstallForm.character_sets_dir" placeholder="安装目录/share/charsets"></label></div><label>插件目录<input v-model="mysqlInstallForm.plugin_dir" placeholder="安装目录/lib/plugin"></label></details><details class="install-section"><summary>初始化账号与权限</summary><p>每个账号的权限可单独选择；保存的“预设账号”会自动带入此处。</p><article v-for="account in mysqlInstallForm.accounts" :key="account.role" class="mysql-account"><div><b>{{ account.role }}</b><label class="switch"><input v-model="account.enabled" type="checkbox"><span>启用</span></label></div><div class="form-row"><label>用户名<input v-model="account.username" :placeholder="account.role"></label><label>密码<input v-model="account.password" type="password" placeholder="默认 3306niubi"></label></div><label>允许来源 Host<input v-model="account.host" placeholder="默认 %"></label><div class="privilege-picker"><b>权限选择</b><label v-for="privilege in mysqlPrivilegeOptions" :key="privilege"><input v-model="account.privileges" type="checkbox" :value="privilege"> {{ privilege }}</label></div></article></details><div class="modal-actions"><button type="button" class="secondary" @click="showMySQLInstall=false">取消</button><button class="primary">创建安装任务</button></div></form></div>
+      <div v-if="showMySQLTask && mysqlTaskDetail" class="modal-mask"><section class="modal flow-modal"><div class="modal-head"><div><p>MySQL 安装流程</p><h2>{{ mysqlTaskDetail.MachineName || mysqlTaskDetail.machine_name || mysqlInstallForm.machine }}</h2></div><button type="button" @click="showMySQLTask=false">×</button></div><p class="form-note">任务：{{ mysqlTaskDetail.Task?.ID || mysqlTaskDetail.task?.id }} · 状态：{{ mysqlTaskDetail.Task?.Status || mysqlTaskDetail.task?.status }}</p><div class="flow-step" v-for="step in (mysqlTaskDetail.Steps || mysqlTaskDetail.steps || [])" :key="step.ID || step.id"><i :class="state(step.Status || step.status)">{{ ['success','completed'].includes(state(step.Status || step.status)) ? '✓' : ['failed','error'].includes(state(step.Status || step.status)) ? '!' : '…' }}</i><div class="flow-content"><b>{{ step.StepName || step.step_name }}</b><span>{{ step.Status || step.status }}</span><small v-if="step.Error || step.error" class="ui-error-summary">{{ errorSummary(step.Error || step.error) }}</small></div></div><div class="modal-actions"><button class="secondary" @click="refreshMySQLTask">刷新进度</button><button class="primary" @click="showMySQLTask=false">完成</button></div></section></div>
+      <section v-if="active === 'clusters'" :class="['cluster-dashboard', { 'cluster-overview-mode': data.clusterSection==='overview', 'cluster-machine-mode': data.clusterSection==='machines', 'cluster-instance-mode': data.clusterSection==='instances' }]">
+        <aside v-if="selectedClusterDetail" class="cluster-context-nav">
+          <div class="context-cluster"><b>{{ selectedClusterDetail.Name || selectedClusterDetail.name }}</b><small>集群 ID：{{ selectedClusterDetail.ID || selectedClusterDetail.id || '—' }}</small><span><i></i>正常运行</span></div>
+          <button :class="{active: (data.clusterSection || 'overview')==='overview'}" type="button" @click="data.clusterSection='overview'; refreshClusterTopology(); startClusterTopologyAutoRefresh()">概览</button>
+          <button :class="{active: data.clusterSection==='machines'}" type="button" @click="stopClusterTopologyAutoRefresh(); data.clusterSection='machines'; refreshClusterTopology({includeMachines:true})">机器管理</button>
+          <button :class="{active: data.clusterSection==='instances'}" type="button" @click="stopClusterTopologyAutoRefresh(); data.clusterSection='instances'; refreshClusterTopology({includeMachines:true})">实例管理</button>
+          <button :class="{active: data.clusterSection==='architecture'}" type="button" @click="openArchitectureAdjustment">架构调整</button>
+          <button :class="{active: data.clusterSection==='backup'}" type="button" @click="openClusterBackup">备份恢复</button>
+          <div class="context-danger"><button type="button" @click="cleanupCluster(selectedClusterDetail)">一键清理</button><button type="button" @click="deleteCluster(selectedClusterDetail)">删除集群</button></div>
+        </aside>
+        <template v-if="selectedClusterDetail">
+          <div class="cluster-detail-head"><button class="back-button" @click="closeClusterDetail">← 返回集群列表</button></div>
+          <div class="cluster-hero cluster-detail-hero"><div class="cluster-detail-title"><p>CLUSTER DETAIL</p><h2>{{ selectedClusterDetail.Name || selectedClusterDetail.name }}</h2><span>{{ selectedClusterDetail.Description || selectedClusterDetail.description || '暂无集群描述' }}</span></div></div>
+          <div class="cluster-summary cluster-detail-summary"><article><small>集群机器</small><b>{{ clusterMachineCount(selectedClusterDetail) }}</b></article><article><small>MySQL 实例</small><b>{{ clusterTopology.nodes.length }}</b></article><article><small>复制链路</small><b>{{ clusterTopology.edges.length }}</b></article><article><small>创建时间</small><strong>{{ date(selectedClusterDetail.CreatedAt || selectedClusterDetail.created_at) }}</strong></article></div>
+          <InstanceManagement v-if="data.clusterSection==='instances'" :cluster="selectedClusterDetail" :machines="clusterMachineItems" :instances="data.mysqlInstances" :packages="data.mysqlPackages" :tasks="data.tasks" :topology="clusterTopology" :account-presets="data.accountPresets" :initial-view="data.instanceView" @view-change="data.instanceView=$event" @close="data.clusterSection='overview'; data.instanceView='overview'; startClusterTopologyAutoRefresh()" @refresh="refresh(); refreshClusterTopology({includeMachines:true})" @open-task="openTaskDetail" />
+          <section v-else-if="data.clusterSection==='architecture'" class="architecture-workspace">
+            <div class="architecture-page-head"><div><p>TOPOLOGY ORCHESTRATION</p><h3>直接编辑集群拓扑</h3><span>角色、复制关系和 Keepalived 都在图上调整，保存前统一生成安全执行计划。</span></div><div class="architecture-head-actions"><button type="button" class="secondary" @click="openArchitectureAdjustment">重新读取</button><details class="architecture-add-menu"><summary>＋ 添加实例</summary><div><button v-for="item in architectureAvailableInstances()" :key="(item.MachineID||item.machine_id)+':'+(item.Port||item.port)" type="button" @click="addArchitectureInstance(item)"><b>{{ architectureNodeName(item.MachineID||item.machine_id) }}</b><small>{{ item.MachineIP||item.machine_ip }}:{{ item.Port||item.port }}</small></button><button v-if="!architectureAvailableInstances().length" type="button" @click="data.clusterSection='instances'"><b>创建新实例</b><small>当前没有可直接加入的已安装实例</small></button></div></details></div></div>
+            <form class="topology-architecture-layout" @submit.prevent="previewArchitectureAdjustment">
+              <section class="topology-editor-card">
+                <header class="topology-editor-head"><div><b>目标架构·{{ ({master_slave:'一主多从',dual_master:'双主架构',multi_master:'多主架构',keepalived_dual_master:'Keepalived + 双主'})[architectureForm.architecture] }}</b><small>拖动卡片调整位置；将从节点拖到主节点可修改复制源</small></div><span v-if="architectureLinkSource" class="topology-link-hint">请点击目标实例 · <button type="button" @click="architectureLinkSource=''">取消</button></span><span v-else class="topology-safe-hint">草稿模式 · 固定卡片 224 × 168</span></header>
+                <div class="topology-draft-canvas">
+                  <section class="topology-app-entry"><i>◇</i><div><b>业务访问入口</b><small>{{ vipConfigs.length ? vipConfigs.map(item=>item.vip_address).join('、') : '尚未配置 VIP' }}</small></div></section>
+                  <div class="topology-draft-stem"></div>
+                  <section v-if="architectureForm.architecture==='keepalived_dual_master'" class="topology-keepalived-node"><span>KA</span><div><b>Keepalived</b><small>VRRP 虚拟入口 · 双主健康检查</small></div><button type="button" @click="removeKeepalivedFromTopology">移除</button></section>
+                  <button v-else-if="architectureForm.nodes.filter(node=>node.role==='M').length===2" type="button" class="topology-add-keepalived" @click="addKeepalivedToTopology">＋ 在双主之间加入 Keepalived</button>
+                  <div :class="['topology-level','topology-master-level',{'drag-active':architectureDraggingNode}]" @dragover.prevent @drop.prevent="dropArchitectureLayer('M')">
+                    <span class="topology-level-label">根节点 · 主库</span>
+                    <div class="topology-node-grid topology-root-grid">
+                      <article v-for="node in architectureForm.nodes.filter(item=>item.role==='M')" :key="node.machine_id" draggable="true" :class="['topology-edit-node', node.role.toLowerCase(), 'root-node', {selected:architectureSelectedNode===node.machine_id, dragging:architectureDraggingNode===node.machine_id, source:architectureLinkSource===node.machine_id, target:architectureLinkSource && architectureLinkSource!==node.machine_id, changed:architectureNodeHasChanges(node)}]" @dragstart="startArchitectureNodeDrag($event,node)" @dragend="finishArchitectureNodeDrag" @dragover.prevent @drop.stop.prevent="dropArchitectureNode(node)" @click="architectureLinkSource && architectureLinkSource!==node.machine_id ? completeArchitectureLink(node) : architectureSelectedNode=node.machine_id">
+                        <header><span class="topology-db-icon">◉</span><select :value="node.role" @click.stop @change="requestArchitectureRoleChange(node,$event.target.value)"><option value="M">主</option><option value="S">从</option></select><button type="button" title="移出集群" @click.stop="kickArchitectureNode(node)">×</button></header>
+                        <div><b>{{ architectureNodeMeta(node.machine_id).name }}</b><small>{{ architectureNodeMeta(node.machine_id).ip }}:{{ node.port }}</small><span><i></i>{{ architectureNodeMeta(node.machine_id).status }}</span></div>
+                        <footer><button type="button" @click.stop="startArchitectureLink(node)">连线</button><small v-if="node.role==='S'">复制源：{{ architectureNodeName(node.source_machine_id || architectureForm.primary_machine_id) }}</small><small v-else>{{ architectureForm.architecture==='master_slave' ? '根节点 · 可写主库' : '根节点 · 双主可写' }}</small></footer>
+                      </article>
+                    </div>
+                  </div>
+                  <div v-if="architectureForm.nodes.some(node=>node.role==='S')" class="topology-branch-connector"><i></i><span></span></div>
+                  <div :class="['topology-level','topology-replica-level',{'drag-active':architectureDraggingNode}]" @dragover.prevent @drop.prevent="dropArchitectureLayer('S')">
+                    <span class="topology-level-label">叶子节点 · 从库</span>
+                    <div class="topology-node-grid topology-leaf-grid">
+                      <article v-for="node in architectureForm.nodes.filter(item=>item.role==='S')" :key="node.machine_id" draggable="true" :class="['topology-edit-node', node.role.toLowerCase(), 'leaf-node', {selected:architectureSelectedNode===node.machine_id, dragging:architectureDraggingNode===node.machine_id, source:architectureLinkSource===node.machine_id, target:architectureLinkSource && architectureLinkSource!==node.machine_id, changed:architectureNodeHasChanges(node)}]" @dragstart="startArchitectureNodeDrag($event,node)" @dragend="finishArchitectureNodeDrag" @dragover.prevent @drop.stop.prevent="dropArchitectureNode(node)" @click="architectureLinkSource && architectureLinkSource!==node.machine_id ? completeArchitectureLink(node) : architectureSelectedNode=node.machine_id">
+                        <header><span class="topology-db-icon">◉</span><select :value="node.role" @click.stop @change="requestArchitectureRoleChange(node,$event.target.value)"><option value="M">主</option><option value="S">从</option></select><button type="button" title="移出集群" @click.stop="kickArchitectureNode(node)">×</button></header>
+                        <div><b>{{ architectureNodeMeta(node.machine_id).name }}</b><small>{{ architectureNodeMeta(node.machine_id).ip }}:{{ node.port }}</small><span><i></i>{{ architectureNodeMeta(node.machine_id).status }}</span></div>
+                        <footer><button type="button" @click.stop="startArchitectureLink(node)">连线</button><small v-if="node.role==='S'">复制源：{{ architectureNodeName(node.source_machine_id || architectureForm.primary_machine_id) }}</small><small v-else>{{ architectureForm.architecture==='master_slave' ? '根节点 · 可写主库' : '根节点 · 双主可写' }}</small></footer>
+                      </article>
+                      <button type="button" class="topology-add-node-tile" @click="data.clusterSection='instances'"><i>＋</i><b>添加实例</b><small>新实例自动作为从节点</small></button>
+                    </div>
+                  </div>
+                  <div class="topology-draft-edges"><b>目标复制关系</b><span v-for="edge in architectureDraftEdges()" :key="edge.source+'>'+edge.target"><em>{{ architectureNodeName(edge.source) }}</em><i>{{ edge.mutual ? '⇄' : '→' }}</i><em>{{ architectureNodeName(edge.target) }}</em></span><small v-if="!architectureDraftEdges().length">点击节点的“连线”，再点击目标节点建立复制关系。</small></div>
+                </div>
+              </section>
+              <aside class="topology-inspector">
+                <section><header><b>拓扑摘要</b><small>根据连线自动推导</small></header><div class="topology-summary-list"><p><span>架构</span><b>{{ ({master_slave:'一主多从',dual_master:'双主架构',multi_master:'多主架构',keepalived_dual_master:'Keepalived + 双主'})[architectureForm.architecture] }}</b></p><p><span>实例</span><b>{{ architectureForm.nodes.length }} 个</b></p><p><span>根节点</span><b>{{ architectureForm.nodes.filter(node=>node.role==='M').length }} 个</b></p><p><span>主节点</span><b>{{ architectureForm.nodes.filter(node=>node.role==='M').map(node=>architectureNodeName(node.machine_id)).join('、') || '未设置' }}</b></p></div></section>
+                <section v-if="architectureSelectedNode"><header><b>实例设置</b><small>{{ architectureNodeName(architectureSelectedNode) }}</small></header><div class="topology-inspector-form" v-for="node in architectureForm.nodes.filter(item=>item.machine_id===architectureSelectedNode)" :key="node.machine_id"><label>目标角色<select :value="node.role" @change="requestArchitectureRoleChange(node,$event.target.value)"><option value="M">主节点</option><option value="S">从节点</option></select></label><label v-if="node.role==='S'">复制源<select v-model="node.source_machine_id" @change="architecturePlan=null"><option v-for="source in architectureForm.nodes.filter(item=>item.role==='M'&&item.machine_id!==node.machine_id)" :key="source.machine_id" :value="source.machine_id">{{ architectureNodeName(source.machine_id) }}</option></select></label><label>选举优先级<input v-model.number="node.election_priority" type="number" min="0" max="1000" @input="architecturePlan=null"></label><label v-if="node.role==='S'">复制延时（秒）<input v-model.number="node.delay_seconds" type="number" min="0" @input="architecturePlan=null"></label></div></section>
+                <section><header><b>VIP 与 Keepalived</b><small>双主入口配置</small></header><div class="topology-inspector-form"><label>VIP 地址<input v-model.trim="vipForm.vip_address" placeholder="192.168.1.100"></label><div class="inspector-inline"><label>前缀<input v-model.number="vipForm.vip_prefix" type="number" min="1" max="32"></label><label>网卡<input v-model.trim="vipForm.default_interface" placeholder="eth0"></label></div><label>宣告模式<select v-model="vipForm.vip_route_mode"><option value="L2_ARP">二层 ARP</option><option value="BGP">三层 BGP</option><option value="KEEPALIVED">Keepalived VRRP</option></select></label><button type="button" class="secondary" :disabled="!vipForm.vip_address" @click="saveVIPConfig">保存 VIP 配置</button></div></section>
+                <details class="topology-credentials"><summary>执行凭证</summary><div class="topology-inspector-form"><label>MySQL root 密码<input v-model="architectureForm.root_password" type="password" placeholder="执行前必填"></label><label>复制账号<input v-model.trim="architectureForm.replication_user" required></label><label>复制账号密码<input v-model="architectureForm.replication_password" type="password" placeholder="执行前必填"></label></div></details>
+                <div class="topology-plan-action"><small>预检不会修改 MySQL、VIP 或网络配置</small><button class="primary" :disabled="architectureSubmitting || architectureForm.nodes.length<2 || !architectureHasChanges">{{ architectureSubmitting ? '正在预检…' : architectureHasChanges ? '生成调整计划' : '当前无修改' }}</button></div>
+              </aside>
+            </form>
+            <div v-if="architectureRoleChangeDialog" class="modal-mask topology-risk-mask" @click.self="architectureRoleChangeDialog=null"><section class="modal topology-risk-modal"><header><span>!</span><div><p>ROLE CHANGE RISK</p><h2>确认切换主从角色</h2></div><button type="button" @click="architectureRoleChangeDialog=null">×</button></header><div class="topology-risk-target"><small>目标实例</small><b>{{ architectureNodeName(architectureRoleChangeDialog.machine_id) }}</b><span>{{ architectureRoleChangeDialog.from_role==='M' ? '主节点' : '从节点' }} → {{ architectureRoleChangeDialog.to_role==='M' ? '主节点' : '从节点' }}</span></div><label v-if="architectureRoleChangeDialog.needs_replacement" class="topology-risk-replacement">接替的新主节点<select v-model="architectureRoleChangeDialog.replacement_machine_id" required><option value="">请选择候选从节点</option><option v-for="candidate in architectureForm.nodes.filter(item=>item.role==='S'&&item.machine_id!==architectureRoleChangeDialog.machine_id)" :key="candidate.machine_id" :value="candidate.machine_id">{{ architectureNodeName(candidate.machine_id) }} · 优先级 {{ candidate.election_priority }}</option></select><small>执行时会先等待该节点复制追平，再提升为新主。</small></label><div class="topology-risk-warning"><b>切主期间业务连接会断开</b><p>Manager 会暂停写入、清理旧主业务会话、等待复制追平，再重建复制关系。应用需要具备断线重连能力。</p></div><ul><li><i>1</i><span><b>短暂不可写</b><small>旧主会进入 read_only / super_read_only</small></span></li><li><i>2</i><span><b>存量连接被清理</b><small>除管理、复制、监控和备份账号外的会话将断开</small></span></li><li><i>3</i><span><b>复制未追平可能延长中断</b><small>超过 60 秒后必须再次人工确认，不会自动强制切换</small></span></li></ul><footer><button type="button" class="secondary" @click="architectureRoleChangeDialog=null">取消变更</button><button type="button" class="danger-button" :disabled="architectureRoleChangeDialog.needs_replacement&&!architectureRoleChangeDialog.replacement_machine_id" @click="confirmArchitectureRoleChange">我已了解业务会中断，确认变更</button></footer></section></div>
+            <section v-if="architecturePlan" class="architecture-plan"><header><div><b>安全执行计划</b><small>计划 ID：{{ architecturePlan.plan_id }}</small></div><span :class="['status',architecturePlan.executable ? 'success' : 'failed']">{{ architecturePlan.executable ? '预检通过' : '存在阻断' }}</span></header><div class="architecture-plan-summary"><div><small>选举的新主候选</small><b>{{ architecturePlan.selected_candidate?.hostname || architecturePlan.selected_candidate?.machine_id || '无可用候选' }}</b></div><div><small>复制追平超时</small><b>{{ architecturePlan.wait_delay_timeout_seconds }} 秒</b></div><div><small>VIP 宣告模式</small><b>{{ architecturePlan.vip_route_mode || '不迁移 VIP' }}</b></div><div><small>强制切主</small><b>超时后必须人工确认</b></div></div><div v-if="architecturePlan.blocking_reasons?.length" class="architecture-blockers"><b>阻断原因</b><p v-for="item in architecturePlan.blocking_reasons" :key="item">{{ errorSummary(item, 140) }}</p></div><ol class="architecture-step-list"><li v-for="step in architecturePlan.steps" :key="step.code" :class="{danger:step.destructive}"><i>{{ step.order }}</i><div><b>{{ step.name }}</b><small>{{ step.description }}</small></div><em v-if="step.requires_confirmation">人工确认</em></li></ol><footer><p>涉及现有复制链路或 VIP 时，系统不会降级为并发脚本执行。</p><button class="primary" :disabled="architectureSubmitting || !architecturePlan.executable || (architectureRun && !['success','failed'].includes(architectureRun.status))" @click="submitArchitectureAdjustment">执行架构调整</button></footer></section>
+            <section v-if="architectureRun" class="architecture-run architecture-live-run"><header><div><p>LIVE SWITCHOVER</p><b>{{ architectureRun.status==='success' ? '架构切换完成' : architectureRun.status==='failed' ? '架构切换失败' : '正在执行架构切换，请勿关闭页面' }}</b><small>{{ architectureRun.run_id }} · 当前步骤 {{ architectureRun.current_step || '等待启动' }}</small></div><div class="architecture-run-actions"><button type="button" class="secondary" @click="openArchitectureRunTask">在任务中心查看</button><button v-if="architectureRun.status==='waiting_force_confirmation'" type="button" class="danger-button" @click="confirmArchitectureForce">确认强制切主</button></div></header><div class="architecture-run-progress"><i :style="{width:architectureRunProgress()+'%'}"></i><span>{{ architectureRunProgress() }}%</span></div><div v-if="architectureRun.error" class="architecture-blockers"><b>{{ architectureRun.status==='waiting_force_confirmation' ? '需要人工决策' : '执行错误' }}</b><p>{{ errorSummary(architectureRun.error) }}</p></div><ol><li v-for="step in (architectureRun.plan?.steps || [])" :key="step.code" :class="architectureRunStepStatus(step)"><i>{{ architectureRunStepStatus(step)==='success' ? '✓' : architectureRunStepStatus(step)==='failed' ? '!' : architectureRunStepStatus(step)==='running' ? '…' : step.order }}</i><span><b>{{ step.name }}</b><small>{{ errorSummary(architectureRunStepResult(step)?.message || (architectureRunStepResult(step)?.task_ids || []).join('、') || step.description, 140) }}</small></span><em>{{ ({pending:'等待',running:'执行中',success:'已完成',failed:'失败'})[architectureRunStepStatus(step)] }}</em></li></ol></section>
+          </section>
+          <section v-else-if="data.clusterSection==='backup'" class="backup-workspace">
+            <div class="backup-page-head"><div><p>XTRABACKUP OPERATIONS</p><h3>备份与恢复</h3><span>Manager 负责策略调度，Agent 使用统一参数化 Shell 模板执行物理备份与恢复。</span></div><div><button class="secondary" @click="loadClusterBackups">刷新</button><button class="primary" @click="openBackupPolicyEditor()">＋ 新建策略</button></div></div>
+            <form v-if="showBackupPolicyEditor" class="backup-policy-editor" @submit.prevent="saveBackupPolicy">
+              <header><div><b>{{ backupPolicyForm.id ? '编辑备份策略' : '创建备份策略' }}</b><small>配置会保存在 Manager，正式执行由目标机器 Agent 完成。</small></div><button type="button" @click="showBackupPolicyEditor=false">×</button></header>
+              <section class="backup-config-section"><div class="backup-section-title"><b>备份对象</b><small>默认选择拓扑中的备节点；只有机器存在多个 MySQL 实例时才需要选择实例。</small></div><div class="backup-form-grid"><label>策略名称<input v-model.trim="backupPolicyForm.name" required placeholder="生产集群物理备份"></label><label>备份机器<select v-model="backupPolicyForm.machine_id" required @change="backupMachineChanged"><option value="">自动选择备节点</option><option v-for="machine in backupMachines()" :key="machine.ID||machine.id" :value="machine.ID||machine.id">{{ machine.Name||machine.name }} · {{ machine.IP||machine.ip }} · {{ backupMachineRole(machine) }}</option></select></label><label v-if="backupInstancesForMachine(backupPolicyForm.machine_id).length>1">多实例选择<select v-model.number="backupPolicyForm.port"><option v-for="instance in backupInstancesForMachine(backupPolicyForm.machine_id)" :key="instance.Port||instance.port" :value="Number(instance.Port||instance.port)">端口 {{ instance.Port||instance.port }} · {{ instance.PackageName||instance.package_name||'版本待上报' }}</option></select></label><label v-else>当前实例<input :value="backupInstancesForMachine(backupPolicyForm.machine_id).length ? '端口 '+backupPolicyForm.port : '将自动选择备节点实例'" readonly></label><label>默认备份类型<select v-model="backupPolicyForm.backup_type"><option value="full">全量备份</option><option value="incremental">增量备份</option></select></label></div></section>
+              <section class="backup-config-section"><div class="backup-section-title"><b>调度配置</b><small>按周模式可为每个执行日分别指定全量或增量；增量前必须存在成功的全量备份。</small></div><div class="backup-form-grid schedule-grid"><label>调度方式<select v-model="backupPolicyForm.schedule_type"><option value="weekly">按周备份</option><option value="custom">自定义间隔</option><option value="once">备份一次</option></select></label><label v-if="backupPolicyForm.schedule_type==='custom'">间隔时间（分钟）<input v-model.number="backupPolicyForm.interval_minutes" type="number" min="1" required></label><label>首次发起日期与时间<input v-model="backupPolicyForm.start_at" type="datetime-local" required></label></div><div v-if="backupPolicyForm.schedule_type==='weekly'" class="weekly-schedule"><div class="weekday-picker"><b>执行日期</b><label><input type="checkbox" :checked="backupPolicyForm.weekdays.length===7" @change="toggleAllBackupWeekdays">全选</label><label v-for="day in [{v:1,n:'周一'},{v:2,n:'周二'},{v:3,n:'周三'},{v:4,n:'周四'},{v:5,n:'周五'},{v:6,n:'周六'},{v:0,n:'周日'}]" :key="day.v"><input v-model="backupPolicyForm.weekdays" type="checkbox" :value="day.v">{{ day.n }}</label></div><div class="weekly-backup-types"><div v-for="day in backupPolicyForm.weekdays" :key="day"><b>{{ weekdayName(day) }}</b><label><input v-model="backupPolicyForm.weekday_backup_types[String(day)]" type="radio" value="full">全量</label><label><input v-model="backupPolicyForm.weekday_backup_types[String(day)]" type="radio" value="incremental">增量</label></div></div></div></section>
+              <section class="backup-config-section"><div class="backup-section-title"><b>存储与安全预检</b><small>磁盘使用率达到阈值会直接失败；备节点延迟超过 30 秒仍未归零会进入重试。</small></div><div class="backup-form-grid"><label class="backup-path-field">备份位置（目标机器绝对路径）<input v-model.trim="backupPolicyForm.backup_location" required placeholder="/data/gmha/backups"></label><label>磁盘使用率失败阈值<input v-model.number="backupPolicyForm.disk_usage_threshold" type="number" min="1" max="99" required><small>默认 95%，达到阈值直接拒绝备份</small></label><label>失败后重试次数<input v-model.number="backupPolicyForm.retry_count" type="number" min="0" max="5"><small>最多 5 次，超过后判定当日失败</small></label><label>重试间隔（秒）<input v-model.number="backupPolicyForm.retry_interval_seconds" type="number" min="1"></label><label>备份账号<input v-model.trim="backupPolicyForm.mysql_user" required></label><label>备份账号密码<input v-model="backupPolicyForm.mysql_password" type="password" :placeholder="backupPolicyForm.id ? '留空保持原密码' : '请输入密码'"></label></div><div class="backup-precheck-flow"><span><i>1</i>磁盘使用率检查</span><span><i>2</i>主从延迟等待 ≤ 30 秒</span><span><i>3</i>XtraBackup 全量/增量</span><span><i>4</i>完整性标记与日志</span></div></section>
+              <div class="backup-switches"><label><input v-model="backupPolicyForm.include_binlog" type="checkbox">同时备份 binlog</label><label><input v-model="backupPolicyForm.enabled" type="checkbox">启用自动调度</label></div><div class="backup-editor-actions"><button type="button" class="secondary" @click="showBackupPolicyEditor=false">取消</button><button class="primary">保存备份策略</button></div>
+            </form>
+            <section class="cluster-workspace backup-policy-list"><div class="panel-head"><div><h3>备份策略</h3><p>机器是备份执行目标；单实例自动选择，多实例才显示端口。</p></div><span class="count">{{ backupPolicies.length }} 条</span></div><div class="backup-table-wrap"><table><thead><tr><th>策略</th><th>备份机器</th><th>类型 / 调度</th><th>安全策略</th><th>下次执行</th><th>状态</th><th>操作</th></tr></thead><tbody><tr v-for="item in backupPolicies" :key="item.id"><td><b>{{ item.name }}</b><small>{{ item.backup_location }}</small></td><td><b>{{ clusterMachineItems.find(m=>(m.ID||m.id)===item.machine_id)?.Name || item.machine_id }}</b><small>实例端口 {{ item.port }}</small></td><td><b>{{ backupTypeLabel(item.backup_type) }}</b><small>{{ backupScheduleLabel(item) }}</small></td><td><span>磁盘 &lt; {{ item.disk_usage_threshold }}%</span><small>延迟等待 30 秒 · 重试 {{ item.retry_count }}/5 次</small></td><td>{{ item.next_run_at ? date(item.next_run_at) : '—' }}</td><td><span :class="['status', item.enabled ? 'success' : 'offline']">{{ item.enabled ? '已启用' : '已停用' }}</span></td><td class="cluster-row-actions"><button class="text-button" @click="runBackupPolicy(item)">立即备份</button><button class="text-button" @click="openBackupPolicyEditor(item)">编辑</button><button class="danger-link" @click="deleteBackupPolicy(item)">删除</button></td></tr><tr v-if="!backupPolicies.length"><td colspan="7" class="empty">尚未配置备份策略。点击“新建策略”开始。</td></tr></tbody></table></div></section>
+            <section class="cluster-workspace backup-run-list"><div class="panel-head"><div><h3>备份记录与执行日志</h3><p>预检、延迟等待、重试和 XtraBackup 输出均随 Agent 任务记录。</p></div><span class="count">最近 {{ backupRuns.length }} 条</span></div><div class="backup-table-wrap"><table><thead><tr><th>备份时间</th><th>备份机器 / 实例</th><th>类型</th><th>任务状态</th><th>备份目录</th><th>操作</th></tr></thead><tbody><template v-for="run in backupRuns" :key="run.id"><tr><td>{{ date(run.created_at) }}</td><td><b>{{ run.machine_name || run.machine_id }}</b><small>{{ run.machine_ip }}:{{ run.port }}</small></td><td><span class="backup-type-badge">{{ backupTypeLabel(run.backup_type) }}</span><small v-if="run.base_run_id">基础：{{ run.base_run_id }}</small></td><td><span :class="['status', state(run.status)]">{{ taskStatusLabel(run.status) }}</span><small v-if="run.last_error" class="backup-last-error">{{ errorSummary(run.last_error) }}</small></td><td><code>{{ run.backup_path }}</code></td><td><button class="text-button" @click="openTaskDetail({ID:run.task_id,id:run.task_id})">任务详情</button><button class="danger-link" :disabled="state(run.status)!=='success'" @click="restoreBackup(run)">恢复</button></td></tr></template><tr v-if="!backupRuns.length"><td colspan="6" class="empty">暂无备份执行记录。</td></tr></tbody></table></div></section>
+          </section>
+          <template v-else>
+<section class="cluster-workspace topology-workspace live-topology-workspace">
+  <div class="panel-head live-topology-head"><div><h3>MySQL 实例与主从拓扑</h3><p>主节点位于根层，从节点按实际复制源位于叶子层；运行数据每 5 秒自动刷新。</p></div><div class="live-topology-controls"><span :class="['live-dot',{refreshing:clusterTopologyRefreshing}]"><i></i>{{ clusterTopologyRefreshing ? '正在刷新' : '实时数据' }}</span><small>更新于 {{ clusterTopologyLastUpdated ? date(clusterTopologyLastUpdated) : '—' }}</small><button type="button" :class="['auto-refresh-toggle',{active:clusterTopologyAutoRefresh}]" @click="toggleClusterTopologyAutoRefresh">{{ clusterTopologyAutoRefresh ? '自动刷新已开启' : '自动刷新已暂停' }}</button><button type="button" class="icon-button" :disabled="clusterTopologyRefreshing" @click="refreshClusterTopology()" title="立即刷新">↻</button></div></div>
+  <div v-if="clusterTopologyError" class="topology-error">{{ errorSummary(clusterTopologyError) }}</div>
+  <div v-else-if="!clusterTopology.nodes.length" class="topology-empty topology-empty-rich"><div class="topology-empty-copy"><span class="topology-empty-icon">⌁</span><div><b>尚未发现 MySQL 实例</b><small>请前往“机器管理”将机器分配至集群，再为机器创建 MySQL 安装任务。</small></div></div><div class="topology-next-steps"><span><i>1</i>在机器管理中分配机器</span><span><i>2</i>创建 MySQL 安装任务</span><span><i>3</i>等待实例心跳上报</span></div><div class="topology-empty-actions"><button class="secondary" @click="active='machines'; closeClusterDetail()">前往机器管理</button><button class="primary" @click="active='mysql'; closeClusterDetail()">前往 MySQL 安装</button></div></div>
+  <div v-else class="live-topology-canvas">
+    <section class="live-entry-card"><span>◇</span><div><b>业务访问入口</b><small>应用连接 / VIP / 读写流量</small></div><em>LIVE</em></section>
+    <div v-if="overviewTopologyRoots().length" class="live-topology-stem"></div>
+    <section v-if="overviewTopologyRoots().length" class="live-topology-level live-root-level"><header><b>根节点 · 主库</b><small>{{ overviewTopologyRoots().length > 1 ? overviewTopologyRoots().length + ' 个可写根节点' : '当前写入主节点' }}</small></header><div class="live-node-row">
+      <article v-for="node in overviewTopologyRoots()" :key="'root-'+node.ip+':'+node.port" :class="['live-node-card','root',{error:node.error}]"><header><span class="live-db-glyph">◉</span><em>{{ mysqlRoleLabel(node.role) }}</em><i :class="{bad:node.error}"></i></header><div class="live-node-identity"><b>{{ node.name || node.ip }}</b><small>{{ node.ip }}:{{ node.port }} · server_id {{ node.server_id || '—' }}</small></div><div class="live-node-metrics"><span><small>QPS</small><b>{{ topologyMetric(node.qps) }}</b></span><span><small>TPS</small><b>{{ topologyMetric(node.tps) }}</b></span><span><small>连接</small><b>{{ topologyMetric(node.connections) }}</b></span><span><small>心跳</small><b>{{ node.heartbeat || '—' }}</b></span></div><footer><span>{{ node.read_only==='true'||node.read_only==='ON' ? '只读' : '可写' }}</span><small>{{ node.last_updated || '等待动态数据' }}</small></footer></article>
+    </div></section>
+    <div v-if="overviewTopologyRoots().length && overviewTopologyReplicas().length" class="live-branch"><i></i><span></span></div>
+    <section v-if="overviewTopologyReplicas().length" class="live-topology-level live-leaf-level"><header><b>叶子节点 · 从库</b><small>按复制源挂载 · {{ overviewTopologyReplicas().length }} 个副本</small></header><div class="live-node-row">
+      <article v-for="node in overviewTopologyReplicas()" :key="'replica-'+node.ip+':'+node.port" :class="['live-node-card','leaf',{error:node.error,lagging:Number(overviewTopologyEdgeForReplica(node)?.lag||0)>30}]"><header><span class="live-db-glyph">◉</span><em>{{ mysqlRoleLabel(node.role) }}</em><i :class="{bad:node.error}"></i></header><div class="live-node-identity"><b>{{ node.name || node.ip }}</b><small>{{ node.ip }}:{{ node.port }} · 来源 {{ overviewTopologySourceName(node) }}</small></div><div class="live-node-metrics"><span><small>延迟</small><b>{{ topologyMetric(overviewTopologyEdgeForReplica(node)?.lag,'s') }}</b></span><span><small>IO 线程</small><b>{{ overviewTopologyEdgeForReplica(node)?.io_running || '—' }}</b></span><span><small>SQL 线程</small><b>{{ overviewTopologyEdgeForReplica(node)?.sql_running || '—' }}</b></span><span><small>QPS</small><b>{{ topologyMetric(node.qps) }}</b></span></div><footer><span>{{ Number(overviewTopologyEdgeForReplica(node)?.lag||0)>30 ? '复制延迟' : '复制正常' }}</span><small>{{ node.last_updated || '等待动态数据' }}</small></footer></article>
+    </div></section>
+    <section v-if="overviewTopologyStandalone().length" class="live-topology-level live-standalone-level"><header><b>独立实例</b><small>尚未建立复制关系</small></header><div class="live-node-row"><article v-for="node in overviewTopologyStandalone()" :key="'standalone-'+node.ip+':'+node.port" :class="['live-node-card','standalone',{error:node.error}]"><header><span class="live-db-glyph">◉</span><em>独立</em><i :class="{bad:node.error}"></i></header><div class="live-node-identity"><b>{{ node.name || node.ip }}</b><small>{{ node.ip }}:{{ node.port }} · server_id {{ node.server_id || '—' }}</small></div><div class="live-node-metrics"><span><small>QPS</small><b>{{ topologyMetric(node.qps) }}</b></span><span><small>TPS</small><b>{{ topologyMetric(node.tps) }}</b></span><span><small>连接</small><b>{{ topologyMetric(node.connections) }}</b></span><span><small>心跳</small><b>{{ node.heartbeat || '—' }}</b></span></div><footer><span>未配置复制</span><small>{{ node.last_updated || '等待动态数据' }}</small></footer></article></div></section>
+    <div class="live-edge-list"><header><b>实时复制链路</b><span>{{ clusterTopology.edges.length }} 条</span></header><div><p v-for="edge in clusterTopology.edges" :key="edge.source_ip+':'+edge.source_port+'>'+edge.target_ip+':'+edge.target_port" :class="{bad:edge.io_running!=='Yes'||edge.sql_running!=='Yes'}"><span><b>{{ edge.source_name || edge.source_ip }}</b><small>{{ edge.source_ip }}:{{ edge.source_port }}</small></span><i>→</i><span><b>{{ edge.target_name || edge.target_ip }}</b><small>{{ edge.target_ip }}:{{ edge.target_port }}</small></span><em>{{ edge.io_running || '—' }}/{{ edge.sql_running || '—' }} · 延迟 {{ topologyMetric(edge.lag,'s') }}</em></p><small v-if="!clusterTopology.edges.length">当前没有复制链路，实例按独立节点展示。</small></div></div>
+  </div>
+</section>
+          <section class="cluster-workspace member-overview cluster-machine-mysql"><div class="panel-head"><div><h3>集群机器管理</h3><p>仅管理当前集群的机器成员、连接信息和 Agent 状态；MySQL 生命周期操作请前往“实例管理”。</p></div><div class="cluster-machine-actions"><span>共 {{ clusterMachineTotal }} 台机器</span><button class="primary" @click="openClusterMembers(selectedClusterDetail)">＋ 添加机器</button></div></div><div class="cluster-machine-table-wrap"><table v-if="clusterMachineItems.length" class="cluster-machine-table"><thead><tr><th class="machine-column">机器</th><th class="network-column">网卡 / IP 地址</th><th class="architecture-column">架构</th><th class="ssh-column">SSH</th><th class="agent-column">Agent</th><th class="credential-column">凭证</th><th class="actions-column">操作</th></tr></thead><tbody><tr v-for="machine in clusterMachineItems" :key="machine.ID || machine.id"><td class="machine-column"><button class="machine-name-link" @click="showMachine(machine.ID || machine.id)" :title="machine.Name || machine.name">{{ machine.Name || machine.name }}</button><small :title="machine.ID || machine.id">{{ machine.ID || machine.id }}</small></td><td class="network-column"><div class="machine-network-list"><div v-for="item in clusterMachineInterfaces(machine)" :key="item.name + item.ip" class="machine-network-item"><span>{{ item.name }}</span><b>{{ item.ip }}</b></div></div></td><td class="architecture-column">{{ machine.Architecture || machine.architecture || machine.Arch || machine.arch || '待采集' }}</td><td class="ssh-column"><b>{{ machine.SSHUser || machine.ssh_user || 'root' }}</b><small>端口 {{ machine.SSHPort || machine.ssh_port || 22 }}</small></td><td class="agent-column"><span :class="['status', machineStatus(machine).code]">{{ machineStatus(machine).label }}</span></td><td class="credential-column">{{ data.credentials.find(item => (item.id || item.ID) === (machine.CredentialID || machine.credential_id))?.name || ((machine.CredentialID || machine.credential_id) ? '已关联' : '未分配') }}</td><td class="cluster-row-actions actions-column"><button class="text-button" @click="showMachine(machine.ID || machine.id)">详情 / 编辑</button><button class="danger-link" @click="removeMachineFromCluster(machine)">移出集群</button></td></tr></tbody></table><div v-else class="member-summary">当前集群暂无机器。点击“添加机器”从已纳管机器中选择。</div></div><div v-if="clusterMachineTotal" class="cluster-pager"><span>第 {{ clusterMachinePage }} 页 · 共 {{ clusterMachineTotal }} 台机器</span><div><button class="secondary" :disabled="clusterMachinePage===1" @click="changeClusterMachinePage(-1)">上一页</button><button class="secondary" :disabled="clusterMachinePage*50>=clusterMachineTotal" @click="changeClusterMachinePage(1)">下一页</button></div></div></section>
+          </template>
+        </template>
+        <template v-else>
+          <div class="cluster-hero"><div><p>CLUSTER OPERATIONS</p><h2>集群列表</h2><span>以集群为运维边界，集中处理机器、MySQL 实例、拓扑、备份与生命周期操作。</span></div><div class="cluster-hero-actions"><button class="primary" @click="openCreateCluster">＋ 创建集群</button><button class="secondary" @click="active='machines'">管理机器</button></div></div>
+          <div class="cluster-summary"><article><small>集群总数</small><b>{{ clusterTotal || data.clusters.length }}</b></article><article><small>已分配机器</small><b>{{ data.clusters.reduce((total, item) => total + clusterMachineCount(item), 0) }}</b></article><article><small>在线 Agent</small><b>{{ data.agents.filter(item => agentStatus(item).code === 'agent_online' && machineCluster(item) !== '未分配集群').length }}</b></article></div>
+          <section class="cluster-workspace"><div class="panel-head"><div><h3>集群列表</h3><p>按名称或描述检索；每行提供机器数、实例数和状态摘要。</p></div><form class="cluster-search" @submit.prevent="searchClusterPage"><input v-model.trim="clusterKeyword" placeholder="搜索集群名称或描述"><button class="secondary">查询</button><button type="button" class="icon-button" @click="refresh">↻</button></form></div><table v-if="clusterPageItems.length" class="cluster-table"><thead><tr><th>集群</th><th>描述</th><th>集群机器</th><th>MySQL 实例</th><th>在线 Agent</th><th>创建时间</th><th></th></tr></thead><tbody><tr v-for="item in clusterPageItems" :key="item.Name || item.name" @click="openClusterDetail(item)" class="cluster-row"><td><b>{{ item.Name || item.name }}</b></td><td><small>{{ item.Description || item.description || '—' }}</small></td><td>{{ clusterMachineCount(item) }}</td><td>{{ data.mysqlInstances.filter(instance => (instance.Cluster || instance.cluster) === (item.Name || item.name)).length }}</td><td>{{ clusterAgentCount(item) }}</td><td>{{ date(item.CreatedAt || item.created_at) }}</td><td><button class="text-button" @click.stop="openClusterDetail(item)">进入管理 →</button></td></tr></tbody></table><div v-else class="cluster-empty"><b>{{ clusterKeyword ? '未找到匹配集群' : '尚未创建集群' }}</b><small>{{ clusterKeyword ? '请修改搜索条件，或清空条件后重试。' : '先创建一个逻辑资源边界，再把已纳管机器分配进去。' }}</small><button v-if="!clusterKeyword" class="primary" @click="openCreateCluster">创建第一个集群</button><button v-else class="secondary" @click="clusterKeyword='';searchClusterPage()">清空搜索</button></div><div v-if="clusterTotal" class="cluster-pager"><span>第 {{ clusterPage }} 页 · 共 {{ clusterTotal }} 个集群</span><div><button class="secondary" :disabled="clusterPage===1" @click="changeClusterPage(-1)">上一页</button><button class="secondary" :disabled="clusterPage*12>=clusterTotal" @click="changeClusterPage(1)">下一页</button></div></div></section>
+        </template>
+      </section>
+      <div v-if="data.restoreDialog" class="modal-mask recovery-modal-mask" @click.self="data.restoreDialog=null">
+        <form class="modal recovery-modal" @submit.prevent="data.submitRestore()">
+          <div class="modal-head"><div><p>MYSQL DATA RECOVERY</p><h2>恢复数据 · {{ data.restoreDialog.machine_name || data.restoreDialog.machine_id }}</h2></div><button type="button" @click="data.restoreDialog=null">×</button></div>
+          <div class="recovery-target"><div><small>实例地址</small><b>{{ data.restoreDialog.machine_ip }}:{{ data.restoreDialog.port }}</b></div><div><small>关联备份</small><b>{{ backupTypeLabel(data.restoreDialog.backup_type) }} · {{ date(data.restoreDialog.created_at) }}</b></div></div>
+          <div class="recovery-mode-grid">
+            <label :class="{active:data.restoreForm.mode==='flashback'}"><input v-model="data.restoreForm.mode" type="radio" value="flashback"><b>数据闪回</b><small>默认使用 bin2sql 生成反向 SQL，不停库。</small></label>
+            <label :class="{active:data.restoreForm.mode==='point_in_time'}"><input v-model="data.restoreForm.mode" type="radio" value="point_in_time"><b>按时间点恢复</b><small>XtraBackup 物理恢复后回放 binlog 到指定时间。</small></label>
+            <label :class="{active:data.restoreForm.mode==='physical'}"><input v-model="data.restoreForm.mode" type="radio" value="physical"><b>全量物理恢复</b><small>使用当前全量/增量链覆盖目标实例数据。</small></label>
+          </div>
+          <div v-if="data.restoreForm.mode==='flashback'" class="recovery-risk amber"><b>在线闪回风险</b><p>bin2sql 依赖 ROW 格式且 binlog_row_image=FULL。默认只生成回滚 SQL；直接执行可能与当前数据冲突，请先审阅 SQL 并在低峰操作。</p></div>
+          <div v-else class="recovery-risk red"><b>高风险：恢复期间数据库将暂停使用</b><p>系统会停止 MySQL、保留旧数据目录并执行物理恢复。按时间点恢复还会继续回放 binlog；请先确认业务已停止写入。</p></div>
+          <div class="recovery-form-grid">
+            <label v-if="data.restoreForm.mode!=='flashback'" class="wide">恢复文件位置<input v-model.trim="data.restoreForm.backup_path" required placeholder="/data/gmha/backups/..."><small>默认使用本条记录及其增量链；手动改路径时按独立全量备份处理。</small></label>
+            <label v-if="data.restoreForm.mode!=='physical'">恢复时间<input v-model="data.restoreForm.restore_time" type="datetime-local" required><small>{{ data.restoreForm.mode==='flashback' ? '回滚此时间之后的变更' : '恢复至该时间点' }}</small></label>
+            <label v-if="data.restoreForm.mode==='flashback'">闪回 SQL 保存位置<input v-model.trim="data.restoreForm.output_dir" required placeholder="/data/gmha/recovery"></label>
+            <label v-if="data.restoreForm.mode==='flashback'">限定数据库（可选）<input v-model.trim="data.restoreForm.database" placeholder="留空表示全部数据库"></label>
+            <label v-if="data.restoreForm.mode==='flashback'">限定数据表（可选）<input v-model.trim="data.restoreForm.tables" placeholder="orders,users"></label>
+            <label>MySQL 管理账号<input v-model.trim="data.restoreForm.mysql_user" required></label>
+            <label>MySQL 管理密码<input v-model="data.restoreForm.mysql_password" type="password" autocomplete="new-password" placeholder="用于 binlog 回放或主从修复"></label>
+          </div>
+          <div class="recovery-options">
+            <label v-if="data.restoreForm.mode!=='flashback'"><input v-model="data.restoreForm.repair_replication" type="checkbox">恢复后启动复制，并使用 Percona Toolkit（pt-table-sync）校验与修复主从数据</label>
+            <label v-else><input v-model="data.restoreForm.apply_flashback" type="checkbox">生成后立即执行回滚 SQL（高风险，建议保持关闭并先审阅文件）</label>
+          </div>
+          <label class="recovery-confirm">二次确认<input v-model.trim="data.restoreForm.confirmation" required :placeholder="data.restoreExpected()"><small>请输入：<code>{{ data.restoreExpected() }}</code></small></label>
+          <div class="modal-actions"><button type="button" class="secondary" @click="data.restoreDialog=null">取消</button><button :class="data.restoreForm.mode==='flashback' && !data.restoreForm.apply_flashback ? 'primary' : 'danger-button'">{{ data.restoreForm.mode==='flashback' && !data.restoreForm.apply_flashback ? '生成闪回 SQL' : '创建恢复任务' }}</button></div>
+        </form>
+      </div>
+      <div v-if="showClusterMembers && selectedClusterForMembers" class="modal-mask" @click.self="showClusterMembers=false"><section class="modal cluster-members-modal"><div class="modal-head"><div><p>集群机器</p><h2>添加机器到 {{ selectedClusterForMembers.Name || selectedClusterForMembers.name }}</h2></div><button type="button" @click="showClusterMembers=false">×</button></div><p class="form-note">选择机器后会调用与 CLI 完全相同的集群分配流程。机器从其他集群迁入时，其归属将被更新。</p><div class="member-list"><label v-for="machine in clusterCandidates" :key="machine.ID || machine.id" class="member-choice"><input type="checkbox" :value="machine.ID || machine.id" v-model="selectedClusterMachineIDs" :disabled="machineCluster(machine) === (selectedClusterForMembers.Name || selectedClusterForMembers.name)"><span><b>{{ machine.Name || machine.name }}</b><small>{{ machine.IP || machine.ip }} · {{ machineStatus(machine).label }}</small></span><em :class="['cluster-label', {unassigned: machineCluster(machine) === '未分配集群'}]">{{ machineCluster(machine) }}</em></label><p v-if="!clusterCandidates.length" class="form-note">本页没有可选机器。</p></div><div class="member-pager"><button class="secondary" :disabled="clusterCandidatePage===1" @click="changeClusterCandidatePage(-1)">上一页</button><span>第 {{ clusterCandidatePage }} 页 · 共 {{ clusterCandidateTotal }} 台</span><button class="secondary" :disabled="clusterCandidatePage*pageSize>=clusterCandidateTotal" @click="changeClusterCandidatePage(1)">下一页</button></div><section v-if="clusterMemberAssignResult" class="member-result"><b>分配结果</b><p v-for="item in (clusterMemberAssignResult.results || [])" :key="item.machine_id"><span :class="['status', item.success ? 'success' : 'error']">{{ item.success ? '成功' : '失败' }}</span>{{ item.machine_id }}<small v-if="item.error">{{ item.error }}</small></p></section><div class="modal-actions"><button type="button" class="secondary" @click="showClusterMembers=false">取消</button><button class="primary" :disabled="!selectedClusterMachineIDs.length" @click="assignClusterMembers">添加 {{ selectedClusterMachineIDs.length ? selectedClusterMachineIDs.length + ' 台机器' : '' }}</button></div></section></div>
+<div v-if="showClusterEditor" class="modal-mask" @click.self="showClusterEditor=false"><form class="modal cluster-editor" @submit.prevent="saveCluster"><div class="modal-head"><div><p>集群管理</p><h2>{{ clusterForm.old_name ? '修改集群' : '创建集群' }}</h2></div><button type="button" @click="showClusterEditor=false">×</button></div><label>集群名称<input v-model.trim="clusterForm.name" required placeholder="mysql-prod-a"></label><label>集群描述<textarea v-model.trim="clusterForm.description" rows="4" placeholder="例如：生产订单库主从集群"></textarea></label><p class="form-note">创建后可在机器详情中分配机器；重命名会同步更新已有成员的集群归属。</p><div class="modal-actions"><button type="button" class="secondary" @click="showClusterEditor=false">取消</button><button class="primary">{{ clusterForm.old_name ? '保存修改' : '创建集群' }}</button></div></form></div>
+      <div v-if="showClusterCleanup && clusterCleanupResult" class="modal-mask"><section class="modal cluster-cleanup-modal"><div class="modal-head"><div><p>集群一键清理</p><h2>{{ clusterCleanupResult.Cluster || clusterCleanupResult.cluster }}</h2></div><button type="button" @click="showClusterCleanup=false">×</button></div><div class="cleanup-summary"><b>已处理 {{ (clusterCleanupResult.Items || clusterCleanupResult.items || []).length }} 台机器</b><span :class="['status', (clusterCleanupResult.Failed || clusterCleanupResult.failed) ? 'error' : 'success']">{{ (clusterCleanupResult.Failed || clusterCleanupResult.failed) ? '失败 ' + (clusterCleanupResult.Failed || clusterCleanupResult.failed) + ' 台' : '全部完成' }}</span></div><div class="cleanup-result"><article v-for="item in (clusterCleanupResult.Items || clusterCleanupResult.items || [])" :key="item.MachineID || item.machine_id"><div><b>{{ item.Name || item.name }}</b><small>{{ item.IP || item.ip }}</small></div><span>{{ (item.MySQLPorts || item.mysql_ports || []).length ? 'MySQL：' + (item.MySQLPorts || item.mysql_ports || []).join('、') : '无 MySQL 实例' }}</span><span>{{ (item.AgentUninstalled ?? item.agent_uninstalled) ? 'Agent 已卸载' : 'Agent 未卸载' }}</span><span>{{ (item.LocalCleaned ?? item.local_cleaned) ? '本地记录已清理' : '本地记录未清理' }}</span><small v-if="item.Error || item.error" class="cleanup-error">{{ errorSummary(item.Error || item.error, 140) }}</small></article></div><div class="modal-actions"><button class="primary" @click="showClusterCleanup=false">完成</button></div></section></div>
+      <div v-if="agentActionDialog" class="modal-mask agent-action-mask" @click.self="closeAgentAction(true)"><form class="modal agent-action-modal" @submit.prevent="submitAgentAction"><div class="modal-head"><div><p>Agent 运维操作</p><h2>{{ agentActionDialog.title }}</h2></div><button type="button" @click="closeAgentAction(true)">×</button></div><div class="agent-action-target"><span>目标机器</span><b>{{ agentActionDialog.name }}</b><small>{{ agentActionDialog.ip }}</small></div><p :class="['agent-action-description', { danger: agentActionDialog.danger }]">{{ agentActionDialog.description }}</p><label v-if="agentActionDialog.inputLabel" class="agent-action-input">{{ agentActionDialog.inputLabel }}<input v-model="agentActionInput" :placeholder="agentActionDialog.expected || ''" type="text" autofocus><small v-if="agentActionDialog.expected">请输入：<code>{{ agentActionDialog.expected }}</code></small></label><div class="modal-actions"><button type="button" class="secondary" @click="closeAgentAction(true)">取消</button><button :class="agentActionDialog.danger ? 'danger-button' : 'primary'">{{ agentActionDialog.confirm }}</button></div></form></div>
+      <section v-if="active === 'agents'" class="agent-list-toolbar"><form @submit.prevent="data.agentPage=1;refresh()"><input v-model.trim="data.agentKeyword" placeholder="搜索机器名、IP、集群或状态"><select v-model="data.agentStatus"><option value="all">全部状态</option><option value="online">在线</option><option value="error">异常 / 离线</option><option value="pending">待安装</option></select><button class="primary">查询</button></form><div><span>共 {{ data.agentTotal }} 台 · 每页 {{ data.agentPageSize }} 台</span><button class="secondary" :disabled="data.agentPage===1" @click="data.agentPage--;refresh()">上一页</button><span>第 {{ data.agentPage }} 页</span><button class="secondary" :disabled="data.agentPage*data.agentPageSize>=data.agentTotal" @click="data.agentPage++;refresh()">下一页</button></div></section>
+      <div v-if="showBatchOnboard" class="modal-mask machine-bulk-mask" @click.self="!batchOnboardRunning && (showBatchOnboard=false)">
+        <form class="modal batch-onboard-modal" @submit.prevent="submitBatchOnboard">
+          <div class="modal-head"><div><p>批量机器纳管</p><h2>一次添加多台机器</h2></div><button type="button" :disabled="batchOnboardRunning" @click="showBatchOnboard=false">×</button></div>
+          <section class="batch-onboard-shared"><header><b>共用连接配置</b><small>每台机器使用相同的 SSH 用户与凭证</small></header><div><label>SSH 端口<input v-model.number="batchOnboardShared.ssh_port" type="number" min="1" required></label><label>SSH 用户<input v-model.trim="batchOnboardShared.ssh_user" required></label><label>已有凭证<select v-model="batchOnboardShared.credential_id" @change="batchOnboardCredentialChanged"><option value="">直接输入密码</option><option v-for="item in data.credentials" :key="item.id || item.ID" :value="item.id || item.ID">{{ item.name || item.Name }}</option></select></label><label v-if="!batchOnboardShared.credential_id">SSH 密码<input v-model="batchOnboardShared.ssh_password" type="password" autocomplete="new-password" required></label></div><div class="batch-preserve-options"><label><input v-model="batchOnboardShared.preserve_agent" type="checkbox"><span><b>保留已有 Agent</b><small>重新登记，不卸载或覆盖。</small></span></label><label><input v-model="batchOnboardShared.preserve_mysql" type="checkbox"><span><b>保留已有 MySQL</b><small>不停止服务或删除数据。</small></span></label></div></section>
+          <section class="batch-concurrency-control"><label><input v-model="batchOnboardShared.concurrent" type="checkbox" :disabled="batchOnboardRunning"><span><b>启用并发纳管</b><small>多台机器同时执行，单台失败不会阻断其他机器。</small></span></label><label>最大并发数<select v-model.number="batchOnboardShared.concurrency" :disabled="batchOnboardRunning || !batchOnboardShared.concurrent"><option :value="2">2 台</option><option :value="3">3 台（推荐）</option><option :value="5">5 台</option><option :value="10">10 台</option></select></label><em>{{ batchOnboardShared.concurrent ? '并发模式' : '串行模式' }}</em></section>
+          <section class="batch-onboard-machines"><header><div><b>机器清单</b><small>填写机器名称和管理 IP</small></div><button type="button" class="text-button" :disabled="batchOnboardRunning" @click="addBatchOnboardRow">＋ 添加一行</button></header><div class="batch-onboard-row" v-for="(row,index) in batchOnboardRows" :key="index"><span>{{ index + 1 }}</span><input v-model.trim="row.name" placeholder="机器名称，例如 mysql-prod-01" :disabled="batchOnboardRunning"><input v-model.trim="row.ip" placeholder="管理 IP，例如 10.0.0.11" :disabled="batchOnboardRunning"><button type="button" class="danger-link" :disabled="batchOnboardRunning || batchOnboardRows.length===1" @click="removeBatchOnboardRow(index)">移除</button></div></section>
+          <section v-if="batchOnboardResults.length" class="machine-bulk-progress"><article v-for="item in batchOnboardResults" :key="item.name+item.ip"><header><div><b>{{ item.name }}</b><small>{{ item.ip }}</small></div><span :class="['status',item.status]">{{ item.status==='running' ? '执行中' : item.status==='success' ? '成功' : item.status==='failed' ? '失败' : '等待' }}</span></header><ol><li v-for="step in item.steps" :key="step.key" :class="step.state"><i>{{ step.state==='success' ? '✓' : step.state==='failed' ? '!' : step.state==='running' ? '…' : step.state==='skipped' ? '—' : '○' }}</i><span><b>{{ step.title }}</b><small>{{ step.detail }}</small></span></li></ol><p :class="{failed:item.status==='failed'}">{{ errorSummary(item.message, 160) }}</p><small v-if="item.status==='failed'" class="bulk-log-hint">完整执行日志请在任务中心对应任务详情中查看。</small></article></section>
+          <div class="modal-actions"><button type="button" class="secondary" :disabled="batchOnboardRunning" @click="showBatchOnboard=false">关闭</button><button class="primary" :disabled="batchOnboardRunning">{{ batchOnboardRunning ? (batchOnboardShared.concurrent ? '并发纳管中…' : '串行纳管中…') : '开始批量纳管' }}</button></div>
+        </form>
+      </div>
+      <div v-if="showBulkDelete" class="modal-mask machine-bulk-mask" @click.self="!bulkDeleteRunning && (showBulkDelete=false)">
+        <form class="modal bulk-delete-modal" @submit.prevent="submitBulkDelete">
+          <div class="modal-head"><div><p>批量危险操作</p><h2>删除 {{ selectedMachineIDs.length }} 台机器</h2></div><button type="button" :disabled="bulkDeleteRunning" @click="showBulkDelete=false">×</button></div>
+          <div class="bulk-delete-summary"><b>已选择 {{ selectedMachineIDs.length }} 台机器</b><small>每台机器独立执行完整清理流程；单台失败不会中断其他机器，失败项会保持选中。</small></div>
+          <section v-if="bulkDeleteClusterMembers().length" class="machine-cluster-reminder"><div><b>请先将机器移出集群</b><p>以下 {{ bulkDeleteClusterMembers().length }} 台机器仍有集群归属，删除前必须先在集群管理中执行“移出集群”。</p><small>{{ bulkDeleteClusterSummary() }}</small></div><button type="button" class="secondary" @click="leaveBulkDeleteForClusters">前往集群管理</button></section>
+          <section class="batch-concurrency-control"><label><input v-model="bulkDeleteForm.concurrent" type="checkbox" :disabled="bulkDeleteRunning"><span><b>启用并发删除</b><small>同时清理多台机器，每台机器内部仍严格按 MySQL → Agent → 平台记录执行。</small></span></label><label>最大并发数<select v-model.number="bulkDeleteForm.concurrency" :disabled="bulkDeleteRunning || !bulkDeleteForm.concurrent"><option :value="2">2 台</option><option :value="3">3 台（推荐）</option><option :value="5">5 台</option><option :value="10">10 台</option></select></label><em>{{ bulkDeleteForm.concurrent ? '并发模式' : '串行模式' }}</em></section>
+          <div class="delete-mode-picker"><label><input v-model="bulkDeleteForm.mode" type="radio" value="detach"><span><b>仅从平台剔除</b><small>不连接目标机器，不处理 Agent、MySQL、systemd 或数据目录。</small></span></label><label><input v-model="bulkDeleteForm.mode" type="radio" value="cleanup"><span><b>远端清理后删除</b><small>Agent 在线时走任务通道；Agent 离线时自动通过保存的 SSH 通道清理。</small></span></label></div>
+          <div v-if="bulkDeleteForm.mode==='cleanup'" class="machine-delete-options"><label><input v-model="bulkDeleteForm.delete_mysql" type="checkbox" :disabled="bulkDeleteRunning"><span><b>删除每台机器上已登记的 MySQL 与数据</b><small>停止并删除 systemd 服务，清理 data/binlog/redo/undo/tmp 目录。</small></span></label><label><input v-model="bulkDeleteForm.delete_agent" type="checkbox" :disabled="bulkDeleteRunning"><span><b>卸载每台机器上的 Agent</b><small>停止并删除 gmha-agent systemd 服务与安装目录。</small></span></label></div>
+          <section v-if="bulkDeleteResults.length" class="machine-bulk-progress"><article v-for="item in bulkDeleteResults" :key="item.id"><header><div><b>{{ item.name }}</b><small>{{ item.ip || item.id }}</small></div><span :class="['status',item.status]">{{ item.status==='running' ? '执行中' : item.status==='success' ? '成功' : item.status==='failed' ? '失败' : '等待' }}</span></header><ol><li v-for="step in item.steps" :key="step.key" :class="step.state"><i>{{ step.state==='success' ? '✓' : step.state==='failed' ? '!' : step.state==='running' ? '…' : step.state==='skipped' ? '—' : '○' }}</i><span><b>{{ step.title }}</b><small>{{ step.detail }}</small></span></li></ol><p :class="{failed:item.status==='failed'}">{{ errorSummary(item.message, 160) }}</p><small v-if="item.status==='failed'" class="bulk-log-hint">完整执行日志请在任务中心对应任务详情中查看。</small></article></section>
+          <label class="machine-delete-confirm">输入 <code>{{ bulkDeleteExpected() }}</code> 确认批量删除<input v-model="bulkDeleteForm.confirmation" :disabled="bulkDeleteRunning || bulkDeleteClusterMembers().length" autocomplete="off" :placeholder="bulkDeleteExpected()"></label>
+          <div class="modal-actions"><button type="button" class="secondary" :disabled="bulkDeleteRunning" @click="showBulkDelete=false">关闭</button><button class="danger-button" :disabled="bulkDeleteRunning || bulkDeleteClusterMembers().length || bulkDeleteForm.confirmation !== bulkDeleteExpected()">{{ bulkDeleteRunning ? (bulkDeleteForm.concurrent ? '并发处理中…' : '串行处理中…') : (bulkDeleteForm.mode==='detach' ? '确认批量剔除' : '确认批量删除') }}</button></div>
+        </form>
+      </div>
+      <div v-if="showMachineDelete && selectedMachine" class="modal-mask machine-delete-mask" @click.self="!machineDeleteSubmitting && (showMachineDelete=false)">
+        <form class="modal machine-delete-modal" @submit.prevent="deleteMachine">
+          <div class="modal-head"><div><p>危险操作</p><h2>删除机器</h2></div><button type="button" :disabled="machineDeleteSubmitting" @click="showMachineDelete=false">×</button></div>
+          <div class="machine-delete-target"><span>目标机器</span><b>{{ selectedMachine.Name || selectedMachine.name }}</b><small>{{ selectedMachine.IP || selectedMachine.ip }}</small></div>
+          <section v-if="machineDeleteClusterName()" class="machine-cluster-reminder"><div><b>请先将机器移出集群</b><p>当前机器仍属于集群 <strong>{{ machineDeleteClusterName() }}</strong>。为避免破坏集群拓扑和自动化任务，删除前必须先解除集群归属。</p></div><button type="button" class="secondary" @click="leaveMachineDeleteForCluster">前往集群机器管理</button></section>
+          <div class="machine-delete-warning"><b>机器记录删除后不可恢复</b><p v-if="machineDeleteForm.mode==='detach'">仅删除管理平台内的机器、心跳、任务与实例关联，不连接目标机器，也不改变远端 Agent、MySQL、systemd 或数据目录。</p><p v-else>按下方选择清理远端资源。MySQL 清理会停止服务、取消开机自启、删除 systemd unit，并永久删除实例数据目录。</p></div>
+          <div class="delete-mode-picker">
+            <label><input v-model="machineDeleteForm.mode" type="radio" value="detach" :disabled="machineDeleteSubmitting"><span><b>仅从平台剔除</b><small>适合已离线或无法管理的机器；不尝试 SSH，不清理远端组件。</small></span></label>
+            <label><input v-model="machineDeleteForm.mode" type="radio" value="cleanup" :disabled="machineDeleteSubmitting"><span><b>远端清理后删除</b><small>Agent 在线时走任务通道；离线时自动通过保存的 SSH 通道卸载 MySQL、Agent。</small></span></label>
+          </div>
+          <div v-if="machineDeleteForm.mode==='cleanup'" class="machine-delete-options">
+            <label :class="{disabled:!mysqlInstancesOnMachine(selectedMachine).length}"><input v-model="machineDeleteForm.delete_mysql" type="checkbox" :disabled="!mysqlInstancesOnMachine(selectedMachine).length || machineDeleteSubmitting"><span><b>删除 MySQL 与数据</b><small v-if="mysqlInstancesOnMachine(selectedMachine).length">共 {{ mysqlInstancesOnMachine(selectedMachine).length }} 个实例：{{ mysqlInstancesOnMachine(selectedMachine).map(item => item.Port || item.port).join('、') }}；清理 data/binlog/redo/undo/tmp 目录及 systemd 管理。</small><small v-else>此机器没有已登记的 MySQL 实例。</small></span></label>
+            <label><input v-model="machineDeleteForm.delete_agent" type="checkbox" :disabled="machineDeleteSubmitting"><span><b>卸载 Agent</b><small>停止并禁用 gmha-agent，删除 systemd unit、安装目录和 Manager 心跳记录。</small></span></label>
+          </div>
+          <section class="machine-delete-flow">
+            <header><b>{{ machineDeleteForm.mode==='detach' ? '平台剔除流程' : '整体执行流程' }}</b><small>{{ machineDeleteForm.mode==='detach' ? '不连接目标机器，直接清理平台记录' : '严格按以下顺序执行，任一步失败都会中止后续删除' }}</small></header>
+            <ol>
+              <li v-for="(step,index) in machineDeleteSteps()" :key="step.key" :class="{skipped:!step.enabled,running:machineDeleteSubmitting && step.enabled}">
+                <i>{{ step.enabled ? index + 1 : '—' }}</i><span><b>{{ step.title }}</b><small>{{ step.detail }}</small></span><em>{{ !step.enabled ? '跳过' : (machineDeleteSubmitting ? '执行队列中' : '待执行') }}</em>
+              </li>
+            </ol>
+          </section>
+          <div v-if="machineDeleteError" class="machine-delete-error"><b>流程已中止</b><p>{{ errorSummary(machineDeleteError) }}</p><small>机器记录仍保留；完整日志请到任务中心对应任务详情查看。</small></div>
+          <label class="machine-delete-confirm">输入 <code>{{ machineDeleteExpected() }}</code> 确认操作<input v-model="machineDeleteForm.confirmation" :disabled="machineDeleteSubmitting || !!machineDeleteClusterName()" autocomplete="off" :placeholder="machineDeleteExpected()"></label>
+          <div class="modal-actions"><button type="button" class="secondary" :disabled="machineDeleteSubmitting" @click="showMachineDelete=false">取消</button><button class="danger-button" :disabled="machineDeleteSubmitting || !!machineDeleteClusterName() || machineDeleteForm.confirmation !== machineDeleteExpected()">{{ machineDeleteSubmitting ? '正在处理，请勿关闭…' : (machineDeleteForm.mode==='detach' ? '确认从平台剔除' : '确认删除机器') }}</button></div>
+        </form>
+      </div>
+    </main>
+    <section v-if="active === 'agents' && data.manualRecovery" class="recovery-flow-toast"><div><b>手动拉起流程</b><small>{{ data.manualRecovery.machine_ip || data.manualRecovery.MachineIP }} · {{ data.manualRecovery.status || data.manualRecovery.Status }}</small></div><ol><li :class="{active:['pending','confirming','executing','waiting_heartbeat','succeeded'].includes(state(data.manualRecovery.status || data.manualRecovery.Status))}">确认离线状态</li><li :class="{active:['executing','waiting_heartbeat','succeeded'].includes(state(data.manualRecovery.status || data.manualRecovery.Status))}">SSH 拉起服务</li><li :class="{active:['waiting_heartbeat','succeeded'].includes(state(data.manualRecovery.status || data.manualRecovery.Status))}">等待心跳恢复</li><li :class="{active:state(data.manualRecovery.status || data.manualRecovery.Status)==='succeeded',failed:['failed','suppressed'].includes(state(data.manualRecovery.status || data.manualRecovery.Status))}">{{ state(data.manualRecovery.status || data.manualRecovery.Status)==='succeeded' ? '恢复完成' : (errorSummary(data.manualRecovery.last_error || data.manualRecovery.LastError, 100) || '等待恢复结果') }}</li></ol></section>
+  `
+}).component('TaskTable', {
+  props: ['items', 'machines', 'state', 'date', 'page', 'total', 'pageSize'],
+  emits: ['select', 'page'],
+  methods: {
+    typeLabel(value) { return ({ exec: '远程命令', collect_machine_info: '机器信息采集', collect_static_info: '静态资产采集', mysql_install: 'MySQL 安装', mysql_uninstall: 'MySQL 卸载', mysql_topology: 'MySQL 拓扑采集', mysql_upgrade: 'MySQL 升级', architecture_adjustment: 'MySQL 架构调整', agent_recovery: 'Agent 恢复', platform_operation: '平台操作' })[String(value || '').toLowerCase()] || value || '未知任务' },
+    categoryLabel(item) {
+      const rawSpec = item.SpecJSON || item.spec_json
+      let spec = {}; try { spec = typeof rawSpec === 'string' ? JSON.parse(rawSpec) : (rawSpec || {}) } catch (_) {}
+      return String(spec.operation || '').startsWith('mysql_') ? '数据库操作' : this.typeLabel(item.Type || item.type)
+    },
+    title(item) {
+      const type = String(item.Type || item.type || '').toLowerCase()
+      const rawSpec = item.SpecJSON || item.spec_json
+      let spec = {}
+      try { spec = typeof rawSpec === 'string' ? JSON.parse(rawSpec) : (rawSpec || {}) } catch (_) { spec = {} }
+      const port = spec.port ? ` · ${spec.port} 端口` : ''
+      return ({ exec: spec.display_name || '执行远程命令', collect_machine_info: '采集机器运行信息', collect_static_info: '采集机器静态资产', mysql_install: `部署 MySQL${port}`, mysql_uninstall: `卸载 MySQL${port}`, mysql_topology: '采集 MySQL 拓扑', mysql_upgrade: `升级 MySQL${port}`, architecture_adjustment: '执行 MySQL 架构调整', platform_operation: spec.display_name || '平台操作' })[type] || this.typeLabel(type)
+    },
+    statusLabel(value) { return ({ pending: '等待执行', sent: '已下发', running: '执行中', success: '执行成功', completed: '执行成功', failed: '执行失败', error: '执行失败' })[this.state(value)] || value || '未知' },
+    progress(item) { return Number(item.ProgressPercent ?? item.progress_percent ?? 0) },
+    targetMachine(item) {
+      const id = item.MachineID || item.machine_id
+      const ip = item.MachineIP || item.machine_ip
+      return (this.machines || []).find(machine => (id && (machine.ID || machine.id) === id) || (ip && (machine.IP || machine.ip) === ip)) || {}
+    },
+    targetName(item) { const machine = this.targetMachine(item); return item.MachineName || item.machine_name || machine.Name || machine.name || item.MachineID || item.machine_id || '—' },
+    targetCode(item) { const machine = this.targetMachine(item); return item.MachineID || item.machine_id || machine.ID || machine.id || '—' },
+    targetIP(item) { const machine = this.targetMachine(item); return item.MachineIP || item.machine_ip || machine.IP || machine.ip || '—' },
+    targetCluster(item) { const machine = this.targetMachine(item); return item.Cluster || item.cluster || machine.Cluster || machine.cluster || '未分配集群' },
+    canDelete(item) { return this.page != null && ['success', 'completed', 'succeeded', 'failed', 'error'].includes(this.state(item.Status || item.status)) },
+    deleteRecord(item) { this.$root.deleteTaskRecord(item) }
+  },
+  template: `<table class="task-table"><thead><tr><th>任务</th><th>目标机器</th><th>归属集群</th><th>状态</th><th>执行进度</th><th>创建时间</th><th>操作</th></tr></thead><tbody><tr v-for="item in items" :key="item.ID || item.id"><td class="task-name-cell"><button class="task-name-link" @click="$emit('select',item)"><span class="task-type-glyph">⌁</span><span><b>{{ title(item) }}</b><small>{{ categoryLabel(item) }} · #{{ item.ID || item.id }}</small></span></button></td><td class="task-machine-cell"><b>{{ targetName(item) }}</b><small>机器码：{{ targetCode(item) }}</small><small>IP：{{ targetIP(item) }}</small></td><td><span :class="['cluster-label', {unassigned:targetCluster(item)==='未分配集群'}]">{{ targetCluster(item) }}</span></td><td><span :class="['status', state(item.Status || item.status)]">{{ statusLabel(item.Status || item.status) }}</span></td><td class="task-progress-cell"><div class="progress"><i :style="{ width: progress(item) + '%' }"></i></div><span>{{ progress(item) }}%</span><small v-if="item.CurrentStep || item.current_step">{{ item.CurrentStep || item.current_step }}</small></td><td>{{ date(item.CreatedAt || item.created_at) }}</td><td class="task-row-actions"><button class="text-button" @click="$emit('select',item)">查看详情</button><button v-if="canDelete(item)" class="danger-link" @click.stop="deleteRecord(item)">删除记录</button></td></tr><tr v-if="!items.length"><td colspan="7" class="empty">暂无任务记录。</td></tr></tbody></table><div v-if="total > pageSize" class="pager task-pager"><button :disabled="page <= 1" @click="$emit('page',-1)">上一页</button><span>第 {{ page }} 页 · 共 {{ total }} 条任务</span><button :disabled="page * pageSize >= total" @click="$emit('page',1)">下一页</button></div>`
+}).mount('#app')

@@ -122,8 +122,21 @@ func (c *Client) Upload(ctx context.Context, endpoint machinedomain.Endpoint, au
 
 func dial(ctx context.Context, endpoint machinedomain.Endpoint, auth machinedomain.SSHAuth, timeout time.Duration) (*gossh.Client, error) {
 	methods := make([]gossh.AuthMethod, 0, 2)
+	var err error
 	if auth.Password != "" {
 		methods = append(methods, gossh.Password(auth.Password))
+	}
+	if auth.PrivateKey != "" {
+		var signer gossh.Signer
+		if auth.Passphrase != "" {
+			signer, err = gossh.ParsePrivateKeyWithPassphrase([]byte(auth.PrivateKey), []byte(auth.Passphrase))
+		} else {
+			signer, err = gossh.ParsePrivateKey([]byte(auth.PrivateKey))
+		}
+		if err != nil {
+			return nil, fmt.Errorf("parse SSH private key: %w", err)
+		}
+		methods = append(methods, gossh.PublicKeys(signer))
 	}
 	signers, err := loadLocalSigners()
 	if err != nil {

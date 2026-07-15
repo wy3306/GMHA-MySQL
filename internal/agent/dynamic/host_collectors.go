@@ -99,6 +99,66 @@ func readCPUStat() (cpuStat, error) {
 	return cpuStat{total: total, idle: idle}, nil
 }
 
+// AgentCPUCollector samples /proc without spawning a process. Its 15-second
+// default interval keeps self-observation overhead negligible.
+type AgentCPUCollector struct {
+	mu             sync.Mutex
+	process, total uint64
+}
+
+func NewAgentCPUCollector() *AgentCPUCollector { return &AgentCPUCollector{} }
+func (c *AgentCPUCollector) Name() string      { return "agent_cpu_usage_percent" }
+func (c *AgentCPUCollector) Collect(ctx context.Context, spec dyndomain.CollectTaskSpec) dyndomain.MetricResult {
+	_ = ctx
+	started := time.Now()
+	proc, total, err := readAgentCPU()
+	if err != nil {
+		return metricError(spec, err, time.Since(started).Milliseconds())
+	}
+	c.mu.Lock()
+	pp, pt := c.process, c.total
+	c.process, c.total = proc, total
+	c.mu.Unlock()
+	value := 0.0
+	if pt > 0 && total > pt && proc >= pp {
+		value = 100 * float64(proc-pp) / float64(total-pt)
+	}
+	return metricOK(spec, "agent", dyndomain.ValueTypeFloat, round2(value), started)
+}
+func readAgentCPU() (uint64, uint64, error) {
+	data, err := os.ReadFile("/proc/self/stat")
+	if err != nil {
+		return 0, 0, err
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) < 15 {
+		return 0, 0, errors.New("invalid /proc/self/stat")
+	}
+	proc := parseUint(fields[13]) + parseUint(fields[14])
+	cpu, err := readCPUStat()
+	if err != nil {
+		return 0, 0, err
+	}
+	return proc, cpu.total, nil
+}
+func collectAgentRSS(ctx context.Context, spec dyndomain.CollectTaskSpec) (any, string, error) {
+	_ = ctx
+	_ = spec
+	data, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		return nil, dyndomain.ValueTypeFloat, err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "VmRSS:") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				return round2(float64(parseUint(fields[1])) / 1024), dyndomain.ValueTypeFloat, nil
+			}
+		}
+	}
+	return nil, dyndomain.ValueTypeFloat, errors.New("VmRSS not found")
+}
+
 // IOCollector 是磁盘 IO 状态采集器，通过读取 /proc/diskstats 计算 IOPS、吞吐量和繁忙率。
 type IOCollector struct {
 	mu   sync.Mutex

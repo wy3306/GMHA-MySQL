@@ -11,10 +11,10 @@ import (
 
 // RecoveryRepository 是自动恢复实体的 SQLite 仓储实现。
 type RecoveryRepository struct {
-	db *sql.DB
+	db *DB
 }
 
-func NewRecoveryRepository(db *sql.DB) *RecoveryRepository {
+func NewRecoveryRepository(db *DB) *RecoveryRepository {
 	return &RecoveryRepository{db: db}
 }
 
@@ -66,7 +66,7 @@ func (r *RecoveryRepository) CreateTask(ctx context.Context, task recoverydomain
 			id, agent_id, machine_id, machine_ip, status, trigger_type, action, reason, attempt, max_attempts,
 			heartbeat_deadline, last_error, last_ssh_output, suppressed_until, created_at, updated_at
 		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, task.ID, task.AgentID, task.MachineID, task.MachineIP, string(task.Status), string(task.Trigger), string(task.Action), task.Reason, task.Attempt, task.MaxAttempts, formatNullableTime(task.HeartbeatDeadline), task.LastError, task.LastSSHOutput, formatNullableTime(task.SuppressedUntil), task.CreatedAt.Format(time.RFC3339), task.UpdatedAt.Format(time.RFC3339))
+	`, task.ID, task.AgentID, task.MachineID, task.MachineIP, string(task.Status), string(task.Trigger), string(task.Action), task.Reason, task.Attempt, task.MaxAttempts, formatNullableTime(task.HeartbeatDeadline), task.LastError, task.LastSSHOutput, formatNullableTime(task.SuppressedUntil), formatDatabaseTime(task.CreatedAt), formatDatabaseTime(task.UpdatedAt))
 	if err != nil {
 		return recoverydomain.Task{}, err
 	}
@@ -80,7 +80,7 @@ func (r *RecoveryRepository) UpdateTask(ctx context.Context, task recoverydomain
 		set status = ?, trigger_type = ?, action = ?, reason = ?, attempt = ?, max_attempts = ?,
 			heartbeat_deadline = ?, last_error = ?, last_ssh_output = ?, suppressed_until = ?, updated_at = ?
 		where id = ?
-	`, string(task.Status), string(task.Trigger), string(task.Action), task.Reason, task.Attempt, task.MaxAttempts, formatNullableTime(task.HeartbeatDeadline), task.LastError, task.LastSSHOutput, formatNullableTime(task.SuppressedUntil), task.UpdatedAt.Format(time.RFC3339), task.ID)
+	`, string(task.Status), string(task.Trigger), string(task.Action), task.Reason, task.Attempt, task.MaxAttempts, formatNullableTime(task.HeartbeatDeadline), task.LastError, task.LastSSHOutput, formatNullableTime(task.SuppressedUntil), formatDatabaseTime(task.UpdatedAt), task.ID)
 	return err
 }
 
@@ -224,18 +224,10 @@ func (r *RecoveryRepository) ReleaseLock(ctx context.Context, machineID string) 
 }
 
 func (r *RecoveryRepository) DeleteByMachineID(ctx context.Context, machineID string) error {
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `delete from recovery_tasks where machine_id = ?`, machineID); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `delete from recovery_latest_state where machine_id = ?`, machineID); err != nil {
-		return err
-	}
-	return tx.Commit()
+	// Recovery tasks are immutable audit history shown in the task center.
+	// Only ephemeral latest-state/locking data belongs to the deleted machine.
+	_, err := r.db.ExecContext(ctx, `delete from recovery_latest_state where machine_id = ?`, machineID)
+	return err
 }
 
 type recoveryScanner interface {

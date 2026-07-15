@@ -1,0 +1,58 @@
+.clickable-row { cursor: pointer; }
+.clickable-row:hover { background: #f8fbff; }
+.instance-task-progress { width: 120px; height: 6px; overflow: hidden; background: #e8edf4; border-radius: 999px; }
+.instance-task-progress i { display: block; height: 100%; background: #2f7df6; border-radius: 999px; }
+.param-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 14px 20px; border-bottom: 1px solid #e7edf5; background: #f9fbfd; }
+.param-toolbar label { display: flex; align-items: center; gap: 7px; margin: 0 auto 0 0; color: #334155; }
+.param-toolbar > input, .param-toolbar select { height: 34px; padding: 0 10px; border: 1px solid #d8e0ea; border-radius: 6px; background: #fff; }
+.param-table-wrap { max-height: 620px; overflow: auto; }
+.param-table-wrap thead { position: sticky; top: 0; z-index: 1; background: #f8fafc; }
+.param-table-wrap td:first-child b, .param-table-wrap td:first-child small { display: block; }
+.param-table-wrap td:first-child small { margin-top: 3px; color: #94a3b8; }
+.param-table-wrap input[type="number"] { width: 76px; padding: 6px; border: 1px solid #d8e0ea; border-radius: 5px; }
+.failover-plan { margin: 0 22px 22px; overflow: hidden; border: 1px solid #dbe5f0; border-radius: 8px; }
+.failover-plan h4 { margin: 0; padding: 12px 14px; background: #f8fafc; }
+.failover-plan pre { max-height: 280px; margin: 0; padding: 14px; overflow: auto; color: #dbeafe; background: #101828; }
+.upgrade-panel > p { margin: 0 0 14px; color: #64748b; font-size: 12px; line-height: 1.6; }
+.instance-panel .status { white-space: nowrap; }
+.mysql-parameter-page { display: grid; gap: 12px; }
+.parameter-connection-bar, .upgrade-form-grid { display: grid; grid-template-columns: 2fr 1fr 1.4fr; gap: 12px; padding: 16px 20px; border-bottom: 1px solid #e7edf5; background: #f9fbfd; }
+.parameter-connection-bar label, .upgrade-form-grid label, .parameter-editor > label { display: grid; gap: 6px; color: #475569; font-size: 12px; }
+.parameter-connection-bar input, .parameter-connection-bar select, .upgrade-form-grid input, .upgrade-form-grid select, .parameter-editor input { box-sizing: border-box; width: 100%; min-width: 0; padding: 9px 10px; border: 1px solid #d8e0ea; border-radius: 6px; background: #fff; }
+.parameter-runtime-panel .param-toolbar { justify-content: flex-start; }
+.parameter-runtime-panel .param-toolbar span { margin-left: auto; color: #64748b; font-size: 12px; }
+.parameter-runtime-panel .param-table-wrap { max-height: 680px; }
+.parameter-value { max-width: 420px; overflow: hidden; color: #334155; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.parameter-mode { display: inline-flex; padding: 3px 8px; border-radius: 999px; font-size: 11px; white-space: nowrap; }
+.parameter-mode.dynamic { color: #047857; background: #ecfdf5; }
+.parameter-mode.restart { color: #9a6700; background: #fff8df; }
+.collect-policy-panel { overflow: hidden; }
+.collect-policy-panel > summary { padding: 15px 20px; cursor: pointer; color: #334155; font-weight: 600; }
+.collect-policy-panel[open] > summary { border-bottom: 1px solid #e7edf5; }
+.collect-policy-table { max-height: 420px; overflow: auto; }
+.collect-policy-table input[type="number"] { width: 78px; padding: 6px; border: 1px solid #d8e0ea; border-radius: 5px; }
+.parameter-editor { width: min(520px, calc(100vw - 32px)); }
+.parameter-editor > label { margin: 14px 22px; }
+.parameter-apply-note { margin: 14px 22px; padding: 12px 14px; border: 1px solid #bfdbfe; border-radius: 7px; background: #eff6ff; }
+.parameter-apply-note p { margin: 5px 0 0; color: #64748b; font-size: 12px; line-height: 1.6; }
+.mysql-upgrade-page { padding-bottom: 22px; }
+.upgrade-form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); margin: 0 20px; border: 1px solid #e7edf5; border-radius: 8px; }
+.mysql-upgrade-page .upgrade-preview { margin: 16px 20px; }
+.upgrade-flow { margin: 16px 20px 0; padding: 18px; border: 1px solid #dbe5f0; border-radius: 8px; }
+.upgrade-flow h4 { margin: 0 0 14px; }
+.upgrade-flow ol { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 0; padding: 0; list-style: none; }
+.upgrade-flow li { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 9px; border: 1px solid #e7edf5; border-radius: 6px; background: #f8fafc; font-size: 12px; }
+.upgrade-flow li i { display: grid; flex: 0 0 22px; height: 22px; place-items: center; border-radius: 50%; color: #1d4ed8; background: #dbeafe; font-style: normal; }
+.upgrade-flow li span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.upgrade-flow > p { margin: 14px 0 0; color: #64748b; font-size: 12px; line-height: 1.6; }
+
+@media (max-width: 720px) {
+  .instance-page-head { align-items: flex-start; gap: 12px; }
+  .instance-kpis { grid-template-columns: 1fr 1fr; }
+  .vip-adopt, .failover-actions { flex-wrap: wrap; }
+  .vip-adopt input { min-width: 0; flex: 1; }
+  .param-toolbar > * { width: 100%; margin: 0; }
+  .instance-panel { overflow: auto; }
+  .parameter-connection-bar, .upgrade-form-grid { grid-template-columns: 1fr; }
+  .upgrade-flow ol { grid-template-columns: 1fr; }
+}

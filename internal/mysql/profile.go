@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	configassets "gmha/configs"
 )
 
 // Profile 定义 MySQL 配置档案，包含缓冲池比例、连接数限制、缓冲区大小等参数模板。
@@ -36,6 +38,9 @@ func LoadProfile(configRoot, name string) (Profile, error) {
 	}
 	path := filepath.Join(configRoot, "profiles", "mysql", name+".yaml")
 	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) && filepath.Clean(configRoot) == "configs" {
+		data, err = configassets.ReadFile(filepath.Join("profiles", "mysql", name+".yaml"))
+	}
 	if err != nil {
 		return Profile{}, err
 	}

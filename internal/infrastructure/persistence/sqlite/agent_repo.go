@@ -13,11 +13,11 @@ import (
 
 // AgentRepository 是 Agent 实体的 SQLite 仓储实现。
 type AgentRepository struct {
-	db *sql.DB
+	db *DB
 }
 
 // NewAgentRepository 创建一个新的 AgentRepository 实例。
-func NewAgentRepository(db *sql.DB) *AgentRepository {
+func NewAgentRepository(db *DB) *AgentRepository {
 	return &AgentRepository{db: db}
 }
 
@@ -151,8 +151,12 @@ func formatNullableTime(t *time.Time) any {
 	if t == nil {
 		return nil
 	}
-	return t.UTC().Format(time.RFC3339)
+	return formatDatabaseTime(*t)
 }
+
+const databaseTimeLayout = "2006-01-02T15:04:05.000000000Z07:00"
+
+func formatDatabaseTime(t time.Time) string { return t.UTC().Format(databaseTimeLayout) }
 
 func parseNullableTime(v sql.NullString) *time.Time {
 	if !v.Valid || v.String == "" {

@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	taskdomain "gmha/internal/domain/task"
@@ -12,10 +14,61 @@ import (
 
 // TaskRepository 是任务实体的 SQLite 仓储实现。
 type TaskRepository struct {
-	db *sql.DB
+	db *DB
 }
 
-func NewTaskRepository(db *sql.DB) *TaskRepository {
+func (r *TaskRepository) ListTaskPage(ctx context.Context, query taskdomain.ListQuery) ([]taskdomain.Task, int, error) {
+	where := make([]string, 0, 3)
+	args := make([]any, 0)
+	if keyword := strings.ToLower(strings.TrimSpace(query.Keyword)); keyword != "" {
+		where = append(where, `(lower(id) like ? or lower(type) like ? or lower(machine_id) like ? or lower(current_step) like ? or lower(spec_json) like ?)`)
+		like := "%" + keyword + "%"
+		args = append(args, like, like, like, like, like)
+	}
+	if len(query.Statuses) > 0 {
+		placeholders := make([]string, len(query.Statuses))
+		for i, status := range query.Statuses {
+			placeholders[i] = "?"
+			args = append(args, string(status))
+		}
+		where = append(where, "status in ("+strings.Join(placeholders, ",")+")")
+	}
+	if len(query.Types) > 0 {
+		placeholders := make([]string, len(query.Types))
+		for i, taskType := range query.Types {
+			placeholders[i] = "?"
+			args = append(args, string(taskType))
+		}
+		where = append(where, "type in ("+strings.Join(placeholders, ",")+")")
+	}
+	whereSQL := ""
+	if len(where) > 0 {
+		whereSQL = " where " + strings.Join(where, " and ")
+	}
+	var total int
+	if err := r.db.QueryRowContext(ctx, "select count(*) from tasks"+whereSQL, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	pageArgs := append(append([]any{}, args...), query.Limit, query.Offset)
+	rows, err := r.db.QueryContext(ctx, fmt.Sprintf(`
+		select id, type, machine_id, agent_id, status, progress_percent, current_step, spec_json, created_at, started_at, finished_at
+		from tasks%s order by created_at desc, id desc limit ? offset ?`, whereSQL), pageArgs...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	items := make([]taskdomain.Task, 0, query.Limit)
+	for rows.Next() {
+		item, err := scanTask(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		items = append(items, item)
+	}
+	return items, total, rows.Err()
+}
+
+func NewTaskRepository(db *DB) *TaskRepository {
 	return &TaskRepository{db: db}
 }
 
@@ -69,7 +122,7 @@ func (r *TaskRepository) CreateTask(ctx context.Context, task taskdomain.Task, s
 	if _, err := tx.ExecContext(ctx, `
 		insert into tasks (id, type, machine_id, agent_id, status, progress_percent, current_step, spec_json, created_at, started_at, finished_at)
 		values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, task.ID, string(task.Type), task.MachineID, task.AgentID, string(task.Status), task.ProgressPercent, task.CurrentStep, string(task.SpecJSON), task.CreatedAt.Format(time.RFC3339), formatNullableTime(task.StartedAt), formatNullableTime(task.FinishedAt)); err != nil {
+	`, task.ID, string(task.Type), task.MachineID, task.AgentID, string(task.Status), task.ProgressPercent, task.CurrentStep, string(task.SpecJSON), formatDatabaseTime(task.CreatedAt), formatNullableTime(task.StartedAt), formatNullableTime(task.FinishedAt)); err != nil {
 		return err
 	}
 	for _, step := range steps {
@@ -84,7 +137,7 @@ func (r *TaskRepository) CreateTask(ctx context.Context, task taskdomain.Task, s
 		if _, err := tx.ExecContext(ctx, `
 			insert into task_events (id, task_id, step_id, event_type, content, created_at)
 			values (?, ?, ?, ?, ?, ?)
-		`, event.ID, event.TaskID, event.StepID, string(event.EventType), event.Content, event.CreatedAt.Format(time.RFC3339)); err != nil {
+		`, event.ID, event.TaskID, event.StepID, string(event.EventType), event.Content, formatDatabaseTime(event.CreatedAt)); err != nil {
 			return err
 		}
 	}
@@ -178,13 +231,18 @@ func (r *TaskRepository) ListSteps(ctx context.Context, taskID string) ([]taskdo
 }
 
 func (r *TaskRepository) ListEvents(ctx context.Context, taskID string, limit int) ([]taskdomain.Event, error) {
-	if limit <= 0 {
+	if limit == 0 {
 		limit = 50
 	}
-	rows, err := r.db.QueryContext(ctx, `
+	query := `
 		select id, task_id, step_id, event_type, content, created_at
-		from task_events where task_id = ? order by created_at asc limit ?
-	`, taskID, limit)
+		from task_events where task_id = ? order by created_at asc, id asc`
+	args := []any{taskID}
+	if limit > 0 {
+		query += " limit ?"
+		args = append(args, limit)
+	}
+	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -222,8 +280,33 @@ func (r *TaskRepository) AppendEvent(ctx context.Context, event taskdomain.Event
 	_, err := r.db.ExecContext(ctx, `
 		insert into task_events (id, task_id, step_id, event_type, content, created_at)
 		values (?, ?, ?, ?, ?, ?)
-	`, event.ID, event.TaskID, event.StepID, string(event.EventType), event.Content, event.CreatedAt.Format(time.RFC3339))
+	`, event.ID, event.TaskID, event.StepID, string(event.EventType), event.Content, formatDatabaseTime(event.CreatedAt))
 	return err
+}
+
+// DeleteTask atomically removes a task and its complete step/event history.
+func (r *TaskRepository) DeleteTask(ctx context.Context, taskID string) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `delete from task_events where task_id = ?`, taskID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `delete from task_steps where task_id = ?`, taskID); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `delete from tasks where id = ?`, taskID)
+	if err != nil {
+		return err
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return err
+	} else if affected == 0 {
+		return errors.New("task not found")
+	}
+	return tx.Commit()
 }
 
 func (r *TaskRepository) DeleteByMachineID(ctx context.Context, machineID string) error {

@@ -44,13 +44,18 @@ func NewOnboardUsecase(dep Dependencies) *OnboardUsecase {
 
 // OnboardMachineRequest 是机器接入的请求参数，包含机器基本信息和 SSH 凭证。
 type OnboardMachineRequest struct {
+	MachineID      string
 	Name           string
 	IP             string
 	SSHPort        int
 	SSHUser        string
 	SSHPassword    string
+	SSHPrivateKey  string
+	SSHPassphrase  string
 	CredentialID   string
 	CredentialName string
+	PreserveAgent  bool
+	PreserveMySQL  bool
 }
 
 // OnboardMachineResponse 是机器接入的响应结果。
@@ -103,6 +108,19 @@ func (u *OnboardUsecase) Execute(ctx context.Context, req OnboardMachineRequest)
 		Cluster:      "",
 		Status:       machinedomain.StatusSSHConnected,
 	}
+	// 重试失败机器时保持原有 ID，允许修正 IP/端口后再次建立 SSH 互信，避免遗留重复记录。
+	if strings.TrimSpace(req.MachineID) != "" {
+		existing, ok, getErr := u.machineRepo.GetByID(ctx, req.MachineID)
+		if getErr != nil {
+			return OnboardMachineResponse{}, getErr
+		}
+		if !ok {
+			return OnboardMachineResponse{}, errors.New("retry machine not found")
+		}
+		entity.ID = existing.ID
+		entity.Cluster = existing.Cluster
+		entity.AgentInstallDir = existing.AgentInstallDir
+	}
 	if trustReady {
 		entity.Status = machinedomain.StatusSSHTrustReady
 	}
@@ -111,10 +129,10 @@ func (u *OnboardUsecase) Execute(ctx context.Context, req OnboardMachineRequest)
 		return OnboardMachineResponse{}, err
 	}
 	if !trustReady {
-		if password == "" {
-			return OnboardMachineResponse{}, errors.New("ssh trust is not ready, please provide ssh_password")
+		if password == "" && strings.TrimSpace(req.SSHPrivateKey) == "" {
+			return OnboardMachineResponse{}, errors.New("ssh trust is not ready, please provide ssh_password or ssh_private_key")
 		}
-		auth := machinedomain.SSHAuth{User: req.SSHUser, Password: password}
+		auth := machinedomain.SSHAuth{User: req.SSHUser, Password: password, PrivateKey: req.SSHPrivateKey, Passphrase: req.SSHPassphrase}
 		if err := u.sshClient.TestConnection(ctx, endpoint, auth); err != nil {
 			_ = u.machineRepo.UpdateStatus(ctx, saved.ID, machinedomain.StatusSSHFailed, err.Error())
 			return OnboardMachineResponse{}, err

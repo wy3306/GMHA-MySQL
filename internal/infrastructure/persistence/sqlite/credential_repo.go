@@ -12,10 +12,10 @@ import (
 
 // CredentialRepository 是 SSH 凭据实体的 SQLite 仓储实现。
 type CredentialRepository struct {
-	db *sql.DB
+	db *DB
 }
 
-func NewCredentialRepository(db *sql.DB) *CredentialRepository {
+func NewCredentialRepository(db *DB) *CredentialRepository {
 	return &CredentialRepository{db: db}
 }
 
@@ -25,17 +25,26 @@ func (r *CredentialRepository) Migrate() error {
 			id text primary key,
 			name text not null unique,
 			ssh_user text not null,
+			credential_type text not null default 'password',
 			ssh_password text not null,
+			private_key text not null default '',
+			passphrase text not null default '',
 			created_at text not null,
 			updated_at text not null
 		);
 	`)
+	_, _ = r.db.Exec(`alter table ssh_credentials add column credential_type text not null default 'password'`)
+	_, _ = r.db.Exec(`alter table ssh_credentials add column private_key text not null default ''`)
+	_, _ = r.db.Exec(`alter table ssh_credentials add column passphrase text not null default ''`)
 	return err
 }
 
 func (r *CredentialRepository) Save(ctx context.Context, item credentialdomain.SSHCredential) (credentialdomain.SSHCredential, error) {
 	item.Name = strings.TrimSpace(item.Name)
 	item.SSHUser = strings.TrimSpace(item.SSHUser)
+	if item.Type == "" {
+		item.Type = credentialdomain.TypePassword
+	}
 	if item.ID == "" {
 		item.ID = credentialdomain.NewID(item.Name)
 	}
@@ -45,13 +54,16 @@ func (r *CredentialRepository) Save(ctx context.Context, item credentialdomain.S
 	}
 	item.UpdatedAt = now
 	_, err := r.db.ExecContext(ctx, `
-		insert into ssh_credentials (id, name, ssh_user, ssh_password, created_at, updated_at)
-		values (?, ?, ?, ?, ?, ?)
+		insert into ssh_credentials (id, name, ssh_user, credential_type, ssh_password, private_key, passphrase, created_at, updated_at)
+		values (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		on conflict(name) do update set
 			ssh_user = excluded.ssh_user,
+			credential_type = excluded.credential_type,
 			ssh_password = excluded.ssh_password,
+			private_key = excluded.private_key,
+			passphrase = excluded.passphrase,
 			updated_at = excluded.updated_at
-	`, item.ID, item.Name, item.SSHUser, item.SSHPassword, item.CreatedAt.Format(time.RFC3339), item.UpdatedAt.Format(time.RFC3339))
+	`, item.ID, item.Name, item.SSHUser, item.Type, item.SSHPassword, item.PrivateKey, item.Passphrase, item.CreatedAt.Format(time.RFC3339), item.UpdatedAt.Format(time.RFC3339))
 	if err != nil {
 		return credentialdomain.SSHCredential{}, err
 	}
@@ -60,7 +72,7 @@ func (r *CredentialRepository) Save(ctx context.Context, item credentialdomain.S
 
 func (r *CredentialRepository) GetByID(ctx context.Context, id string) (credentialdomain.SSHCredential, bool, error) {
 	row := r.db.QueryRowContext(ctx, `
-		select id, name, ssh_user, ssh_password, created_at, updated_at
+		select id, name, ssh_user, credential_type, ssh_password, private_key, passphrase, created_at, updated_at
 		from ssh_credentials
 		where id = ?
 	`, strings.TrimSpace(id))
@@ -87,7 +99,7 @@ func (r *CredentialRepository) GetByName(ctx context.Context, name string) (cred
 
 func (r *CredentialRepository) GetValueByName(ctx context.Context, name string) (credentialdomain.SSHCredential, error) {
 	row := r.db.QueryRowContext(ctx, `
-		select id, name, ssh_user, ssh_password, created_at, updated_at
+		select id, name, ssh_user, credential_type, ssh_password, private_key, passphrase, created_at, updated_at
 		from ssh_credentials
 		where name = ?
 	`, strings.TrimSpace(name))
@@ -96,7 +108,7 @@ func (r *CredentialRepository) GetValueByName(ctx context.Context, name string) 
 
 func (r *CredentialRepository) List(ctx context.Context) ([]credentialdomain.SSHCredential, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		select id, name, ssh_user, ssh_password, created_at, updated_at
+		select id, name, ssh_user, credential_type, ssh_password, private_key, passphrase, created_at, updated_at
 		from ssh_credentials
 		order by name asc
 	`)
@@ -129,7 +141,7 @@ func scanCredential(scanner credentialScanner) (credentialdomain.SSHCredential, 
 	var item credentialdomain.SSHCredential
 	var createdAt string
 	var updatedAt string
-	if err := scanner.Scan(&item.ID, &item.Name, &item.SSHUser, &item.SSHPassword, &createdAt, &updatedAt); err != nil {
+	if err := scanner.Scan(&item.ID, &item.Name, &item.SSHUser, &item.Type, &item.SSHPassword, &item.PrivateKey, &item.Passphrase, &createdAt, &updatedAt); err != nil {
 		return credentialdomain.SSHCredential{}, err
 	}
 	item.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)

@@ -11,12 +11,22 @@ import (
 	"time"
 )
 
-// SSHCredential 是 SSH 凭据实体的领域模型。
+type Type string
+
+const (
+	TypePassword   Type = "password"
+	TypePrivateKey Type = "private_key"
+)
+
+// SSHCredential 是 SSH 凭据实体的领域模型。敏感字段只在服务端使用，绝不返回 Web 页面。
 type SSHCredential struct {
 	ID          string
 	Name        string
 	SSHUser     string
+	Type        Type
 	SSHPassword string
+	PrivateKey  string
+	Passphrase  string
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 }

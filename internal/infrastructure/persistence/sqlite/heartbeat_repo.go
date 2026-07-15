@@ -2,7 +2,6 @@ package sqlite
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"time"
 
@@ -11,10 +10,10 @@ import (
 
 // HeartbeatRepository 是心跳状态的 SQLite 仓储实现。
 type HeartbeatRepository struct {
-	db *sql.DB
+	db *DB
 }
 
-func NewHeartbeatRepository(db *sql.DB) *HeartbeatRepository {
+func NewHeartbeatRepository(db *DB) *HeartbeatRepository {
 	return &HeartbeatRepository{db: db}
 }
 

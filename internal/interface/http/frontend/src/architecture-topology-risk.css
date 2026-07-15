@@ -1,0 +1,89 @@
+.topology-level{position:relative}.topology-level-label{display:block;width:max-content;margin:0 auto 12px;padding:4px 10px;border-radius:12px;background:#e7f1ff;color:#2869ae;font-size:10px;font-weight:700}.topology-master-level{padding:0 6%}.topology-root-grid{grid-template-columns:repeat(auto-fit,minmax(205px,260px));justify-content:center}.topology-replica-level{margin-top:0}.topology-replica-level .topology-level-label{background:#e8f6f1;color:#327862}.topology-leaf-grid{grid-template-columns:repeat(auto-fit,minmax(205px,1fr))}.topology-edit-node.root-node{border-top:3px solid #3981d6}.topology-edit-node.leaf-node{border-top:3px solid #37a884}.topology-branch-connector{position:relative;height:60px;margin:0 9%}.topology-branch-connector i{position:absolute;top:0;bottom:20px;left:50%;width:2px;background:#afc4da;transform:translateX(-50%)}.topology-branch-connector span{position:absolute;right:0;bottom:20px;left:0;height:2px;background:#afc4da}.topology-branch-connector span:before,.topology-branch-connector span:after{position:absolute;top:0;width:2px;height:20px;background:#afc4da;content:""}.topology-branch-connector span:before{left:0}.topology-branch-connector span:after{right:0}.topology-risk-mask{z-index:80}.topology-risk-modal{width:min(570px,calc(100vw - 30px));padding:0;overflow:hidden}.topology-risk-modal>header{display:grid;padding:20px 22px;grid-template-columns:42px 1fr 28px;align-items:center;gap:12px;border-bottom:1px solid #f0dadd;background:#fff8f8}.topology-risk-modal>header>span{display:grid;width:38px;height:38px;border-radius:50%;background:#e54858;color:#fff;place-items:center;font-size:21px;font-weight:800}.topology-risk-modal>header p{margin:0 0 3px;color:#c13d4b;font-size:9px;font-weight:800;letter-spacing:1px}.topology-risk-modal>header h2{margin:0;color:#402b31;font-size:19px}.topology-risk-modal>header button{border:0;background:transparent;color:#a89096;cursor:pointer;font-size:20px}.topology-risk-target{display:grid;margin:17px 22px 0;padding:12px 14px;grid-template-columns:1fr auto;gap:4px;border:1px solid #e3e9f0;border-radius:6px;background:#fafbfd}.topology-risk-target small{grid-column:1/-1;color:#8897a9;font-size:9px}.topology-risk-target b{color:#2e425a;font-size:13px}.topology-risk-target span{padding:3px 8px;border-radius:10px;background:#fff0f1;color:#c23f4d;font-size:10px}.topology-risk-warning{margin:12px 22px;padding:12px 14px;border-left:3px solid #e54858;border-radius:5px;background:#fff5f6}.topology-risk-warning b{color:#bd3443;font-size:13px}.topology-risk-warning p{margin:6px 0 0;color:#79555c;font-size:11px;line-height:1.6}.topology-risk-modal>ul{display:flex;margin:0;padding:2px 22px 18px;flex-direction:column;gap:11px;list-style:none}.topology-risk-modal>ul li{display:grid;grid-template-columns:25px 1fr;gap:10px}.topology-risk-modal>ul i{display:grid;width:24px;height:24px;border-radius:50%;background:#eef3f8;color:#657a93;place-items:center;font-size:10px;font-style:normal}.topology-risk-modal>ul span{display:flex;flex-direction:column;gap:3px}.topology-risk-modal>ul b{color:#384c64;font-size:11px}.topology-risk-modal>ul small{color:#7e8da1;font-size:10px;line-height:1.45}.topology-risk-modal>footer{display:flex;padding:14px 22px;justify-content:flex-end;gap:9px;border-top:1px solid #e8edf3;background:#fafbfd}.topology-risk-modal>footer button{min-height:36px}@media(max-width:700px){.topology-master-level{padding:0}.topology-root-grid,.topology-leaf-grid{grid-template-columns:1fr}.topology-branch-connector{margin:0 50%}.topology-branch-connector span{display:none}.topology-risk-modal>footer{flex-direction:column-reverse}.topology-risk-modal>footer button{width:100%}}
+.topology-risk-replacement{display:flex;margin:12px 22px 0;flex-direction:column;gap:6px;color:#435971;font-size:11px;font-weight:700}.topology-risk-replacement select{height:36px;padding:0 9px;border:1px solid #d2deea;border-radius:5px;background:#fff}.topology-risk-replacement small{color:#7d8da1;font-size:9px;font-weight:400;line-height:1.45}
+.topology-node-grid{display:flex!important;flex-wrap:wrap;justify-content:center;align-items:flex-start}.topology-edit-node,.topology-add-node-tile{width:224px!important;min-width:224px!important;max-width:224px!important;height:168px!important;min-height:168px!important;max-height:168px!important;flex:0 0 224px;box-sizing:border-box}.topology-edit-node{cursor:grab;user-select:none}.topology-edit-node:active{cursor:grabbing}.topology-edit-node.dragging{opacity:.42;transform:scale(.97)}.topology-level.drag-active{margin-right:-8px;margin-left:-8px;padding-right:8px;padding-left:8px;border-radius:10px;outline:1px dashed #9ab8d7;outline-offset:5px}.topology-level.drag-active .topology-level-label:after{margin-left:5px;content:"· 可放置";font-weight:400}.topology-edit-node[draggable=true] .topology-db-icon:after{margin-left:3px;color:#8ca0b7;content:"⋮⋮";font-size:8px;letter-spacing:-2px}
+
+/* 固定尺寸卡片使用明确的三段高度，避免内容撑出卡片并覆盖下一拓扑层。 */
+.topology-edit-node {
+  display: grid;
+  grid-template-rows: 46px minmax(0, 1fr) 35px;
+}
+
+.topology-edit-node > header {
+  min-width: 0;
+  padding: 7px 10px;
+}
+
+.topology-edit-node > div {
+  min-width: 0;
+  min-height: 0;
+  padding: 9px 12px 7px;
+  gap: 3px;
+  overflow: hidden;
+}
+
+.topology-edit-node > div > span {
+  margin-top: 2px;
+}
+
+.topology-edit-node > footer {
+  min-width: 0;
+  min-height: 0;
+  padding: 6px 10px;
+}
+
+.topology-edit-node > footer small {
+  min-width: 0;
+  max-width: 132px;
+}
+
+/* 所有宽度计算都限制在当前工作区，防止相对超宽画布居中后被视口裁切。 */
+.architecture-workspace,
+.topology-architecture-layout,
+.topology-editor-card,
+.topology-draft-canvas,
+.topology-inspector {
+  min-width: 0;
+}
+
+.topology-architecture-layout {
+  width: 100%;
+}
+
+.topology-editor-card {
+  overflow: hidden;
+}
+
+.topology-draft-canvas {
+  width: 100%;
+  overflow: hidden;
+}
+
+.topology-master-level + .topology-replica-level {
+  margin-top: 28px;
+}
+
+/* 集群二级导航占用 250px，常见桌面宽度下将检查器放到画布下方。 */
+@media (max-width: 1500px) {
+  .topology-architecture-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .topology-inspector {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .topology-plan-action {
+    justify-content: flex-end;
+  }
+}
+
+@media (max-width: 760px) {
+  .topology-inspector {
+    display: flex;
+  }
+
+  .topology-draft-canvas {
+    overflow-x: auto;
+  }
+}

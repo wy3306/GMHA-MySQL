@@ -28,8 +28,8 @@ func TestBuildDefaultMySQLDynamicCollectConfig(t *testing.T) {
 			t.Fatalf("expected default mysql task %s", name)
 		}
 	}
-	if got := seen["mysql_threads_connected"].IntervalSeconds; got != 1 {
-		t.Fatalf("expected 1s task, got %d", got)
+	if got := seen["mysql_threads_connected"].IntervalSeconds; got != 5 {
+		t.Fatalf("expected 5s task, got %d", got)
 	}
 	if got := seen["mysql_qps"].IntervalSeconds; got != 5 {
 		t.Fatalf("expected 5s task, got %d", got)

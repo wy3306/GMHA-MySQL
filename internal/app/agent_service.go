@@ -10,14 +10,14 @@ import (
 	"strings"
 	"time"
 
+	"encoding/json"
+	"fmt"
+	"gmha/internal/agent/mysqlcheck"
 	agentdomain "gmha/internal/domain/agent"
 	dynamicdomain "gmha/internal/domain/dynamic"
 	hbdomain "gmha/internal/domain/heartbeat"
 	machinedomain "gmha/internal/domain/machine"
 	agentusecase "gmha/internal/usecase/agent"
-	"encoding/json"
-	"fmt"
-	"gmha/internal/agent/mysqlcheck"
 )
 
 // AgentService 是 Agent 管理服务，负责 Agent 的安装、升级、卸载、重试安装、
@@ -255,9 +255,7 @@ func (s *AgentService) RetryInstallByIP(ctx context.Context, req agentusecase.In
 	if !ok {
 		return agentusecase.InstallAgentResponse{}, errors.New("machine not found")
 	}
-	if strings.TrimSpace(machine.Cluster) == "" {
-		return agentusecase.InstallAgentResponse{}, errors.New("machine is not assigned to any cluster")
-	}
+	// Agent 是后续资源采集与集群编排的基础能力，允许在分配集群前完成安装。
 	agent, agentFound, err := s.repo.GetByMachineID(ctx, machine.ID)
 	if err != nil {
 		return agentusecase.InstallAgentResponse{}, err
@@ -266,8 +264,9 @@ func (s *AgentService) RetryInstallByIP(ctx context.Context, req agentusecase.In
 		return agentusecase.InstallAgentResponse{}, errors.New("agent is already online")
 	}
 	req.MachineID = machine.ID
-	req.SSHUser = machine.SSHUser
-	req.SSHPassword = ""
+	if strings.TrimSpace(req.SSHUser) == "" {
+		req.SSHUser = machine.SSHUser
+	}
 	req.ManagerHTTPAddr = ResolveManagerHTTPAddrForTarget(s.managerHTTPAddr, machine.IP)
 	req.ManagerGRPCAddr = ResolveManagerGRPCAddrForTarget("", s.managerGRPCAddr, machine.IP)
 	if strings.TrimSpace(req.InstallDir) == "" && agentFound && strings.TrimSpace(agent.InstallDir) != "" {
@@ -491,7 +490,9 @@ func (s *AgentService) RepairMySQLConfigByIP(ctx context.Context, ip string) (st
 
 	// 使用 TaskService 执行 shell 命令写入文件
 	cmd := fmt.Sprintf("cat > %s <<EOF\n%s\nEOF\n", configPath, string(configJSON))
-	task, err := s.taskService.CreateExecTask(ctx, ip, cmd)
+	task, err := s.taskService.CreateExecTaskWithOptions(ctx, ip, cmd, ExecTaskOptions{
+		Operation: "mysql_monitor_config_repair", DisplayName: "修复 MySQL 监控配置", StepName: "写入 MySQL 监控配置",
+	})
 	if err != nil {
 		return "", fmt.Errorf("创建修复任务失败: %w", err)
 	}

@@ -61,7 +61,7 @@ type MetricBatchResult struct {
 	Items       []MetricResult `json:"items"`
 }
 
-// BuildDefaultDynamicCollectConfig 构建默认的主机级动态采集配置，包含16项基础指标：
+// BuildDefaultDynamicCollectConfig 构建默认的主机级动态采集配置，包含18项基础指标：
 // CPU使用率、内存使用率、IO状态、负载均值、NTP偏移、SSH探活、inode使用率、
 // MySQL进程存活、端口监听、Socket状态、连接状态、数据盘/Binlog盘/Redo盘/Tmp盘/Undo盘使用率。
 func BuildDefaultDynamicCollectConfig() DynamicCollectConfig {
@@ -69,6 +69,8 @@ func BuildDefaultDynamicCollectConfig() DynamicCollectConfig {
 	names := []string{
 		"cpu_usage_percent",
 		"mem_usage_percent",
+		"agent_cpu_usage_percent",
+		"agent_memory_rss_mb",
 		"io_status",
 		"load_average",
 		"ntp_offset_ms",
@@ -86,11 +88,20 @@ func BuildDefaultDynamicCollectConfig() DynamicCollectConfig {
 	}
 	tasks := make([]CollectTaskSpec, 0, len(names))
 	for _, name := range names {
+		interval := 5
+		switch name {
+		case "agent_cpu_usage_percent", "agent_memory_rss_mb":
+			interval = 15
+		case "ntp_offset_ms":
+			interval = 60
+		case "ssh_probe", "inode_usage", "mysql_data_disk_usage", "mysql_binlog_disk_usage", "mysql_redo_disk_usage", "mysql_tmp_disk_usage", "mysql_undo_disk_usage":
+			interval = 30
+		}
 		tasks = append(tasks, CollectTaskSpec{
 			Name:            name,
 			Enabled:         true,
 			Type:            TaskTypeBuiltin,
-			IntervalSeconds: 1,
+			IntervalSeconds: interval,
 			TimeoutSeconds:  1,
 		})
 	}
@@ -103,11 +114,14 @@ func BuildDefaultDynamicCollectConfig() DynamicCollectConfig {
 }
 
 // BuildDefaultMySQLDynamicCollectConfig 构建默认的 MySQL 动态采集配置，包含100+项指标，
-// 涵盖连接、复制、性能、存储、拓扑、变量等六大类，采集间隔从1秒到300秒不等。
+// 涵盖连接、复制、性能、存储、拓扑、变量等六大类，采集间隔从5秒到300秒不等。
 func BuildDefaultMySQLDynamicCollectConfig() DynamicCollectConfig {
 	now := time.Now().UTC()
 	tasks := make([]CollectTaskSpec, 0, 128)
 	add := func(name, category string, interval int, displayName string, params map[string]string) {
+		if interval < 5 {
+			interval = 5
+		}
 		if params == nil {
 			params = map[string]string{}
 		}

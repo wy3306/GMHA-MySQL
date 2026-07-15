@@ -1,0 +1,102 @@
+/* 非任务中心只展示受控摘要，避免远端命令和 systemd 输出破坏页面布局。 */
+.shell,
+.content,
+.content > *,
+.panel,
+.modal,
+.panel-head,
+.panel-head > *,
+.alert,
+.alert > * {
+  min-width: 0;
+}
+
+.alert {
+  box-sizing: border-box;
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr) max-content;
+  align-items: start;
+  gap: 4px 10px;
+  width: 100%;
+  max-width: 100%;
+  max-height: 92px;
+  overflow: hidden;
+}
+
+.alert > span {
+  display: -webkit-box;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.alert > small {
+  grid-column: 2;
+  color: inherit;
+  opacity: .72;
+}
+
+.alert > button {
+  grid-column: 3;
+  grid-row: 1 / span 2;
+  flex: none;
+}
+
+.ui-error-summary,
+.machine-info-error,
+.machine-last-error p,
+.machine-delete-error p,
+.machine-bulk-results article p,
+.cleanup-error,
+.topology-error,
+.backup-last-error,
+.flow-error small,
+.error-cell {
+  display: -webkit-box;
+  max-width: 100%;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  line-height: 1.5;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+table {
+  max-width: 100%;
+}
+
+td,
+th {
+  min-width: 0;
+}
+
+.machine-bulk-results article,
+.cleanup-result article,
+.agent-detail,
+.flow-content {
+  min-width: 0;
+}
+
+/* 任务中心是完整日志的唯一入口，并在自身区域内滚动。 */
+.task-log-panel,
+.task-log-content,
+.task-log-line,
+.task-log-line pre {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.task-log-content {
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.task-log-line pre {
+  overflow-x: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

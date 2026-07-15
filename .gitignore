@@ -6,7 +6,7 @@
 
 # Go build artifacts
 bin/
-dist/
+/dist/
 *.exe
 *.exe~
 *.dll
@@ -31,6 +31,9 @@ data/
 
 # Software dependencies (large binaries)
 software/
+
+# Frontend dependencies and build output
+node_modules/
 
 # Temporary files
 *.tmp

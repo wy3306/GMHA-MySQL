@@ -120,7 +120,7 @@ func (r *mysqlInstallRunner) run() error {
 			return r.writeFileStep(step, "/etc/systemd/system/"+r.spec.SystemdUnitName+".service", r.spec.SystemdContent)
 		},
 		func(step taskdomain.DispatchStep) error {
-			return r.runShellStep(step, "初始化 MySQL", fmt.Sprintf("%s/bin/mysqld --defaults-file=%s --initialize-insecure --user=%s", shellEscape(r.spec.BaseDir), shellEscape(r.spec.MyCnfPath), shellEscape(r.spec.MySQLUser)))
+			return r.runShellStep(step, "校验配置并初始化 MySQL", fmt.Sprintf("%s/bin/mysqld --defaults-file=%s --validate-config && %s/bin/mysqld --defaults-file=%s --initialize-insecure --user=%s", shellEscape(r.spec.BaseDir), shellEscape(r.spec.MyCnfPath), shellEscape(r.spec.BaseDir), shellEscape(r.spec.MyCnfPath), shellEscape(r.spec.MySQLUser)))
 		},
 		func(step taskdomain.DispatchStep) error {
 			return r.runShellStep(step, "启动 MySQL", fmt.Sprintf("systemctl daemon-reload && systemctl enable %s && systemctl restart %s", shellEscape(r.spec.SystemdUnitName), shellEscape(r.spec.SystemdUnitName)))
@@ -134,6 +134,17 @@ func (r *mysqlInstallRunner) run() error {
 		func(step taskdomain.DispatchStep) error {
 			return r.runShellStep(step, "验证 MySQL", fmt.Sprintf("%s/bin/mysqladmin --connect-timeout=5 --socket=%s -uroot -p%s ping", shellEscape(r.spec.BaseDir), shellEscape(r.spec.SocketPath), shellEscape(r.spec.RootPassword)))
 		},
+	}
+	if r.spec.InstallPTTools {
+		steps = append(steps, func(step taskdomain.DispatchStep) error {
+			ptURL := r.spec.PTToolsPackageDownloadURL
+			if !strings.HasPrefix(ptURL, "http://") && !strings.HasPrefix(ptURL, "https://") {
+				ptURL = strings.TrimRight(r.baseURL, "/") + "/" + strings.TrimLeft(ptURL, "/")
+			}
+			return r.runShellStep(step, "安装 Percona Toolkit", installPTToolsCommand(r.spec.BaseDir, r.spec.PTToolsPackageName, ptURL))
+		})
+	}
+	steps = append(steps,
 		func(step taskdomain.DispatchStep) error {
 			return r.initAccountsStep(step)
 		},
@@ -143,7 +154,7 @@ func (r *mysqlInstallRunner) run() error {
 		func(step taskdomain.DispatchStep) error {
 			return r.setupAgentCollectConfigStep(step)
 		},
-	}
+	)
 	if len(r.task.Steps) != len(steps) {
 		return fmt.Errorf("mysql_install step mismatch: task has %d steps, handler expects %d; recreate task with current manager", len(r.task.Steps), len(steps))
 	}
@@ -285,6 +296,32 @@ func installDependenciesCommand() string {
 		`elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then rpm -qa >/dev/null || { echo "rpmdb is broken, run: rpm --rebuilddb"; exit 1; }; pm=dnf; command -v dnf >/dev/null 2>&1 || pm=yum; for p in xz libaio numactl-libs openssl perl; do rpm -q "$p" >/dev/null 2>&1 || missing="$missing $p"; done; rpm -q libaio-devel >/dev/null 2>&1 || missing="$missing libaio-devel"; if ! rpm -q ncurses-compat-libs >/dev/null 2>&1 && ! rpm -q ncurses >/dev/null 2>&1; then missing="$missing ncurses-compat-libs"; fi; if [ -n "$missing" ]; then run_with_timeout $pm -y install $missing || run_with_timeout $pm -y install xz libaio libaio-devel numactl-libs ncurses openssl perl; else echo "dependencies already installed"; fi`,
 		`fi`,
 		`if ! ldconfig -p 2>/dev/null | grep -q "libaio.so.1 "; then for p in /usr/lib/*/libaio.so.1t64 /lib/*/libaio.so.1t64; do if [ -e "$p" ]; then ln -sfn "$p" "$(dirname "$p")/libaio.so.1"; fi; done; ldconfig 2>/dev/null || true; fi`,
+	}, "; ")
+}
+
+// installPTToolsCommand 安装 Percona Toolkit，并验证核心 pt 命令可用。
+func installPTToolsCommand(mysqlBaseDir, packageName, packageURL string) string {
+	return strings.Join([]string{
+		fmt.Sprintf(`mysql_version=$(%s/bin/mysql --version 2>/dev/null | sed -nE 's/.*Distrib ([0-9]+\.[0-9]+).*/\1/p' | head -1)`, shellEscape(mysqlBaseDir)),
+		`case "$mysql_version" in 8.*) min_pt_version=3.7.0 ;; *) echo "unsupported MySQL version for automatic PT installation: $mysql_version" >&2; exit 1 ;; esac`,
+		`run_with_timeout() { if command -v timeout >/dev/null 2>&1; then timeout 600 "$@"; else "$@"; fi; }`,
+		`download() { if command -v curl >/dev/null 2>&1; then curl -fsSLo "$2" "$1"; elif command -v wget >/dev/null 2>&1; then wget -qO "$2" "$1"; else echo "curl or wget is required" >&2; return 1; fi; }`,
+		fmt.Sprintf(`pt_package_name=%s`, shellEscape(packageName)),
+		fmt.Sprintf(`pt_package_url=%s`, shellEscape(packageURL)),
+		`[ -n "$pt_package_name" ] && [ -n "$pt_package_url" ] || { echo "local Percona Toolkit package is not configured" >&2; exit 1; }`,
+		`if command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive run_with_timeout apt-get update && DEBIAN_FRONTEND=noninteractive run_with_timeout apt-get -y install --no-install-recommends perl libdbi-perl libdbd-mysql-perl libio-socket-ssl-perl libterm-readkey-perl`,
+		`elif command -v dnf >/dev/null 2>&1; then run_with_timeout dnf -y install perl perl-DBI perl-DBD-MySQL perl-IO-Socket-SSL perl-TermReadKey`,
+		`elif command -v yum >/dev/null 2>&1; then run_with_timeout yum -y install perl perl-DBI perl-DBD-MySQL perl-IO-Socket-SSL perl-TermReadKey`,
+		`else echo "unsupported package manager for Percona Toolkit dependencies" >&2; exit 1; fi`,
+		`pt_archive="/tmp/$pt_package_name"; pt_dir=/tmp/gmha-percona-toolkit`,
+		`download "$pt_package_url" "$pt_archive"`,
+		`test -s "$pt_archive" && rm -rf "$pt_dir" && mkdir -p "$pt_dir" && tar -xzf "$pt_archive" -C "$pt_dir" --strip-components=1`,
+		`test -f "$pt_dir/bin/pt-table-sync" && test -f "$pt_dir/bin/pt-table-checksum" && install -m 0755 "$pt_dir"/bin/pt-* /usr/local/bin/`,
+		`hash -r`,
+		`pt_version=$(pt-table-sync --version 2>/dev/null | sed -nE 's/.* ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -1)`,
+		`[ -n "$pt_version" ] || { echo "unable to determine Percona Toolkit version" >&2; exit 1; }`,
+		`[ "$(printf '%s\n%s\n' "$min_pt_version" "$pt_version" | sort -V | head -1)" = "$min_pt_version" ] || { echo "Percona Toolkit $pt_version is incompatible; MySQL $mysql_version requires >= $min_pt_version" >&2; exit 1; }`,
+		`pt-table-sync --version; pt-table-checksum --version`,
 	}, "; ")
 }
 
@@ -517,11 +554,12 @@ func mhaHeartbeatAccount(result mysqlapp.AccountInitResult, accounts []taskdomai
 			continue
 		}
 		return taskdomain.MySQLAccountSpec{
-			Role:     item.Role,
-			Username: item.Username,
-			Password: item.Password,
-			Host:     item.Host,
-			Enabled:  item.Enabled,
+			Role:       item.Role,
+			Username:   item.Username,
+			Password:   item.Password,
+			Host:       item.Host,
+			Enabled:    item.Enabled,
+			Privileges: item.Privileges,
 		}, true
 	}
 	return taskdomain.MySQLAccountSpec{}, false
@@ -537,6 +575,7 @@ func mysqlAccountSpecsFromDomain(items []taskdomain.MySQLAccountSpec) []mysqlapp
 			Host:           item.Host,
 			Enabled:        item.Enabled,
 			ExtendedBackup: item.ExtendedBackup,
+			Privileges:     item.Privileges,
 		})
 	}
 	return out
@@ -761,43 +800,47 @@ func (r *mysqlInstallRunner) finalResult() json.RawMessage {
 		return resultJSON
 	}
 	resultJSON, _ := json.Marshal(taskdomain.MySQLInstallResult{
-		Port:        r.spec.Port,
-		ServerID:    r.spec.ServerID,
-		MySQLUser:   r.spec.MySQLUser,
-		InstanceDir: r.spec.InstanceDir,
-		DataDir:     r.spec.DataDir,
-		BinlogDir:   r.spec.BinlogDir,
-		RedoDir:     r.spec.RedoDir,
-		UndoDir:     r.spec.UndoDir,
-		TmpDir:      r.spec.TmpDir,
-		BaseDir:     r.spec.BaseDir,
-		Profile:     r.spec.Profile,
-		PackageName: r.spec.PackageName,
-		SystemdUnit: r.spec.SystemdUnitName,
-		MyCnfPath:   r.spec.MyCnfPath,
-		SocketPath:  r.spec.SocketPath,
+		Port:         r.spec.Port,
+		ServerID:     r.spec.ServerID,
+		MySQLUser:    r.spec.MySQLUser,
+		InstanceDir:  r.spec.InstanceDir,
+		DataDir:      r.spec.DataDir,
+		BinlogDir:    r.spec.BinlogDir,
+		RedoDir:      r.spec.RedoDir,
+		UndoDir:      r.spec.UndoDir,
+		TmpDir:       r.spec.TmpDir,
+		BaseDir:      r.spec.BaseDir,
+		Profile:      r.spec.Profile,
+		PackageName:  r.spec.PackageName,
+		Version:      r.spec.Version,
+		Architecture: r.spec.Architecture,
+		SystemdUnit:  r.spec.SystemdUnitName,
+		MyCnfPath:    r.spec.MyCnfPath,
+		SocketPath:   r.spec.SocketPath,
 	})
 	return resultJSON
 }
 
 func (r *mysqlInstallRunner) finalResultWithAccounts(accountResult mysqlapp.AccountInitResult) json.RawMessage {
 	resultJSON, _ := json.Marshal(taskdomain.MySQLInstallResult{
-		Port:        r.spec.Port,
-		ServerID:    r.spec.ServerID,
-		MySQLUser:   r.spec.MySQLUser,
-		InstanceDir: r.spec.InstanceDir,
-		DataDir:     r.spec.DataDir,
-		BinlogDir:   r.spec.BinlogDir,
-		RedoDir:     r.spec.RedoDir,
-		UndoDir:     r.spec.UndoDir,
-		TmpDir:      r.spec.TmpDir,
-		BaseDir:     r.spec.BaseDir,
-		Profile:     r.spec.Profile,
-		PackageName: r.spec.PackageName,
-		SystemdUnit: r.spec.SystemdUnitName,
-		MyCnfPath:   r.spec.MyCnfPath,
-		SocketPath:  r.spec.SocketPath,
-		AccountInit: mysqlAccountResultToDomain(accountResult),
+		Port:         r.spec.Port,
+		ServerID:     r.spec.ServerID,
+		MySQLUser:    r.spec.MySQLUser,
+		InstanceDir:  r.spec.InstanceDir,
+		DataDir:      r.spec.DataDir,
+		BinlogDir:    r.spec.BinlogDir,
+		RedoDir:      r.spec.RedoDir,
+		UndoDir:      r.spec.UndoDir,
+		TmpDir:       r.spec.TmpDir,
+		BaseDir:      r.spec.BaseDir,
+		Profile:      r.spec.Profile,
+		PackageName:  r.spec.PackageName,
+		Version:      r.spec.Version,
+		Architecture: r.spec.Architecture,
+		SystemdUnit:  r.spec.SystemdUnitName,
+		MyCnfPath:    r.spec.MyCnfPath,
+		SocketPath:   r.spec.SocketPath,
+		AccountInit:  mysqlAccountResultToDomain(accountResult),
 	})
 	return resultJSON
 }

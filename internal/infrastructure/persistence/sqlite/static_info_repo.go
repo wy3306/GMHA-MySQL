@@ -12,10 +12,10 @@ import (
 
 // StaticInfoRepository 是静态信息的 SQLite 仓储实现。
 type StaticInfoRepository struct {
-	db *sql.DB
+	db *DB
 }
 
-func NewStaticInfoRepository(db *sql.DB) *StaticInfoRepository {
+func NewStaticInfoRepository(db *DB) *StaticInfoRepository {
 	return &StaticInfoRepository{db: db}
 }
 

@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -13,10 +14,10 @@ import (
 
 // HARepository 是高可用领域实体的 SQLite 仓储实现，管理 VIP 配置、故障转移策略、事件等。
 type HARepository struct {
-	db *sql.DB
+	db *DB
 }
 
-func NewHARepository(db *sql.DB) *HARepository {
+func NewHARepository(db *DB) *HARepository {
 	return &HARepository{db: db}
 }
 
@@ -238,8 +239,88 @@ func (r *HARepository) Migrate() error {
 			started_at text default CURRENT_TIMESTAMP,
 			finished_at text
 		);
+		create table if not exists architecture_adjustment_run (
+			run_id text primary key,
+			cluster_id text not null,
+			status text not null,
+			current_step text,
+			run_json text not null,
+			created_at text not null,
+			updated_at text not null
+		);
+		create index if not exists idx_architecture_run_cluster on architecture_adjustment_run(cluster_id, created_at);
 	`)
 	return err
+}
+
+// SaveArchitectureRun 持久化架构调整状态机快照。
+func (r *HARepository) SaveArchitectureRun(ctx context.Context, run hadomain.ArchitectureRun) error {
+	payload, err := json.Marshal(run)
+	if err != nil {
+		return err
+	}
+	_, err = r.db.ExecContext(ctx, `
+		insert into architecture_adjustment_run (run_id, cluster_id, status, current_step, run_json, created_at, updated_at)
+		values (?, ?, ?, ?, ?, ?, ?)
+		on conflict(run_id) do update set
+			status=excluded.status, current_step=excluded.current_step, run_json=excluded.run_json, updated_at=excluded.updated_at
+	`, run.RunID, run.ClusterID, run.Status, run.CurrentStep, string(payload), run.CreatedAt.UTC().Format(time.RFC3339Nano), run.UpdatedAt.UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+// GetArchitectureRun 读取一次架构调整状态机快照。
+func (r *HARepository) GetArchitectureRun(ctx context.Context, clusterID, runID string) (hadomain.ArchitectureRun, bool, error) {
+	var payload string
+	err := r.db.QueryRowContext(ctx, `select run_json from architecture_adjustment_run where cluster_id = ? and run_id = ?`, strings.TrimSpace(clusterID), strings.TrimSpace(runID)).Scan(&payload)
+	if errors.Is(err, sql.ErrNoRows) {
+		return hadomain.ArchitectureRun{}, false, nil
+	}
+	if err != nil {
+		return hadomain.ArchitectureRun{}, false, err
+	}
+	var run hadomain.ArchitectureRun
+	if err := json.Unmarshal([]byte(payload), &run); err != nil {
+		return hadomain.ArchitectureRun{}, false, err
+	}
+	return run, true, nil
+}
+
+// MarkInterruptedArchitectureRuns reconciles runs left active by a Manager
+// restart. Credentials are deliberately not persisted, so destructive steps
+// cannot be resumed safely and require a fresh plan after manual inspection.
+func (r *HARepository) MarkInterruptedArchitectureRuns(ctx context.Context) error {
+	rows, err := r.db.QueryContext(ctx, `select run_json from architecture_adjustment_run where status in (?, ?, ?)`, hadomain.ArchitectureRunPending, hadomain.ArchitectureRunRunning, hadomain.ArchitectureRunWaitingForce)
+	if err != nil {
+		return err
+	}
+	var runs []hadomain.ArchitectureRun
+	for rows.Next() {
+		var payload string
+		if err := rows.Scan(&payload); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		var run hadomain.ArchitectureRun
+		if err := json.Unmarshal([]byte(payload), &run); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		runs = append(runs, run)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	for _, run := range runs {
+		run.Status = hadomain.ArchitectureRunFailed
+		run.CurrentStep = "manager_restart_recovery"
+		run.Error = "Manager restarted during architecture adjustment; credentials were not persisted. Inspect MySQL roles, replication and VIP holders, then create a fresh plan."
+		run.UpdatedAt, run.FinishedAt = now, &now
+		if err := r.SaveArchitectureRun(ctx, run); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *HARepository) EnsureDefaultPolicies(ctx context.Context, clusterID string) error {
@@ -309,7 +390,9 @@ func (r *HARepository) ListVIPConfigs(ctx context.Context, clusterID string) ([]
 	rows, err := r.db.QueryContext(ctx, `
 		select id, cluster_id, coalesce(vip_name,''), vip_address, vip_prefix, vip_route_mode, vip_manage_mode,
 			coalesce(default_interface,''), allow_manual_adopt, preempt_enabled, arping_enabled, arping_count,
-			check_after_bind, external_check_enabled, enabled, coalesce(created_at,''), coalesce(updated_at,'')
+			check_after_bind, external_check_enabled, bgp_enabled, coalesce(bgp_local_as,0), coalesce(bgp_peer_as,0),
+			coalesce(bgp_peer_address,''), coalesce(bgp_router_id,''), coalesce(bgp_community,''),
+			enabled, coalesce(created_at,''), coalesce(updated_at,'')
 		from cluster_vip_config where cluster_id = ? and enabled = 1 order by id
 	`, strings.TrimSpace(clusterID))
 	if err != nil {
@@ -319,9 +402,9 @@ func (r *HARepository) ListVIPConfigs(ctx context.Context, clusterID string) ([]
 	var out []hadomain.ClusterVIPConfig
 	for rows.Next() {
 		var item hadomain.ClusterVIPConfig
-		var adopt, preempt, arping, check, external, enabled int
+		var adopt, preempt, arping, check, external, bgp, enabled int
 		var createdAt, updatedAt string
-		if err := rows.Scan(&item.ID, &item.ClusterID, &item.VIPName, &item.VIPAddress, &item.VIPPrefix, &item.VIPRouteMode, &item.VIPManageMode, &item.DefaultInterface, &adopt, &preempt, &arping, &item.ArpingCount, &check, &external, &enabled, &createdAt, &updatedAt); err != nil {
+		if err := rows.Scan(&item.ID, &item.ClusterID, &item.VIPName, &item.VIPAddress, &item.VIPPrefix, &item.VIPRouteMode, &item.VIPManageMode, &item.DefaultInterface, &adopt, &preempt, &arping, &item.ArpingCount, &check, &external, &bgp, &item.BGPLocalAS, &item.BGPPeerAS, &item.BGPPeerAddress, &item.BGPRouterID, &item.BGPCommunity, &enabled, &createdAt, &updatedAt); err != nil {
 			return nil, err
 		}
 		item.AllowManualAdopt = adopt != 0
@@ -329,12 +412,75 @@ func (r *HARepository) ListVIPConfigs(ctx context.Context, clusterID string) ([]
 		item.ArpingEnabled = arping != 0
 		item.CheckAfterBind = check != 0
 		item.ExternalCheckEnabled = external != 0
+		item.BGPEnabled = bgp != 0
 		item.Enabled = enabled != 0
 		item.CreatedAt, _ = parseDBTime(createdAt)
 		item.UpdatedAt, _ = parseDBTime(updatedAt)
 		out = append(out, item)
 	}
 	return out, rows.Err()
+}
+
+// UpsertVIPConfig 保存集群 VIP 与二层/三层宣告参数。
+func (r *HARepository) UpsertVIPConfig(ctx context.Context, cfg hadomain.ClusterVIPConfig) (hadomain.ClusterVIPConfig, error) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if cfg.VIPName == "" {
+		cfg.VIPName = "default"
+	}
+	if cfg.VIPPrefix <= 0 {
+		cfg.VIPPrefix = 24
+	}
+	if cfg.VIPManageMode == "" {
+		cfg.VIPManageMode = "GMHA_MANAGED"
+	}
+	if cfg.ArpingCount <= 0 {
+		cfg.ArpingCount = 3
+	}
+	_, err := r.db.ExecContext(ctx, `
+		insert into cluster_vip_config (
+			cluster_id, vip_name, vip_address, vip_prefix, vip_route_mode, vip_manage_mode, default_interface,
+			allow_manual_adopt, preempt_enabled, arping_enabled, arping_count, check_after_bind,
+			external_check_enabled, bgp_enabled, bgp_local_as, bgp_peer_as, bgp_peer_address,
+			bgp_router_id, bgp_community, enabled, created_at, updated_at
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		on conflict(cluster_id, vip_address) do update set
+			vip_name=excluded.vip_name, vip_prefix=excluded.vip_prefix, vip_route_mode=excluded.vip_route_mode,
+			vip_manage_mode=excluded.vip_manage_mode, default_interface=excluded.default_interface,
+			allow_manual_adopt=excluded.allow_manual_adopt, preempt_enabled=excluded.preempt_enabled,
+			arping_enabled=excluded.arping_enabled, arping_count=excluded.arping_count,
+			check_after_bind=excluded.check_after_bind, external_check_enabled=excluded.external_check_enabled,
+			bgp_enabled=excluded.bgp_enabled, bgp_local_as=excluded.bgp_local_as, bgp_peer_as=excluded.bgp_peer_as,
+			bgp_peer_address=excluded.bgp_peer_address, bgp_router_id=excluded.bgp_router_id,
+			bgp_community=excluded.bgp_community, enabled=excluded.enabled, updated_at=excluded.updated_at
+	`, cfg.ClusterID, cfg.VIPName, cfg.VIPAddress, cfg.VIPPrefix, cfg.VIPRouteMode, cfg.VIPManageMode, cfg.DefaultInterface,
+		haBoolInt(cfg.AllowManualAdopt), haBoolInt(cfg.PreemptEnabled), haBoolInt(cfg.ArpingEnabled), cfg.ArpingCount,
+		haBoolInt(cfg.CheckAfterBind), haBoolInt(cfg.ExternalCheckEnabled), haBoolInt(cfg.BGPEnabled), nullableHAInt(cfg.BGPLocalAS), nullableHAInt(cfg.BGPPeerAS), cfg.BGPPeerAddress,
+		cfg.BGPRouterID, cfg.BGPCommunity, haBoolInt(cfg.Enabled), now, now)
+	if err != nil {
+		return hadomain.ClusterVIPConfig{}, err
+	}
+	items, err := r.ListVIPConfigs(ctx, cfg.ClusterID)
+	if err != nil {
+		return hadomain.ClusterVIPConfig{}, err
+	}
+	for _, item := range items {
+		if item.VIPAddress == cfg.VIPAddress {
+			return item, nil
+		}
+	}
+	return hadomain.ClusterVIPConfig{}, errors.New("saved VIP config not found")
+}
+
+func (r *HARepository) DeleteVIPConfig(ctx context.Context, clusterID, vip string) error {
+	_, err := r.db.ExecContext(ctx, `delete from cluster_vip_config where cluster_id = ? and vip_address = ?`, strings.TrimSpace(clusterID), strings.TrimSpace(vip))
+	return err
+}
+
+func nullableHAInt(value int) any {
+	if value == 0 {
+		return nil
+	}
+	return value
 }
 
 func (r *HARepository) UpsertVIPBindingState(ctx context.Context, state hadomain.VIPBindingState) error {
@@ -431,6 +577,18 @@ func (r *HARepository) AcquireFailoverLock(ctx context.Context, clusterID, failo
 	n, _ := result.RowsAffected()
 	if n == 0 {
 		return fmt.Errorf("failover lock for cluster %s is already held", clusterID)
+	}
+	return nil
+}
+
+func (r *HARepository) RenewFailoverLock(ctx context.Context, clusterID, failoverID string, ttl time.Duration) error {
+	result, err := r.db.ExecContext(ctx, `update failover_lock set expires_at = ? where cluster_id = ? and failover_id = ?`, time.Now().UTC().Add(ttl).Format(time.RFC3339), clusterID, failoverID)
+	if err != nil {
+		return err
+	}
+	rows, _ := result.RowsAffected()
+	if rows != 1 {
+		return fmt.Errorf("failover lock for cluster %s is no longer owned by %s", clusterID, failoverID)
 	}
 	return nil
 }

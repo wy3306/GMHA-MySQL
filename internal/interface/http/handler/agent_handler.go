@@ -4,6 +4,7 @@ package handler
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"gmha/internal/app"
@@ -52,15 +53,60 @@ func (h *AgentHandler) HandleAgents(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, items)
+		keyword := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("keyword")))
+		status := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("status")))
+		filtered := make([]app.AgentView, 0, len(items))
+		for _, item := range items {
+			text := strings.ToLower(strings.Join([]string{item.Name, item.IP, item.Cluster, item.InstallState, item.HeartbeatState, item.OverallHealth, item.RecoveryState}, " "))
+			if keyword != "" && !strings.Contains(text, keyword) {
+				continue
+			}
+			if status != "" && status != "all" {
+				state := strings.ToLower(item.InstallState)
+				if status == "online" {
+					if state != "online" && strings.ToLower(item.HeartbeatState) != "online" {
+						continue
+					}
+				} else if status == "error" {
+					if state != "error" && state != "offline" && strings.ToLower(item.HeartbeatState) != "offline" {
+						continue
+					}
+				} else if state != status {
+					continue
+				}
+			}
+			filtered = append(filtered, item)
+		}
+		page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+		if page < 1 {
+			page = 1
+		}
+		pageSize, _ := strconv.Atoi(r.URL.Query().Get("page_size"))
+		if pageSize < 1 {
+			pageSize = 50
+		}
+		if pageSize > 100 {
+			pageSize = 100
+		}
+		start := (page - 1) * pageSize
+		if start > len(filtered) {
+			start = len(filtered)
+		}
+		end := start + pageSize
+		if end > len(filtered) {
+			end = len(filtered)
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"items": filtered[start:end], "total": len(filtered), "page": page, "page_size": pageSize})
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
 }
 
 type retryInstallRequest struct {
-	IP         string `json:"ip"`
-	InstallDir string `json:"install_dir"`
+	IP          string `json:"ip"`
+	InstallDir  string `json:"install_dir"`
+	SSHUser     string `json:"ssh_user"`
+	SSHPassword string `json:"ssh_password"`
 }
 
 type uninstallAgentRequest struct {
@@ -72,6 +118,10 @@ type recoveryRequest struct {
 }
 
 type upgradeAgentRequest struct {
+	IP string `json:"ip"`
+}
+
+type repairMySQLConfigRequest struct {
 	IP string `json:"ip"`
 }
 
@@ -87,8 +137,10 @@ func (h *AgentHandler) HandleRetryInstall(w http.ResponseWriter, r *http.Request
 		return
 	}
 	resp, err := h.service.RetryInstallByIP(r.Context(), agentusecase.InstallAgentRequest{
-		IP:         req.IP,
-		InstallDir: req.InstallDir,
+		IP:          req.IP,
+		InstallDir:  req.InstallDir,
+		SSHUser:     req.SSHUser,
+		SSHPassword: req.SSHPassword,
 	})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -133,6 +185,25 @@ func (h *AgentHandler) HandleUpgrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// HandleRepairMySQLConfig 调用 CLI 同一内核能力，修复 Agent 的 MySQL 采集配置。
+func (h *AgentHandler) HandleRepairMySQLConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var req repairMySQLConfigRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	taskID, err := h.service.RepairMySQLConfigByIP(r.Context(), req.IP)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"ip": req.IP, "task_id": taskID})
 }
 
 type registerRequest struct {

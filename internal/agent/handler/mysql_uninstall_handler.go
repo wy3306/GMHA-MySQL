@@ -58,43 +58,12 @@ func (h *MySQLUninstallHandler) Handle(ctx context.Context, task taskdomain.Disp
 }
 
 func (r *mysqlInstallRunner) runUninstall(spec taskdomain.MySQLUninstallSpec) error {
-	if spec.SystemdUnitName == "" {
-		spec.SystemdUnitName = "mysqld"
-	}
-	if err := validateUninstallSpec(spec); err != nil {
+	commands, err := BuildMySQLUninstallCommands(spec)
+	if err != nil {
 		return err
 	}
-	steps := []func(taskdomain.DispatchStep) error{
-		func(step taskdomain.DispatchStep) error {
-			return r.runShellStep(step, "停止 MySQL", stopMySQLCommand(spec))
-		},
-		func(step taskdomain.DispatchStep) error {
-			return r.runShellStep(step, "取消开机自启", fmt.Sprintf("systemctl disable %s 2>/dev/null || true", shellEscape(spec.SystemdUnitName)))
-		},
-		func(step taskdomain.DispatchStep) error {
-			return r.runShellStep(step, "删除 systemd 管理文件", fmt.Sprintf("rm -f /etc/systemd/system/%s.service", shellEscape(spec.SystemdUnitName)))
-		},
-		func(step taskdomain.DispatchStep) error {
-			return r.runShellStep(step, "删除实例数据目录", fmt.Sprintf("rm -rf -- %s", shellEscape(filepath.Clean(spec.InstanceDir))))
-		},
-		func(step taskdomain.DispatchStep) error {
-			return r.runShellStep(step, "删除临时安装包", removePackageCommand(spec))
-		},
-		func(step taskdomain.DispatchStep) error {
-			return r.runShellStep(step, "删除安装目录和软链接", uninstallBaseDirCommand(spec))
-		},
-		func(step taskdomain.DispatchStep) error {
-			return r.runShellStep(step, "删除配置文件", removeExtraPathsCommand(spec))
-		},
-		func(step taskdomain.DispatchStep) error {
-			return r.runShellStep(step, "刷新 systemd", "systemctl daemon-reload; systemctl reset-failed 2>/dev/null || true")
-		},
-		func(step taskdomain.DispatchStep) error {
-			return r.runShellStep(step, "验证卸载结果", verifyUninstallCommand(spec))
-		},
-	}
-	for i, fn := range steps {
-		if err := fn(r.task.Steps[i]); err != nil {
+	for i, command := range commands {
+		if err := r.runShellStep(r.task.Steps[i], command.Title, command.Command); err != nil {
 			return err
 		}
 	}
@@ -104,18 +73,82 @@ func (r *mysqlInstallRunner) runUninstall(spec taskdomain.MySQLUninstallSpec) er
 	return nil
 }
 
+// MySQLUninstallCommand 是 Agent 任务与 Manager SSH 回退通道共用的卸载步骤。
+type MySQLUninstallCommand struct {
+	Title   string
+	Command string
+}
+
+// BuildMySQLUninstallCommands 构建经过路径安全校验的 MySQL 卸载命令。
+// Manager 在 Agent 不在线时通过 SSH 执行同一组命令，避免两条清理链路行为漂移。
+func BuildMySQLUninstallCommands(spec taskdomain.MySQLUninstallSpec) ([]MySQLUninstallCommand, error) {
+	if spec.SystemdUnitName == "" {
+		spec.SystemdUnitName = "mysqld"
+	}
+	if err := validateUninstallSpec(spec); err != nil {
+		return nil, err
+	}
+	return []MySQLUninstallCommand{
+		{Title: "停止 MySQL", Command: stopMySQLCommand(spec)},
+		{Title: "取消开机自启", Command: fmt.Sprintf("systemctl disable %s 2>/dev/null || true", shellEscape(spec.SystemdUnitName))},
+		{Title: "删除 systemd 管理文件", Command: fmt.Sprintf("rm -f /etc/systemd/system/%s.service", shellEscape(spec.SystemdUnitName))},
+		{Title: "删除实例数据目录", Command: removeInstancePathsCommand(spec)},
+		{Title: "删除临时安装包", Command: removePackageCommand(spec)},
+		{Title: "删除安装目录和软链接", Command: uninstallBaseDirCommand(spec)},
+		{Title: "删除配置文件", Command: removeExtraPathsCommand(spec)},
+		{Title: "刷新 systemd", Command: "systemctl daemon-reload; systemctl reset-failed 2>/dev/null || true"},
+		{Title: "验证卸载结果", Command: verifyUninstallCommand(spec)},
+	}, nil
+}
+
 func validateUninstallSpec(spec taskdomain.MySQLUninstallSpec) error {
-	for label, path := range map[string]string{
+	paths := map[string]string{
 		"instance_dir": spec.InstanceDir,
+		"data_dir":     spec.DataDir,
+		"binlog_dir":   spec.BinlogDir,
+		"redo_dir":     spec.RedoDir,
+		"undo_dir":     spec.UndoDir,
+		"tmp_dir":      spec.TmpDir,
 		"base_dir":     spec.BaseDir,
-	} {
+	}
+	for label, path := range paths {
 		path = filepath.Clean(strings.TrimSpace(path))
+		if path == "." && label != "instance_dir" && label != "base_dir" {
+			continue
+		}
 		switch path {
-		case "", ".", "/", "/data", "/usr", "/usr/local":
+		case "", ".", "/", "/data", "/var", "/usr", "/usr/local", "/opt", "/home", "/tmp":
 			return fmt.Errorf("refuse to uninstall mysql with unsafe %s: %s", label, path)
 		}
 	}
 	return nil
+}
+
+func removeInstancePathsCommand(spec taskdomain.MySQLUninstallSpec) string {
+	paths := uniqueUninstallPaths(spec)
+	args := make([]string, 0, len(paths))
+	for _, path := range paths {
+		args = append(args, shellEscape(path))
+	}
+	return "rm -rf -- " + strings.Join(args, " ")
+}
+
+func uniqueUninstallPaths(spec taskdomain.MySQLUninstallSpec) []string {
+	values := []string{spec.InstanceDir, spec.DataDir, spec.BinlogDir, spec.RedoDir, spec.UndoDir, spec.TmpDir}
+	seen := make(map[string]struct{}, len(values))
+	paths := make([]string, 0, len(values))
+	for _, value := range values {
+		path := filepath.Clean(strings.TrimSpace(value))
+		if path == "." {
+			continue
+		}
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		paths = append(paths, path)
+	}
+	return paths
 }
 
 func stopMySQLCommand(spec taskdomain.MySQLUninstallSpec) string {
@@ -176,21 +209,17 @@ func removeExtraPathsCommand(spec taskdomain.MySQLUninstallSpec) string {
 func verifyUninstallCommand(spec taskdomain.MySQLUninstallSpec) string {
 	baseDir := filepath.Clean(spec.BaseDir)
 	installDir := mysqlPackageInstallDir(baseDir, spec.PackageName)
-	if installDir == "" {
-		return fmt.Sprintf(
-			"test ! -e %s && test ! -e %s && test ! -e /etc/systemd/system/%s.service",
-			shellEscape(spec.InstanceDir),
-			shellEscape(baseDir),
-			shellEscape(spec.SystemdUnitName),
-		)
+	checks := make([]string, 0, 8)
+	for _, path := range uniqueUninstallPaths(spec) {
+		checks = append(checks, "test ! -e "+shellEscape(path))
 	}
-	return fmt.Sprintf(
-		"test ! -e %s && test ! -e %s && test ! -e /etc/systemd/system/%s.service && test ! -e %s",
-		shellEscape(spec.InstanceDir),
-		shellEscape(baseDir),
-		shellEscape(spec.SystemdUnitName),
-		shellEscape(installDir),
-	)
+	checks = append(checks, "test ! -e /etc/systemd/system/"+shellEscape(spec.SystemdUnitName)+".service")
+	if installDir == "" {
+		checks = append(checks, "test ! -e "+shellEscape(baseDir))
+		return strings.Join(checks, " && ")
+	}
+	checks = append(checks, "test ! -e "+shellEscape(baseDir), "test ! -e "+shellEscape(installDir))
+	return strings.Join(checks, " && ")
 }
 
 func mysqlPackageInstallDir(baseDir, packageName string) string {

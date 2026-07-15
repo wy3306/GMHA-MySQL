@@ -41,6 +41,7 @@ type RecoveryConfig struct {
 }
 
 type RecoveryView struct {
+	ID            string `json:"id"`
 	MachineID     string `json:"machine_id"`
 	MachineIP     string `json:"machine_ip"`
 	Status        string `json:"status"`
@@ -79,6 +80,7 @@ func (s *RecoveryService) ListRecent(ctx context.Context, limit int) ([]Recovery
 	out := make([]RecoveryView, 0, len(items))
 	for _, item := range items {
 		out = append(out, RecoveryView{
+			ID:            item.ID,
 			MachineID:     item.MachineID,
 			MachineIP:     item.MachineIP,
 			Status:        string(item.Status),
@@ -130,10 +132,24 @@ func (s *RecoveryService) TriggerManualRecoverByIP(ctx context.Context, ip strin
 	if err != nil {
 		return RecoveryView{}, err
 	}
-	if err := s.ExecuteTask(ctx, task); err != nil {
+	// 手动操作应立即返回任务号，让 UI 能展示检查、拉起和心跳等待的实时过程。
+	// 执行使用独立上下文，避免浏览器请求结束时取消正在进行的 SSH 恢复。
+	state, _, _ := s.repo.GetLatestState(ctx, task.MachineID)
+	state.MachineID = task.MachineID
+	state.InProgress = true
+	state.LastAttemptAt = ptrTime(time.Now())
+	state.LastTaskID = task.ID
+	state.LastResult = "manual recovery queued"
+	if err := s.repo.SaveLatestState(ctx, state); err != nil {
 		return RecoveryView{}, err
 	}
+	go func(task recoverydomain.Task) {
+		execCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		_ = s.ExecuteTask(execCtx, task)
+	}(task)
 	return RecoveryView{
+		ID:            task.ID,
 		MachineID:     task.MachineID,
 		MachineIP:     task.MachineIP,
 		Status:        string(task.Status),
@@ -159,7 +175,9 @@ func (s *RecoveryService) ExecuteTask(ctx context.Context, task recoverydomain.T
 	defer s.repo.ReleaseLock(ctx, task.MachineID)
 
 	state, _, _ := s.repo.GetLatestState(ctx, task.MachineID)
-	if state.SuppressedUntil != nil && state.SuppressedUntil.After(time.Now()) {
+	// 冷却窗口用于限制后台自动恢复的重复尝试。用户主动点击“手动拉起”
+	// 时应明确绕过该限制，否则故障排查期间无法立即再次尝试恢复。
+	if task.Trigger != recoverydomain.TriggerManual && state.SuppressedUntil != nil && state.SuppressedUntil.After(time.Now()) {
 		task.Status = recoverydomain.StatusSuppressed
 		task.LastError = "recovery suppressed by cooldown"
 		_ = s.repo.UpdateTask(ctx, task)
@@ -257,6 +275,7 @@ func (s *RecoveryService) ExecuteTask(ctx context.Context, task recoverydomain.T
 		LastAttemptAt:       ptrTime(time.Now()),
 		LastSuccessAt:       ptrTime(time.Now()),
 		ConsecutiveFailures: 0,
+		SuppressedUntil:     nil,
 		LastTaskID:          task.ID,
 		LastResult:          "recovered",
 	})

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	machinedomain "gmha/internal/domain/machine"
+	taskdomain "gmha/internal/domain/task"
 	mysqlapp "gmha/internal/mysql"
 )
 
@@ -19,11 +20,17 @@ type MySQLInstanceRepository interface {
 	PruneUninstalled(ctx context.Context) (int64, error)
 }
 
+type MySQLAccountPresetRepository interface {
+	List(ctx context.Context) ([]taskdomain.MySQLAccountSpec, error)
+	Save(ctx context.Context, items []taskdomain.MySQLAccountSpec) error
+}
+
 // MySQLService 是 MySQL 实例管理服务，负责实例列表、视图聚合（关联机器和心跳）、遗忘实例等操作。
 type MySQLService struct {
 	repo      MySQLInstanceRepository
 	machines  machinedomain.Repository
 	heartbeat *HeartbeatService
+	presets   MySQLAccountPresetRepository
 }
 
 // MySQLInstanceView 是 MySQL 实例的聚合视图，关联了机器名称、IP、集群和心跳状态。
@@ -38,8 +45,65 @@ type MySQLInstanceView struct {
 }
 
 // NewMySQLService 创建 MySQL 服务实例。
-func NewMySQLService(repo MySQLInstanceRepository, machines machinedomain.Repository, heartbeat *HeartbeatService) *MySQLService {
-	return &MySQLService{repo: repo, machines: machines, heartbeat: heartbeat}
+func NewMySQLService(repo MySQLInstanceRepository, machines machinedomain.Repository, heartbeat *HeartbeatService, presets MySQLAccountPresetRepository) *MySQLService {
+	return &MySQLService{repo: repo, machines: machines, heartbeat: heartbeat, presets: presets}
+}
+
+func (s *MySQLService) AccountPresets(ctx context.Context) ([]taskdomain.MySQLAccountSpec, error) {
+	if s.presets == nil {
+		return defaultMySQLAccountPresets(), nil
+	}
+	items, err := s.presets.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return normalizeMySQLAccountPresets(items), nil
+}
+
+func (s *MySQLService) SaveAccountPresets(ctx context.Context, items []taskdomain.MySQLAccountSpec) ([]taskdomain.MySQLAccountSpec, error) {
+	if s.presets == nil {
+		return nil, errors.New("mysql account preset repository is not configured")
+	}
+	items = normalizeMySQLAccountPresets(items)
+	if err := s.presets.Save(ctx, items); err != nil {
+		return nil, err
+	}
+	return s.AccountPresets(ctx)
+}
+
+func defaultMySQLAccountPresets() []taskdomain.MySQLAccountSpec {
+	return []taskdomain.MySQLAccountSpec{{Role: "monitor", Username: "monitor", Password: "3306niubi", Host: "%", Enabled: true, Privileges: mysqlapp.DefaultPrivileges("monitor")}, {Role: "mha", Username: "mha", Password: "3306niubi", Host: "%", Enabled: true, Privileges: mysqlapp.DefaultPrivileges("mha")}, {Role: "backup", Username: "backup", Password: "3306niubi", Host: "%", Enabled: true, Privileges: mysqlapp.DefaultPrivileges("backup")}}
+}
+
+func normalizeMySQLAccountPresets(items []taskdomain.MySQLAccountSpec) []taskdomain.MySQLAccountSpec {
+	defaults := defaultMySQLAccountPresets()
+	byRole := make(map[string]taskdomain.MySQLAccountSpec, len(defaults))
+	for _, item := range defaults {
+		byRole[item.Role] = item
+	}
+	for _, item := range items {
+		role := strings.ToLower(strings.TrimSpace(item.Role))
+		base, ok := byRole[role]
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(item.Username) != "" {
+			base.Username = strings.TrimSpace(item.Username)
+		}
+		if item.Password != "" {
+			base.Password = item.Password
+		}
+		if strings.TrimSpace(item.Host) != "" {
+			base.Host = strings.TrimSpace(item.Host)
+		}
+		base.Enabled = item.Enabled
+		base.ExtendedBackup = item.ExtendedBackup
+		if item.Privileges != nil {
+			base.Privileges = append([]string(nil), item.Privileges...)
+		}
+		byRole[role] = base
+	}
+	return []taskdomain.MySQLAccountSpec{byRole["monitor"], byRole["mha"], byRole["backup"]}
 }
 
 // ListInstances 返回所有 MySQL 实例列表，会自动清理已卸载的实例记录。

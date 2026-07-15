@@ -11,11 +11,11 @@ import (
 
 // MachineRepository 是机器实体的 SQLite 仓储实现。
 type MachineRepository struct {
-	db *sql.DB
+	db *DB
 }
 
 // NewMachineRepository 创建一个新的 MachineRepository 实例。
-func NewMachineRepository(db *sql.DB) *MachineRepository {
+func NewMachineRepository(db *DB) *MachineRepository {
 	return &MachineRepository{db: db}
 }
 

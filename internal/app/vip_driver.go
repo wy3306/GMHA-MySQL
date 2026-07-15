@@ -186,6 +186,31 @@ type NotImplementedVipDriver struct {
 	Message string
 }
 
+// ArchitectureManagedVIPDriver prevents a caller from bypassing the ordered
+// architecture state machine. BGP and Keepalived require cluster-wide remote
+// target context, fencing and single-holder verification that the local
+// VipDriver interface intentionally does not carry.
+type ArchitectureManagedVIPDriver struct{ Mode string }
+
+func (d ArchitectureManagedVIPDriver) err() error {
+	return fmt.Errorf("%s VIP changes must run through the architecture adjustment state machine", d.Mode)
+}
+func (d ArchitectureManagedVIPDriver) Check(context.Context, CheckVipRequest) (*CheckVipResult, error) {
+	return nil, d.err()
+}
+func (d ArchitectureManagedVIPDriver) Add(context.Context, AddVipRequest) (*VipOperationResult, error) {
+	return nil, d.err()
+}
+func (d ArchitectureManagedVIPDriver) Delete(context.Context, DeleteVipRequest) (*VipOperationResult, error) {
+	return nil, d.err()
+}
+func (d ArchitectureManagedVIPDriver) Move(context.Context, MoveVipRequest) (*VipOperationResult, error) {
+	return nil, d.err()
+}
+func (d ArchitectureManagedVIPDriver) Validate(context.Context, ValidateVipRequest) (*ValidateVipResult, error) {
+	return nil, d.err()
+}
+
 func (d NotImplementedVipDriver) Check(context.Context, CheckVipRequest) (*CheckVipResult, error) {
 	return nil, d.err()
 }

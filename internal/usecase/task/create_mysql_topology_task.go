@@ -50,6 +50,7 @@ type CreateMySQLTopologyNodeRequest struct {
 	Port          int
 	Role          string
 	SourceMachine string
+	DelaySeconds  int
 }
 
 // CreateMySQLTopologyTaskResult 是创建 MySQL 拓扑任务的结果，包含多个任务及其步骤和事件。
@@ -258,6 +259,7 @@ func (u *CreateMySQLTopologyTaskUsecase) resolveTopologyNodes(ctx context.Contex
 				Port:                     instance.Port,
 				Role:                     role,
 				ServerID:                 serverID,
+				ReplicationDelaySeconds:  max(node.DelaySeconds, 0),
 				AutoIncrementOffset:      1,
 				AutoIncrementIncrement:   1,
 				InstanceDir:              instance.InstanceDir,

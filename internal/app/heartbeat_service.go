@@ -31,15 +31,28 @@ type HeartbeatConfig struct {
 // 管理 Agent 状态转换（INIT→ONLINE→SUSPECT→DEGRADED→OFFLINE）、
 // 协调循环检查超时、同步操作状态到 Agent/Machine 实体、管理动态采集配置。
 type HeartbeatService struct {
-	repo               hbdomain.Repository
-	cfg                HeartbeatConfig
-	agents             agentStatusUpdater
-	machines           machineStatusUpdater
-	mysql              mysqlStatusUpdater
+	repo          hbdomain.Repository
+	cfg           HeartbeatConfig
+	agents        agentStatusUpdater
+	machines      machineStatusUpdater
+	mysql         mysqlStatusUpdater
+	alertObserver interface {
+		ObserveHeartbeat(context.Context, hbdomain.HeartbeatPayload)
+	}
 	mu                 sync.RWMutex
 	latest             map[string]hbdomain.LatestStatus
 	dynamicConfig      dynamicdomain.DynamicCollectConfig
 	mysqlDynamicConfig dynamicdomain.DynamicCollectConfig
+}
+
+// SetAlertObserver attaches the Manager-side alert engine. Evaluation is
+// non-blocking and remains outside the Agent heartbeat critical path.
+func (s *HeartbeatService) SetAlertObserver(observer interface {
+	ObserveHeartbeat(context.Context, hbdomain.HeartbeatPayload)
+}) {
+	s.mu.Lock()
+	s.alertObserver = observer
+	s.mu.Unlock()
 }
 
 type agentStatusUpdater interface {
@@ -320,7 +333,7 @@ func (s *HeartbeatService) getByMachineIDRefreshing(ctx context.Context, machine
 
 func (s *HeartbeatService) ProcessHeartbeat(ctx context.Context, req *hbgrpc.HeartbeatRequest) (*hbgrpc.HeartbeatResponse, error) {
 	now := time.Now().UTC()
-	payload := mapRequest(req)
+	payload := s.enrichAlertPayload(ctx, mapRequest(req))
 
 	s.mu.Lock()
 	current, ok := s.latest[payload.AgentID]
@@ -345,6 +358,12 @@ func (s *HeartbeatService) ProcessHeartbeat(ctx context.Context, req *hbgrpc.Hea
 	s.syncOperationalState(ctx, next)
 	if changed {
 		_ = s.repo.AppendEvent(ctx, buildEvent(current, next, reason, payload, now))
+	}
+	s.mu.RLock()
+	observer := s.alertObserver
+	s.mu.RUnlock()
+	if observer != nil {
+		observer.ObserveHeartbeat(ctx, withAlertHealthMetrics(payload, 1))
 	}
 
 	cfg := s.GetDynamicCollectConfig()
@@ -380,8 +399,51 @@ func (s *HeartbeatService) Reconcile(ctx context.Context) error {
 			Version:   item.Version,
 			Seq:       item.LastSeq,
 		}, now))
+		if s.alertObserver != nil {
+			payload := s.enrichAlertPayload(ctx, hbdomain.HeartbeatPayload{AgentID: item.AgentID, MachineID: item.MachineID, ClusterID: item.ClusterID, Hostname: item.Hostname, OverallHealth: item.OverallHealth})
+			s.alertObserver.ObserveHeartbeat(ctx, withAlertHealthMetrics(payload, 0))
+		}
 	}
 	return nil
+}
+
+func (s *HeartbeatService) enrichAlertPayload(ctx context.Context, payload hbdomain.HeartbeatPayload) hbdomain.HeartbeatPayload {
+	payload.MachineName = payload.Hostname
+	reader, ok := s.machines.(interface {
+		GetByID(context.Context, string) (machinedomain.Machine, bool, error)
+	})
+	if !ok {
+		return payload
+	}
+	machine, found, err := reader.GetByID(ctx, payload.MachineID)
+	if err != nil || !found {
+		return payload
+	}
+	if payload.ClusterID == "" {
+		payload.ClusterID = machine.Cluster
+	}
+	payload.MachineName, payload.MachineIP = machine.Name, machine.IP
+	return payload
+}
+
+func withAlertHealthMetrics(payload hbdomain.HeartbeatPayload, heartbeatAlive float64) hbdomain.HeartbeatPayload {
+	now := time.Now().UTC()
+	healthValue := float64(0)
+	if payload.OverallHealth != hbdomain.HealthHealthy {
+		healthValue = 1
+	}
+	payload.Metrics = append(payload.Metrics,
+		dynamicdomain.MetricResult{Name: "agent_heartbeat_alive", Category: "agent", Success: true, ValueType: dynamicdomain.ValueTypeFloat, Value: heartbeatAlive, CollectedAt: now, Labels: map[string]string{"metric_scope": "agent_health"}},
+		dynamicdomain.MetricResult{Name: "agent_overall_health", Category: "agent", Success: true, ValueType: dynamicdomain.ValueTypeFloat, Value: healthValue, CollectedAt: now, Labels: map[string]string{"metric_scope": "agent_health"}},
+	)
+	for _, check := range payload.Checks {
+		value := float64(0)
+		if check.Status != hbdomain.CheckOK {
+			value = 1
+		}
+		payload.Metrics = append(payload.Metrics, dynamicdomain.MetricResult{Name: "agent_health_check_failed", Category: "agent", Success: true, ValueType: dynamicdomain.ValueTypeFloat, Value: value, CollectedAt: now, Labels: map[string]string{"metric_scope": "agent_health", "check_name": check.Name}})
+	}
+	return payload
 }
 
 func (s *HeartbeatService) syncOperationalState(ctx context.Context, item hbdomain.LatestStatus) {

@@ -12,10 +12,10 @@ import (
 
 // MachineInfoRepository 是机器信息的 SQLite 仓储实现。
 type MachineInfoRepository struct {
-	db *sql.DB
+	db *DB
 }
 
-func NewMachineInfoRepository(db *sql.DB) *MachineInfoRepository {
+func NewMachineInfoRepository(db *DB) *MachineInfoRepository {
 	return &MachineInfoRepository{db: db}
 }
 

@@ -14,13 +14,13 @@ import (
 type Status string
 
 const (
-	StatusPending         Status = "pending"           // 初始状态，等待 SSH 连接测试
-	StatusSSHConnected    Status = "ssh_connected"     // SSH 连接测试通过
-	StatusSSHTrustReady   Status = "ssh_trust_ready"   // SSH 免密信任已建立
-	StatusAgentInstalling Status = "agent_installing"   // Agent 正在安装
-	StatusAgentOnline     Status = "agent_online"       // Agent 在线运行
-	StatusAgentError      Status = "agent_error"        // Agent 安装或运行出错
-	StatusSSHFailed       Status = "ssh_failed"         // SSH 连接失败
+	StatusPending         Status = "pending"          // 初始状态，等待 SSH 连接测试
+	StatusSSHConnected    Status = "ssh_connected"    // SSH 连接测试通过
+	StatusSSHTrustReady   Status = "ssh_trust_ready"  // SSH 免密信任已建立
+	StatusAgentInstalling Status = "agent_installing" // Agent 正在安装
+	StatusAgentOnline     Status = "agent_online"     // Agent 在线运行
+	StatusAgentError      Status = "agent_error"      // Agent 安装或运行出错
+	StatusSSHFailed       Status = "ssh_failed"       // SSH 连接失败
 )
 
 // Machine 是机器实体的领域模型，表示一台被纳管的服务器。
@@ -45,10 +45,12 @@ type Endpoint struct {
 	SSHPort int
 }
 
-// SSHAuth 表示 SSH 认证信息（用户名 + 密码）。
+// SSHAuth 表示 SSH 认证信息，支持密码或私钥文件内容。
 type SSHAuth struct {
-	User     string
-	Password string
+	User       string
+	Password   string
+	PrivateKey string
+	Passphrase string
 }
 
 // Repository 定义了机器实体的仓储接口，用于持久化机器数据。

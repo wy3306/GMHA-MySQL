@@ -13,26 +13,37 @@ import (
 
 // Receiver 是 WebSocket 任务接收器，通过 WebSocket 长连接从管理端接收任务并交给分发器处理。
 type Receiver struct {
-	managerHTTPAddr string
-	agentID         string
-	machineID       string
-	dispatcher      *Dispatcher
+	managerHTTPAddrs []string
+	agentID          string
+	machineID        string
+	dispatcher       *Dispatcher
 }
 
 // NewReceiver 创建一个新的任务接收器实例。
 func NewReceiver(managerHTTPAddr, agentID, machineID string, dispatcher *Dispatcher) *Receiver {
+	addrs := make([]string, 0, 2)
+	for _, addr := range strings.Split(managerHTTPAddr, ",") {
+		if addr = strings.TrimSpace(addr); addr != "" {
+			addrs = append(addrs, addr)
+		}
+	}
 	return &Receiver{
-		managerHTTPAddr: managerHTTPAddr,
-		agentID:         agentID,
-		machineID:       machineID,
-		dispatcher:      dispatcher,
+		managerHTTPAddrs: addrs,
+		agentID:          agentID,
+		machineID:        machineID,
+		dispatcher:       dispatcher,
 	}
 }
 
 // Run 启动任务接收循环，自动重连 WebSocket 并接收任务。
 func (r *Receiver) Run(ctx context.Context) error {
+	index := 0
 	for {
-		err := r.runOnce(ctx)
+		if len(r.managerHTTPAddrs) == 0 {
+			return fmt.Errorf("manager_http_addr is required")
+		}
+		err := r.runOnce(ctx, r.managerHTTPAddrs[index%len(r.managerHTTPAddrs)])
+		index++
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -46,12 +57,12 @@ func (r *Receiver) Run(ctx context.Context) error {
 	}
 }
 
-func (r *Receiver) runOnce(ctx context.Context) error {
-	wsURL, err := buildTaskWSURL(r.managerHTTPAddr, r.agentID, r.machineID, r.dispatcher.Types())
+func (r *Receiver) runOnce(ctx context.Context, managerHTTPAddr string) error {
+	wsURL, err := buildTaskWSURL(managerHTTPAddr, r.agentID, r.machineID, r.dispatcher.Types())
 	if err != nil {
 		return err
 	}
-	conn, err := websocket.Dial(wsURL, "", r.managerHTTPAddr)
+	conn, err := websocket.Dial(wsURL, "", managerHTTPAddr)
 	if err != nil {
 		return err
 	}

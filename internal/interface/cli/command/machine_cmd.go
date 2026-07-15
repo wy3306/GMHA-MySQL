@@ -64,7 +64,7 @@ func (c *MachineCommand) Run(args []string) error {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		item, err := c.core.MachineService.CreateSSHCredential(ctx, *name, *sshUser, *sshPassword)
+		item, err := c.core.MachineService.CreateSSHCredential(ctx, *name, *sshUser, "password", *sshPassword, "", "")
 		if err != nil {
 			return err
 		}

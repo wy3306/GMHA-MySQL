@@ -14,11 +14,11 @@ import (
 type AgentState string
 
 const (
-	StateInit     AgentState = "INIT"      // 初始状态，Agent 刚注册
-	StateOnline   AgentState = "ONLINE"    // 在线，心跳正常
-	StateSuspect  AgentState = "SUSPECT"   // 疑似离线，心跳超时但未确认
-	StateDegraded AgentState = "DEGRADED"  // 降级状态，健康检查异常
-	StateOffline  AgentState = "OFFLINE"   // 离线，确认无心跳
+	StateInit     AgentState = "INIT"     // 初始状态，Agent 刚注册
+	StateOnline   AgentState = "ONLINE"   // 在线，心跳正常
+	StateSuspect  AgentState = "SUSPECT"  // 疑似离线，心跳超时但未确认
+	StateDegraded AgentState = "DEGRADED" // 降级状态，健康检查异常
+	StateOffline  AgentState = "OFFLINE"  // 离线，确认无心跳
 )
 
 // HealthLevel 表示 Agent 的整体健康等级。
@@ -53,6 +53,8 @@ type HealthCheck struct {
 type HeartbeatPayload struct {
 	AgentID             string
 	MachineID           string
+	MachineName         string
+	MachineIP           string
 	ClusterID           string
 	Hostname            string
 	Version             string

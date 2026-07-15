@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -23,28 +24,48 @@ type MachineInfoRepository interface {
 	Get(ctx context.Context, machineID string) (collectdomain.MachineInfo, bool, error)
 }
 
+type PerconaToolkitPackageResolver interface {
+	ResolvePerconaToolkitPackage(arch string) (string, error)
+}
+
 // CreateMySQLInstallTaskRequest 是创建 MySQL 安装任务的请求参数。
 type CreateMySQLInstallTaskRequest struct {
-	Machine          string
-	Port             int
-	ServerID         int
-	MySQLUser        string
-	InstanceDir      string
-	DataDir          string
-	BinlogDir        string
-	RedoDir          string
-	UndoDir          string
-	TmpDir           string
-	BaseDir          string
-	MyCnfPath        string
-	SocketPath       string
-	ErrorLog         string
-	PIDFile          string
-	CharacterSetsDir string
-	PluginDir        string
-	RootPassword     string
-	Profile          string
-	Accounts         []taskdomain.MySQLAccountSpec
+	Machine           string
+	Port              int
+	ServerID          int
+	MySQLUser         string
+	InstanceDir       string
+	DataDir           string
+	BinlogDir         string
+	RedoDir           string
+	UndoDir           string
+	TmpDir            string
+	BaseDir           string
+	MyCnfPath         string
+	SocketPath        string
+	ErrorLog          string
+	PIDFile           string
+	CharacterSetsDir  string
+	PluginDir         string
+	RootPassword      string
+	Profile           string
+	PackageName       string
+	Version           string
+	Architecture      string
+	InstallPTTools    bool
+	RuntimeParameters map[string]string
+	Accounts          []taskdomain.MySQLAccountSpec
+}
+
+// ListPackages 返回安装任务可选的 MySQL 安装包版本。
+func (u *CreateMySQLInstallTaskUsecase) ListPackages() ([]mysqlapp.PackageOption, error) {
+	return u.packageSelector.ListOptions()
+}
+
+// ResolvePackage validates a named package against the target machine's
+// architecture and glibc before an upgrade workflow is created.
+func (u *CreateMySQLInstallTaskUsecase) ResolvePackage(info collectdomain.MachineInfo, name string) (mysqlapp.Package, error) {
+	return u.packageSelector.SelectNamed(info, name)
 }
 
 // CreateMySQLInstallTaskResult 是创建 MySQL 安装任务的结果。
@@ -56,14 +77,15 @@ type CreateMySQLInstallTaskResult struct {
 
 // CreateMySQLInstallTaskUsecase 是创建 MySQL 安装任务的用例，负责计算配置参数并构建安装任务。
 type CreateMySQLInstallTaskUsecase struct {
-	machines        MachineRepository
-	agents          AgentRepository
-	machineInfo     MachineInfoRepository
-	loader          *render.Loader
-	engine          *render.Engine
-	calculator      *mysqlapp.Calculator
-	packageSelector *mysqlapp.PackageSelector
-	managerHTTPAddr string
+	machines          MachineRepository
+	agents            AgentRepository
+	machineInfo       MachineInfoRepository
+	loader            *render.Loader
+	engine            *render.Engine
+	calculator        *mysqlapp.Calculator
+	packageSelector   *mysqlapp.PackageSelector
+	ptPackageResolver PerconaToolkitPackageResolver
+	managerHTTPAddr   string
 }
 
 // NewCreateMySQLInstallTaskUsecase 创建一个新的 MySQL 安装任务用例实例。
@@ -75,17 +97,19 @@ func NewCreateMySQLInstallTaskUsecase(
 	engine *render.Engine,
 	calculator *mysqlapp.Calculator,
 	selector *mysqlapp.PackageSelector,
+	ptPackageResolver PerconaToolkitPackageResolver,
 	managerHTTPAddr string,
 ) *CreateMySQLInstallTaskUsecase {
 	return &CreateMySQLInstallTaskUsecase{
-		machines:        machines,
-		agents:          agents,
-		machineInfo:     machineInfo,
-		loader:          loader,
-		engine:          engine,
-		calculator:      calculator,
-		packageSelector: selector,
-		managerHTTPAddr: strings.TrimRight(managerHTTPAddr, "/"),
+		machines:          machines,
+		agents:            agents,
+		machineInfo:       machineInfo,
+		loader:            loader,
+		engine:            engine,
+		calculator:        calculator,
+		packageSelector:   selector,
+		ptPackageResolver: ptPackageResolver,
+		managerHTTPAddr:   strings.TrimRight(managerHTTPAddr, "/"),
 	}
 }
 
@@ -153,8 +177,31 @@ func (u *CreateMySQLInstallTaskUsecase) Execute(ctx context.Context, req CreateM
 	if err != nil {
 		return CreateMySQLInstallTaskResult{}, err
 	}
-	pkg, err := u.packageSelector.Select(info)
+	var pkg mysqlapp.Package
+	if strings.TrimSpace(req.PackageName) != "" {
+		pkg, err = u.packageSelector.SelectNamed(info, req.PackageName)
+	} else {
+		pkg, err = u.packageSelector.SelectVersionArchitecture(info, req.Version, req.Architecture)
+	}
 	if err != nil {
+		return CreateMySQLInstallTaskResult{}, err
+	}
+	if req.InstallPTTools && !mysqlapp.SupportsPerconaToolkit(pkg.Version) {
+		return CreateMySQLInstallTaskResult{}, fmt.Errorf("automatic Percona Toolkit installation is not supported for MySQL %s; disable install_pt_tools", pkg.Version)
+	}
+	ptPackageName := ""
+	ptPackageDownloadURL := ""
+	if req.InstallPTTools {
+		if u.ptPackageResolver == nil {
+			return CreateMySQLInstallTaskResult{}, errors.New("Percona Toolkit package resolver is not configured")
+		}
+		ptPackageName, err = u.ptPackageResolver.ResolvePerconaToolkitPackage(info.Arch)
+		if err != nil {
+			return CreateMySQLInstallTaskResult{}, err
+		}
+		ptPackageDownloadURL = fmt.Sprintf("%s/api/v1/packages/percona-toolkit/%s", strings.TrimRight(u.managerHTTPAddr, "/"), url.PathEscape(ptPackageName))
+	}
+	if err := mysqlapp.ApplyRuntimeParametersForVersion(&vars, pkg.Version, req.RuntimeParameters); err != nil {
 		return CreateMySQLInstallTaskResult{}, err
 	}
 	tpl, err := u.loader.LoadTemplate("mysql", "my.cnf.tmpl")
@@ -191,6 +238,7 @@ func (u *CreateMySQLInstallTaskUsecase) Execute(ctx context.Context, req CreateM
 			Host:           item.Host,
 			Enabled:        item.Enabled,
 			ExtendedBackup: item.ExtendedBackup,
+			Privileges:     item.Privileges,
 		})
 	}
 	if err := mysqlapp.ValidateAccountSpecs(accountCheck); err != nil {
@@ -198,36 +246,42 @@ func (u *CreateMySQLInstallTaskUsecase) Execute(ctx context.Context, req CreateM
 	}
 
 	spec := taskdomain.MySQLInstallSpec{
-		Port:               input.Port,
-		ServerID:           vars.ServerID,
-		MySQLUser:          input.MySQLUser,
-		InstanceDir:        input.InstanceDir,
-		DataDir:            input.DataDir,
-		BinlogDir:          input.BinlogDir,
-		RedoDir:            input.RedoDir,
-		UndoDir:            input.UndoDir,
-		TmpDir:             input.TmpDir,
-		BaseDir:            input.BaseDir,
-		RootPassword:       req.RootPassword,
-		Profile:            req.Profile,
-		PackageName:        pkg.FileName,
-		PackageDownloadURL: fmt.Sprintf("%s/api/v1/software/mysql/%s", strings.TrimRight(u.managerHTTPAddr, "/"), pkg.FileName),
-		MyCnfPath:          input.MyCnfPath,
-		MyCnfContent:       string(renderedMyCnf),
-		SocketPath:         input.SocketPath,
-		ErrorLog:           input.ErrorLog,
-		PIDFile:            input.PIDFile,
-		CharacterSetsDir:   input.CharacterSetsDir,
-		PluginDir:          input.PluginDir,
-		SystemdUnitName:    "mysqld",
-		SystemdContent:     string(renderedSystemd),
-		LimitsPath:         "/etc/security/limits.d/mysql.conf",
-		LimitsContent:      string(renderedLimits),
-		SysctlPath:         "/etc/sysctl.d/99-gmha-mysql.conf",
-		SysctlContent:      string(renderedSysctl),
-		EnvFilePath:        "/etc/profile.d/mysql.sh",
-		EnvContent:         string(renderedEnv),
-		Accounts:           accounts,
+		Port:                      input.Port,
+		ServerID:                  vars.ServerID,
+		MySQLUser:                 input.MySQLUser,
+		InstanceDir:               input.InstanceDir,
+		DataDir:                   input.DataDir,
+		BinlogDir:                 input.BinlogDir,
+		RedoDir:                   input.RedoDir,
+		UndoDir:                   input.UndoDir,
+		TmpDir:                    input.TmpDir,
+		BaseDir:                   input.BaseDir,
+		RootPassword:              req.RootPassword,
+		Profile:                   req.Profile,
+		PackageName:               pkg.FileName,
+		Version:                   pkg.Version,
+		Architecture:              mysqlapp.NormalizeArchitecture(pkg.Arch),
+		PackageDownloadURL:        fmt.Sprintf("%s/api/v1/software/mysql/%s", strings.TrimRight(u.managerHTTPAddr, "/"), pkg.FileName),
+		MyCnfPath:                 input.MyCnfPath,
+		MyCnfContent:              string(renderedMyCnf),
+		SocketPath:                input.SocketPath,
+		ErrorLog:                  input.ErrorLog,
+		PIDFile:                   input.PIDFile,
+		CharacterSetsDir:          input.CharacterSetsDir,
+		PluginDir:                 input.PluginDir,
+		SystemdUnitName:           "mysqld",
+		SystemdContent:            string(renderedSystemd),
+		LimitsPath:                "/etc/security/limits.d/mysql.conf",
+		LimitsContent:             string(renderedLimits),
+		SysctlPath:                "/etc/sysctl.d/99-gmha-mysql.conf",
+		SysctlContent:             string(renderedSysctl),
+		EnvFilePath:               "/etc/profile.d/mysql.sh",
+		EnvContent:                string(renderedEnv),
+		InstallPTTools:            req.InstallPTTools,
+		PTToolsPackageName:        ptPackageName,
+		PTToolsPackageDownloadURL: ptPackageDownloadURL,
+		RuntimeParameters:         normalizedRuntimeParameters(req.RuntimeParameters),
+		Accounts:                  accounts,
 	}
 	specJSON, _ := json.Marshal(spec)
 
@@ -244,7 +298,7 @@ func (u *CreateMySQLInstallTaskUsecase) Execute(ctx context.Context, req CreateM
 		SpecJSON:        specJSON,
 		CreatedAt:       now,
 	}
-	steps := buildMySQLInstallSteps(taskID)
+	steps := buildMySQLInstallSteps(taskID, req.InstallPTTools)
 	events := []taskdomain.Event{{
 		ID:        fmt.Sprintf("task-event-%d", now.UnixNano()),
 		TaskID:    taskID,
@@ -254,6 +308,18 @@ func (u *CreateMySQLInstallTaskUsecase) Execute(ctx context.Context, req CreateM
 		CreatedAt: now,
 	}}
 	return CreateMySQLInstallTaskResult{Task: task, Steps: steps, Events: events}, nil
+}
+
+func normalizedRuntimeParameters(parameters map[string]string) map[string]string {
+	out := make(map[string]string)
+	for name, value := range parameters {
+		name = strings.ToLower(strings.TrimSpace(name))
+		value = strings.TrimSpace(value)
+		if name != "" && value != "" {
+			out[name] = value
+		}
+	}
+	return out
 }
 
 // renderTemplate 使用配置变量渲染指定名称的模板文件。
@@ -266,7 +332,7 @@ func (u *CreateMySQLInstallTaskUsecase) renderTemplate(name string, vars mysqlap
 }
 
 // buildMySQLInstallSteps 构建 MySQL 安装任务的所有步骤。
-func buildMySQLInstallSteps(taskID string) []taskdomain.Step {
+func buildMySQLInstallSteps(taskID string, installPTTools bool) []taskdomain.Step {
 	names := []string{
 		"check_env",
 		"disable_firewall_selinux",
@@ -288,10 +354,15 @@ func buildMySQLInstallSteps(taskID string) []taskdomain.Step {
 		"wait_mysql_ready",
 		"set_root_password",
 		"verify_mysql",
+	}
+	if installPTTools {
+		names = append(names, "install_pt_tools")
+	}
+	names = append(names,
 		"init_accounts",
 		"ensure_heartbeat_table",
 		"setup_agent_collect_config",
-	}
+	)
 	steps := make([]taskdomain.Step, 0, len(names))
 	now := time.Now().UTC().UnixNano()
 	for i, name := range names {
@@ -301,10 +372,43 @@ func buildMySQLInstallSteps(taskID string) []taskdomain.Step {
 			StepNo:   i + 1,
 			StepName: name,
 			Status:   taskdomain.StepPending,
-			Message:  "等待 Agent 执行",
+			Message:  mysqlInstallStepMessage(name),
 		})
 	}
 	return steps
+}
+
+func mysqlInstallStepMessage(name string) string {
+	labels := map[string]string{
+		"check_env":                  "检查安装环境",
+		"disable_firewall_selinux":   "关闭防火墙和 SELinux",
+		"uninstall_mariadb":          "清理 MariaDB 冲突包",
+		"install_dependencies":       "安装 MySQL 依赖",
+		"optimize_limits":            "优化系统资源限制",
+		"optimize_sysctl":            "优化内核参数",
+		"create_mysql_user":          "创建 MySQL 系统用户",
+		"create_directories":         "创建实例目录",
+		"upload_mysql_package":       "下载 MySQL 安装包",
+		"extract_mysql":              "解压 MySQL",
+		"create_symlink":             "创建安装目录链接",
+		"check_mysql_binary":         "验证 MySQL 二进制",
+		"setup_env":                  "配置 MySQL 环境变量",
+		"generate_mycnf":             "生成 my.cnf",
+		"generate_systemd":           "生成 systemd 服务",
+		"initialize_mysql":           "初始化 MySQL 数据目录",
+		"start_mysql":                "启动 MySQL",
+		"wait_mysql_ready":           "等待 MySQL 就绪",
+		"set_root_password":          "设置 root 密码",
+		"verify_mysql":               "验证 MySQL 服务",
+		"install_pt_tools":           "安装 PT 工具（Percona Toolkit）",
+		"init_accounts":              "创建数据库用户并授权",
+		"ensure_heartbeat_table":     "初始化心跳表",
+		"setup_agent_collect_config": "配置 Agent 采集",
+	}
+	if label := labels[name]; label != "" {
+		return label
+	}
+	return "等待 Agent 执行"
 }
 
 // normalizeInstallAccounts 对安装任务中的账户规格进行标准化处理。
@@ -318,6 +422,7 @@ func normalizeInstallAccounts(input []taskdomain.MySQLAccountSpec) []taskdomain.
 			Host:           item.Host,
 			Enabled:        item.Enabled,
 			ExtendedBackup: item.ExtendedBackup,
+			Privileges:     item.Privileges,
 		})
 	}
 	normalized := mysqlapp.NormalizeAccountSpecs(items)
@@ -330,6 +435,7 @@ func normalizeInstallAccounts(input []taskdomain.MySQLAccountSpec) []taskdomain.
 			Host:           item.Host,
 			Enabled:        item.Enabled,
 			ExtendedBackup: item.ExtendedBackup,
+			Privileges:     item.Privileges,
 		})
 	}
 	return out

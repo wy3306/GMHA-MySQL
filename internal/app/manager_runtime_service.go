@@ -4,6 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +23,8 @@ type ManagerRuntimeConfig struct {
 	ListenHTTP       string `json:"listen_http"`
 	ListenGRPC       string `json:"listen_grpc"`
 	DBPath           string `json:"db_path"`
+	DatabaseDriver   string `json:"database_driver"`
+	DatabaseDSN      string `json:"database_dsn"`
 	ManagerPublicKey string `json:"manager_public_key"`
 	AgentBinaryPath  string `json:"agent_binary_path"`
 	ManagerHTTPAddr  string `json:"manager_http_addr"`
@@ -31,6 +37,7 @@ type ManagerRuntimeStatus struct {
 	PID       int                  `json:"pid"`
 	StartedAt time.Time            `json:"started_at"`
 	LogPath   string               `json:"log_path"`
+	Discovery string               `json:"discovery"`
 	Config    ManagerRuntimeConfig `json:"config"`
 }
 
@@ -47,6 +54,7 @@ type managerRuntimeState struct {
 type ManagerRuntimeService struct {
 	statePath     string
 	defaultConfig ManagerRuntimeConfig
+	healthClient  *http.Client
 }
 
 // NewManagerRuntimeService 创建 Manager 运行时服务实例，状态文件保存在 ~/.gmha/ 目录下。
@@ -54,11 +62,14 @@ func NewManagerRuntimeService(cfg Config) *ManagerRuntimeService {
 	home, _ := os.UserHomeDir()
 	base := filepath.Join(home, ".gmha")
 	return &ManagerRuntimeService{
-		statePath: filepath.Join(base, "manager-runtime.json"),
+		statePath:    filepath.Join(base, "manager-runtime.json"),
+		healthClient: &http.Client{Timeout: 1200 * time.Millisecond},
 		defaultConfig: normalizeManagerRuntimeConfig(ManagerRuntimeConfig{
 			ListenHTTP:       ":8080",
 			ListenGRPC:       ":9100",
 			DBPath:           cfg.DBPath,
+			DatabaseDriver:   cfg.DatabaseDriver,
+			DatabaseDSN:      cfg.DatabaseDSN,
 			ManagerPublicKey: cfg.ManagerPublicKey,
 			AgentBinaryPath:  cfg.AgentBinaryPath,
 			ManagerHTTPAddr:  cfg.ManagerHTTPAddr,
@@ -74,9 +85,20 @@ func (s *ManagerRuntimeService) GetStatus(ctx context.Context) (ManagerRuntimeSt
 		return ManagerRuntimeStatus{}, err
 	}
 	if !ok {
+		if s.managerHealthy(ctx, s.defaultConfig) {
+			return ManagerRuntimeStatus{Running: true, Discovery: "health", Config: s.defaultConfig}, nil
+		}
 		return ManagerRuntimeStatus{Config: s.defaultConfig}, nil
 	}
 	running := processRunning(state.PID)
+	if running && state.PID != os.Getpid() && time.Since(state.StartedAt) > 3*time.Second {
+		// Kill(pid, 0) 对僵尸进程也会成功。启动宽限期之后以 HTTP 健康检查
+		// 作为最终依据，避免控制台把监听失败后退出的 Manager 显示为运行中。
+		running = s.managerHealthy(ctx, state.Config)
+	}
+	if !running && s.managerHealthy(ctx, state.Config) {
+		return ManagerRuntimeStatus{Running: true, Discovery: "health", LogPath: state.LogPath, Config: normalizeManagerRuntimeConfig(state.Config)}, nil
+	}
 	if !running {
 		return ManagerRuntimeStatus{Config: normalizeManagerRuntimeConfig(state.Config), LogPath: state.LogPath}, nil
 	}
@@ -85,12 +107,134 @@ func (s *ManagerRuntimeService) GetStatus(ctx context.Context) (ManagerRuntimeSt
 		PID:       state.PID,
 		StartedAt: state.StartedAt,
 		LogPath:   state.LogPath,
+		Discovery: "state",
 		Config:    normalizeManagerRuntimeConfig(state.Config),
 	}, nil
 }
 
+// RegisterCurrentProcess 登记当前 serve 进程。无论 Manager 是由控制台、systemd
+// 还是直接执行 gmha serve 启动，CLI 和 Web 控制台都能发现同一运行实例。
+func (s *ManagerRuntimeService) RegisterCurrentProcess(cfg ManagerRuntimeConfig) error {
+	cfg = normalizeManagerRuntimeConfig(cfg)
+	if err := validateManagerRuntimeConfig(cfg); err != nil {
+		return err
+	}
+	state, ok, err := s.loadState()
+	if err != nil {
+		return err
+	}
+	logPath := ""
+	if ok && state.PID == os.Getpid() {
+		logPath = state.LogPath
+	}
+	return s.persistState(managerRuntimeState{
+		PID: os.Getpid(), StartedAt: time.Now().UTC(), LogPath: logPath, Config: cfg,
+	})
+}
+
+// AdoptCurrentProcess makes the process serving the Web console authoritative.
+// A request cannot reach Manager's own API unless that Manager is running, so
+// stale PID files or an advertised address which is not locally routable must
+// not make the Web console report "stopped" and try to bind the same ports again.
+func (s *ManagerRuntimeService) AdoptCurrentProcess() (ManagerRuntimeStatus, error) {
+	state, ok, err := s.loadState()
+	if err != nil {
+		return ManagerRuntimeStatus{}, err
+	}
+	if !ok {
+		state.Config = s.defaultConfig
+	}
+	if state.PID != os.Getpid() {
+		state.PID = os.Getpid()
+		state.StartedAt = time.Now().UTC()
+		// A log path from another stale process is misleading for a directly
+		// started Manager. Preserve it only when it actually exists.
+		if state.LogPath != "" {
+			if _, statErr := os.Stat(state.LogPath); statErr != nil {
+				state.LogPath = ""
+			}
+		}
+		if err := s.persistState(state); err != nil {
+			return ManagerRuntimeStatus{}, err
+		}
+	}
+	return ManagerRuntimeStatus{
+		Running: true, PID: os.Getpid(), StartedAt: state.StartedAt,
+		LogPath: state.LogPath, Discovery: "current", Config: normalizeManagerRuntimeConfig(state.Config),
+	}, nil
+}
+
+// TestDatabase 验证所选数据库驱动和连接串，不执行迁移或切换。
+func (s *ManagerRuntimeService) TestDatabase(ctx context.Context, cfg ManagerRuntimeConfig) error {
+	cfg = normalizeManagerRuntimeConfig(cfg)
+	if err := validateManagerDatabaseConfig(cfg); err != nil {
+		return err
+	}
+	db, _, err := openDatabase(Config{DBPath: cfg.DBPath, DatabaseDriver: cfg.DatabaseDriver, DatabaseDSN: cfg.DatabaseDSN})
+	if err != nil {
+		return fmt.Errorf("数据库连接失败: %w", err)
+	}
+	defer db.Close()
+	return db.PingContext(ctx)
+}
+
+func (s *ManagerRuntimeService) managerHealthy(ctx context.Context, cfg ManagerRuntimeConfig) bool {
+	endpoint, err := managerHealthURL(cfg.ManagerHTTPAddr)
+	if err != nil {
+		return false
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return false
+	}
+	client := s.healthClient
+	if client == nil {
+		client = &http.Client{Timeout: 1200 * time.Millisecond}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	var result struct {
+		Status string `json:"status"`
+	}
+	return json.Unmarshal(body, &result) == nil && result.Status == "ok"
+}
+
+func managerHealthURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", errors.New("empty manager address")
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "http://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	if u.Hostname() == "0.0.0.0" || u.Hostname() == "::" {
+		port := u.Port()
+		u.Host = "127.0.0.1"
+		if port != "" {
+			u.Host += ":" + port
+		}
+	}
+	u.Path, u.RawQuery, u.Fragment = "/api/v1/healthz", "", ""
+	return u.String(), nil
+}
+
 // SaveConfig 保存 Manager 启动配置到磁盘（不重启进程）。
 func (s *ManagerRuntimeService) SaveConfig(ctx context.Context, cfg ManagerRuntimeConfig) error {
+	cfg = normalizeManagerRuntimeConfig(cfg)
+	if err := validateManagerRuntimeConfig(cfg); err != nil {
+		return err
+	}
 	state, _, err := s.loadOrDefault(cfg)
 	if err != nil {
 		return err
@@ -113,6 +257,60 @@ func (s *ManagerRuntimeService) Start(ctx context.Context, cfg ManagerRuntimeCon
 	if err := validateManagerRuntimeConfig(cfg); err != nil {
 		return ManagerRuntimeStatus{}, err
 	}
+	return s.launch(cfg, 0)
+}
+
+// IsCurrentProcess reports whether the runtime state points at this HTTP server.
+func (s *ManagerRuntimeService) IsCurrentProcess() bool {
+	state, ok, err := s.loadState()
+	return err == nil && ok && state.PID == os.Getpid()
+}
+
+// RestartCurrentProcess starts a replacement which waits for this process to
+// release its listeners. The delayed SIGTERM gives the HTTP handler time to
+// return a successful response to the console.
+func (s *ManagerRuntimeService) RestartCurrentProcess(cfg ManagerRuntimeConfig) (ManagerRuntimeStatus, error) {
+	cfg = normalizeManagerRuntimeConfig(cfg)
+	if err := validateManagerRuntimeConfig(cfg); err != nil {
+		return ManagerRuntimeStatus{}, err
+	}
+	status, err := s.launch(cfg, os.Getpid())
+	if err != nil {
+		return ManagerRuntimeStatus{}, err
+	}
+	signalCurrentProcessAfterDelay()
+	return status, nil
+}
+
+// StopCurrentProcess records the stopped state, then terminates this Manager
+// after the API response has had time to flush.
+func (s *ManagerRuntimeService) StopCurrentProcess() (ManagerRuntimeStatus, error) {
+	state, ok, err := s.loadState()
+	if err != nil {
+		return ManagerRuntimeStatus{}, err
+	}
+	if !ok || state.PID != os.Getpid() {
+		return ManagerRuntimeStatus{}, errors.New("当前 Manager 未登记为受控进程")
+	}
+	state.PID = 0
+	state.StartedAt = time.Time{}
+	if err := s.persistState(state); err != nil {
+		return ManagerRuntimeStatus{}, err
+	}
+	signalCurrentProcessAfterDelay()
+	return ManagerRuntimeStatus{Config: normalizeManagerRuntimeConfig(state.Config), LogPath: state.LogPath}, nil
+}
+
+func signalCurrentProcessAfterDelay() {
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		if process, err := os.FindProcess(os.Getpid()); err == nil {
+			_ = process.Signal(syscall.SIGTERM)
+		}
+	}()
+}
+
+func (s *ManagerRuntimeService) launch(cfg ManagerRuntimeConfig, waitForPID int) (ManagerRuntimeStatus, error) {
 
 	exePath, err := os.Executable()
 	if err != nil {
@@ -134,15 +332,22 @@ func (s *ManagerRuntimeService) Start(ctx context.Context, cfg ManagerRuntimeCon
 		"--listen", cfg.ListenHTTP,
 		"--grpc-listen", cfg.ListenGRPC,
 		"--db", cfg.DBPath,
+		"--db-driver", cfg.DatabaseDriver,
 		"--agent-binary", cfg.AgentBinaryPath,
 		"--manager-http-addr", cfg.ManagerHTTPAddr,
 		"--manager-grpc-addr", cfg.ManagerGRPCAddr,
+	}
+	if strings.TrimSpace(cfg.DatabaseDSN) != "" {
+		args = append(args, "--db-dsn", cfg.DatabaseDSN)
 	}
 	if strings.TrimSpace(cfg.ManagerPublicKey) != "" {
 		args = append(args, "--manager-pubkey", cfg.ManagerPublicKey)
 	}
 
 	cmd := exec.Command(exePath, args...)
+	if waitForPID > 0 {
+		cmd.Env = append(os.Environ(), "GMHA_WAIT_FOR_PID="+strconv.Itoa(waitForPID))
+	}
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.Stdin = nil
@@ -150,9 +355,13 @@ func (s *ManagerRuntimeService) Start(ctx context.Context, cfg ManagerRuntimeCon
 	if err := cmd.Start(); err != nil {
 		return ManagerRuntimeStatus{}, err
 	}
+	pid := cmd.Process.Pid
+	// The daemon is intentionally independent from the console process. Release
+	// prevents an exited child from remaining as a zombie and being misdetected.
+	_ = cmd.Process.Release()
 
 	state := managerRuntimeState{
-		PID:       cmd.Process.Pid,
+		PID:       pid,
 		StartedAt: time.Now().UTC(),
 		LogPath:   logPath,
 		Config:    cfg,
@@ -162,7 +371,14 @@ func (s *ManagerRuntimeService) Start(ctx context.Context, cfg ManagerRuntimeCon
 	}
 
 	time.Sleep(300 * time.Millisecond)
-	return s.GetStatus(ctx)
+	status, err := s.GetStatus(context.Background())
+	if err != nil {
+		return ManagerRuntimeStatus{}, err
+	}
+	if !status.Running {
+		return status, fmt.Errorf("manager 启动后立即退出，请检查日志 %s", logPath)
+	}
+	return status, nil
 }
 
 // Stop 停止 Manager 后台进程，先发送 SIGTERM，超时后发送 SIGKILL。
@@ -268,6 +484,16 @@ func normalizeManagerRuntimeConfig(cfg ManagerRuntimeConfig) ManagerRuntimeConfi
 	if strings.TrimSpace(cfg.DBPath) == "" {
 		cfg.DBPath = "./data/manager.db"
 	}
+	if strings.TrimSpace(cfg.DatabaseDriver) == "" {
+		cfg.DatabaseDriver = "sqlite"
+	}
+	cfg.DatabaseDriver = strings.ToLower(strings.TrimSpace(cfg.DatabaseDriver))
+	if cfg.DatabaseDriver == "sqlite3" {
+		cfg.DatabaseDriver = "sqlite"
+	}
+	if cfg.DatabaseDriver == "postgresql" {
+		cfg.DatabaseDriver = "postgres"
+	}
 	if strings.TrimSpace(cfg.AgentBinaryPath) == "" {
 		cfg.AgentBinaryPath = "./bin/agentd"
 	}
@@ -287,6 +513,12 @@ func sanitizeManagerRuntimeConfig(cfg ManagerRuntimeConfig) ManagerRuntimeConfig
 	}
 	if looksLikePromptGarbage(cfg.DBPath) {
 		cfg.DBPath = ""
+	}
+	if looksLikePromptGarbage(cfg.DatabaseDriver) {
+		cfg.DatabaseDriver = ""
+	}
+	if looksLikePromptGarbage(cfg.DatabaseDSN) {
+		cfg.DatabaseDSN = ""
 	}
 	if looksLikePromptGarbage(cfg.ManagerPublicKey) {
 		cfg.ManagerPublicKey = ""
@@ -335,8 +567,8 @@ func validateManagerRuntimeConfig(cfg ManagerRuntimeConfig) error {
 	if strings.TrimSpace(cfg.ListenGRPC) == "" {
 		return errors.New("gRPC 监听地址不能为空")
 	}
-	if strings.TrimSpace(cfg.DBPath) == "" {
-		return errors.New("数据库路径不能为空")
+	if err := validateManagerDatabaseConfig(cfg); err != nil {
+		return err
 	}
 	if strings.TrimSpace(cfg.AgentBinaryPath) == "" {
 		return errors.New("Agent 二进制路径不能为空")
@@ -349,6 +581,22 @@ func validateManagerRuntimeConfig(cfg ManagerRuntimeConfig) error {
 	}
 	if strings.HasPrefix(cfg.ManagerGRPCAddr, "127.0.0.1:") || strings.HasPrefix(cfg.ManagerGRPCAddr, "localhost:") {
 		return errors.New("Manager gRPC 地址不能使用 127.0.0.1 或 localhost，目标主机上的 Agent 无法访问")
+	}
+	return nil
+}
+
+func validateManagerDatabaseConfig(cfg ManagerRuntimeConfig) error {
+	switch strings.ToLower(strings.TrimSpace(cfg.DatabaseDriver)) {
+	case "sqlite", "sqlite3":
+		if strings.TrimSpace(cfg.DBPath) == "" && strings.TrimSpace(cfg.DatabaseDSN) == "" {
+			return errors.New("SQLite 数据库路径不能为空")
+		}
+	case "mysql", "postgres", "postgresql":
+		if strings.TrimSpace(cfg.DatabaseDSN) == "" {
+			return fmt.Errorf("%s 数据库连接串不能为空", cfg.DatabaseDriver)
+		}
+	default:
+		return fmt.Errorf("不支持的数据库驱动 %q，可选 sqlite、mysql、postgres", cfg.DatabaseDriver)
 	}
 	return nil
 }
@@ -381,10 +629,19 @@ func (s *ManagerRuntimeService) DescribeStatus(ctx context.Context) (map[string]
 		"gRPC监听":   status.Config.ListenGRPC,
 		"HTTP地址":   status.Config.ManagerHTTPAddr,
 		"gRPC地址":   status.Config.ManagerGRPCAddr,
-		"数据库":      status.Config.DBPath,
+		"数据库":      status.Config.DatabaseDriver + ": " + firstNonEmpty(status.Config.DatabaseDSN, status.Config.DBPath),
 		"Agent二进制": status.Config.AgentBinaryPath,
 		"日志文件":     emptyStringAsDash(status.LogPath),
 	}, nil
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func emptyStringAsDash(v string) string {

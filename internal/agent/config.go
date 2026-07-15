@@ -21,6 +21,8 @@ type Config struct {
 	ManagerMode       string
 	ManagerHTTPAddr   string
 	ManagerGRPCAddr   string
+	ManagerHTTPAddrs  []string
+	ManagerGRPCAddrs  []string
 	HeartbeatInterval time.Duration
 	Token             string
 }
@@ -87,6 +89,14 @@ func LoadConfig(path string) (Config, error) {
 			cfg.ManagerHTTPAddr = fmt.Sprintf("http://%s:8080", host)
 		}
 	}
+	cfg.ManagerHTTPAddrs = splitAddresses(cfg.ManagerHTTPAddr)
+	cfg.ManagerGRPCAddrs = splitAddresses(cfg.ManagerGRPCAddr)
+	if len(cfg.ManagerHTTPAddrs) > 0 {
+		cfg.ManagerHTTPAddr = cfg.ManagerHTTPAddrs[0]
+	}
+	if len(cfg.ManagerGRPCAddrs) > 0 {
+		cfg.ManagerGRPCAddr = cfg.ManagerGRPCAddrs[0]
+	}
 	if cfg.InstallDir == "" {
 		cfg.InstallDir = filepath.Dir(path)
 	}
@@ -94,4 +104,17 @@ func LoadConfig(path string) (Config, error) {
 		return Config{}, errors.New("agent config requires agent_id, machine_id, machine_ip, manager_http_addr and manager_grpc_addr")
 	}
 	return cfg, nil
+}
+
+func splitAddresses(value string) []string {
+	seen := map[string]bool{}
+	items := make([]string, 0, 2)
+	for _, part := range strings.Split(value, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" && !seen[part] {
+			seen[part] = true
+			items = append(items, part)
+		}
+	}
+	return items
 }

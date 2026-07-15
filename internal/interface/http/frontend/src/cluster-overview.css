@@ -1,0 +1,287 @@
+/* 集群详情使用独立的二级页面：概览只展示拓扑，机器页承载机器与 MySQL 运维。 */
+.cluster-dashboard.cluster-overview-mode .cluster-machine-mysql { display: none !important; }
+.cluster-dashboard.cluster-machine-mode .topology-workspace { display: none !important; }
+.cluster-dashboard.cluster-machine-mode .cluster-machine-mysql { display: block !important; width: 100% !important; margin: 0 !important; }
+.cluster-dashboard.cluster-machine-mode .cluster-detail-head,
+.cluster-dashboard.cluster-machine-mode .cluster-detail-hero,
+.cluster-dashboard.cluster-machine-mode .cluster-detail-summary { display: none !important; }
+/* 机器页只展示机器资产与 Agent；MySQL 生命周期操作移至“实例管理”。 */
+/* 实例管理是独立子页，只呈现实例拓扑与实例运维入口，不复用集群概览头部。 */
+.cluster-dashboard.cluster-instance-mode .cluster-detail-head,
+.cluster-dashboard.cluster-instance-mode .cluster-detail-hero,
+.cluster-dashboard.cluster-instance-mode .cluster-detail-summary { display: none !important; }
+.cluster-dashboard.cluster-instance-mode .cluster-machine-mysql { display: none !important; }
+.cluster-dashboard.cluster-instance-mode .topology-workspace { display: none !important; }
+
+/* 概览页采用固定的字号层级，避免被历史全局面板样式反复覆盖。 */
+.cluster-dashboard.cluster-overview-mode {
+  color: #1f2f46;
+  font-size: 14px;
+}
+
+.cluster-dashboard.cluster-overview-mode .cluster-detail-head {
+  min-height: 32px;
+  margin: 0 0 10px;
+}
+
+.cluster-dashboard.cluster-overview-mode .back-button {
+  padding: 5px 2px;
+  color: #60728a;
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.cluster-dashboard.cluster-overview-mode .cluster-detail-hero {
+  min-height: 0 !important;
+  padding: 18px 22px !important;
+}
+
+.cluster-dashboard.cluster-overview-mode .cluster-detail-title p {
+  margin: 0 0 5px;
+  font-size: 10px;
+  line-height: 14px;
+  letter-spacing: 1px;
+}
+
+.cluster-dashboard.cluster-overview-mode .cluster-detail-title h2 {
+  margin: 0;
+  font-size: 24px !important;
+  font-weight: 700;
+  line-height: 30px;
+  letter-spacing: -.02em;
+}
+
+.cluster-dashboard.cluster-overview-mode .cluster-detail-title span {
+  display: block;
+  margin-top: 4px;
+  font-size: 13px !important;
+  line-height: 20px;
+}
+
+.cluster-dashboard.cluster-overview-mode .cluster-detail-summary {
+  gap: 12px;
+  margin: 12px 0;
+}
+
+.cluster-dashboard.cluster-overview-mode .cluster-detail-summary article {
+  display: flex;
+  min-height: 76px;
+  padding: 13px 17px;
+  justify-content: center;
+  flex-direction: column;
+}
+
+.cluster-dashboard.cluster-overview-mode .cluster-detail-summary article small {
+  color: #71839b;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 18px;
+}
+
+.cluster-dashboard.cluster-overview-mode .cluster-detail-summary article b {
+  margin-top: 3px;
+  color: #1f2f46;
+  font-size: 25px;
+  font-weight: 700;
+  line-height: 31px;
+}
+
+.cluster-dashboard.cluster-overview-mode .cluster-detail-summary article strong {
+  margin-top: 5px;
+  color: #34465e;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 20px;
+  white-space: nowrap;
+}
+
+.cluster-dashboard.cluster-overview-mode .topology-workspace {
+  display: block !important;
+  width: 100% !important;
+  margin: 0 !important;
+  border-radius: 8px;
+}
+
+.cluster-dashboard.cluster-overview-mode .live-topology-head {
+  min-height: 68px;
+  padding: 14px 18px;
+  align-items: center;
+  gap: 24px;
+}
+
+.cluster-dashboard.cluster-overview-mode .live-topology-head > div:first-child {
+  min-width: 260px;
+}
+
+.cluster-dashboard.cluster-overview-mode .live-topology-head h3 {
+  color: #24364d;
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 22px;
+}
+
+.cluster-dashboard.cluster-overview-mode .live-topology-head p {
+  margin-top: 3px;
+  color: #7b8ba0;
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.cluster-dashboard.cluster-overview-mode .live-topology-controls {
+  margin-left: auto;
+  gap: 8px;
+}
+
+.cluster-dashboard.cluster-overview-mode .live-topology-controls > small,
+.cluster-dashboard.cluster-overview-mode .live-dot,
+.cluster-dashboard.cluster-overview-mode .auto-refresh-toggle {
+  font-size: 11px;
+  line-height: 18px;
+}
+
+.cluster-dashboard.cluster-overview-mode .auto-refresh-toggle {
+  min-height: 30px;
+  padding: 0 10px;
+  border-radius: 5px;
+}
+
+.cluster-dashboard.cluster-overview-mode .live-topology-controls .icon-button {
+  width: 32px;
+  height: 32px;
+  border: 1px solid #dce4ee;
+  border-radius: 5px;
+  font-size: 17px;
+  box-shadow: none;
+}
+
+/* 空状态按“说明 → 步骤 → 操作”排列，避免标题和正文粘连。 */
+.cluster-dashboard.cluster-overview-mode .topology-empty-rich {
+  display: flex;
+  min-height: 280px;
+  padding: 38px 40px;
+  align-items: flex-start;
+  justify-content: center;
+  flex-direction: column;
+  background: linear-gradient(180deg, #fff 0%, #fbfcff 100%);
+  text-align: left;
+}
+
+.cluster-dashboard.cluster-overview-mode .topology-empty-copy {
+  display: grid;
+  max-width: 760px;
+  grid-template-columns: 44px minmax(0, 1fr);
+  align-items: center;
+  gap: 14px;
+}
+
+.cluster-dashboard.cluster-overview-mode .topology-empty-icon {
+  width: 44px;
+  height: 44px;
+  border-radius: 10px;
+  font-size: 22px;
+}
+
+.cluster-dashboard.cluster-overview-mode .topology-empty-copy b,
+.cluster-dashboard.cluster-overview-mode .topology-empty-copy small {
+  display: block;
+}
+
+.cluster-dashboard.cluster-overview-mode .topology-empty-copy b {
+  margin: 0 0 3px;
+  color: #23344c;
+  font-size: 17px;
+  font-weight: 700;
+  line-height: 24px;
+}
+
+.cluster-dashboard.cluster-overview-mode .topology-empty-copy small {
+  color: #6f8097;
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.cluster-dashboard.cluster-overview-mode .topology-next-steps {
+  display: grid;
+  width: min(100%, 760px);
+  margin: 22px 0 18px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.cluster-dashboard.cluster-overview-mode .topology-next-steps span {
+  min-width: 0;
+  min-height: 42px;
+  padding: 9px 11px;
+  color: #52657e;
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.cluster-dashboard.cluster-overview-mode .topology-next-steps i {
+  flex: none;
+  width: 18px;
+  height: 18px;
+}
+
+.cluster-dashboard.cluster-overview-mode .topology-empty-actions {
+  gap: 10px;
+}
+
+.cluster-dashboard.cluster-overview-mode .topology-empty-actions button {
+  min-height: 34px;
+  padding: 7px 13px;
+  border-radius: 5px;
+  font-size: 12px;
+  line-height: 18px;
+}
+
+@media (max-width: 1100px) {
+  .cluster-dashboard.cluster-overview-mode .cluster-detail-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 980px) {
+  .cluster-dashboard.cluster-overview-mode .live-topology-head {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .cluster-dashboard.cluster-overview-mode .live-topology-controls {
+    width: 100%;
+    margin-left: 0;
+    justify-content: flex-start;
+  }
+}
+
+@media (max-width: 760px) {
+  .cluster-dashboard.cluster-overview-mode .topology-empty-rich {
+    min-height: 0;
+    padding: 28px 20px;
+  }
+
+  .cluster-dashboard.cluster-overview-mode .topology-next-steps {
+    grid-template-columns: 1fr;
+    gap: 7px;
+  }
+}
+
+@media (max-width: 560px) {
+  .cluster-dashboard.cluster-overview-mode .cluster-detail-summary {
+    grid-template-columns: 1fr;
+  }
+
+  .cluster-dashboard.cluster-overview-mode .topology-empty-copy {
+    grid-template-columns: 1fr;
+  }
+
+  .cluster-dashboard.cluster-overview-mode .topology-empty-actions {
+    width: 100%;
+    flex-direction: column;
+  }
+
+  .cluster-dashboard.cluster-overview-mode .topology-empty-actions button {
+    width: 100%;
+  }
+}

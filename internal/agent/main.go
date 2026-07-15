@@ -3,10 +3,12 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	agentcollect "gmha/internal/agent/collect"
@@ -26,24 +28,20 @@ import (
 // Run 启动代理主循环，包括注册任务处理器、建立 gRPC 心跳流、启动动态指标采集，并定时发送心跳包。
 func Run(ctx context.Context, cfg Config) error {
 	dispatcher := agentcore.NewDispatcher(
-		agenthandler.NewExecHandler(),
+		agenthandler.NewExecHandler(cfg.ManagerHTTPAddr),
+		agenthandler.NewMySQLUpgradeHandler(cfg.ManagerHTTPAddr),
 		agenthandler.NewCollectMachineInfoHandler(agentcollect.NewMachineCollector()),
 		agenthandler.NewCollectStaticInfoHandler(agentcollect.NewStaticCollector(cfg.InstallDir)),
 		agenthandler.NewMySQLInstallHandler(cfg.ManagerHTTPAddr, cfg.InstallDir),
 		agenthandler.NewMySQLUninstallHandler(cfg.InstallDir),
 		agenthandler.NewMySQLTopologyHandler(),
 	)
-	receiver := agentcore.NewReceiver(cfg.ManagerHTTPAddr, cfg.AgentID, cfg.MachineID, dispatcher)
+	receiver := agentcore.NewReceiver(strings.Join(cfg.ManagerHTTPAddrs, ","), cfg.AgentID, cfg.MachineID, dispatcher)
 	go func() {
 		_ = receiver.Run(ctx)
 	}()
 
-	conn, err := grpc.DialContext(
-		ctx,
-		cfg.ManagerGRPCAddr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.ForceCodec(hbgrpc.JSONCodec{})),
-	)
+	conn, err := dialManager(ctx, cfg.ManagerGRPCAddrs)
 	if err != nil {
 		return err
 	}
@@ -132,6 +130,29 @@ func Run(ctx context.Context, cfg Config) error {
 		case <-ticker.C:
 		}
 	}
+}
+
+// dialManager 顺序尝试 Manager 地址候选。候选由安装端根据同网段与所有活动网卡生成；
+// 显式 DNS 地址也会保留，因此 Manager IP 变化后 Agent 重启即可重新解析并接入。
+func dialManager(ctx context.Context, candidates []string) (*grpc.ClientConn, error) {
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("manager_grpc_addr is required")
+	}
+	var failures []string
+	for _, target := range candidates {
+		dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		conn, err := grpc.DialContext(dialCtx, target,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithDefaultCallOptions(grpc.ForceCodec(hbgrpc.JSONCodec{})),
+			grpc.WithBlock(),
+		)
+		cancel()
+		if err == nil {
+			return conn, nil
+		}
+		failures = append(failures, target+": "+err.Error())
+	}
+	return nil, fmt.Errorf("all manager grpc addresses unavailable: %s", strings.Join(failures, "; "))
 }
 
 // mapChecks 将领域层健康检查结果转换为 gRPC 心跳协议的健康检查格式。

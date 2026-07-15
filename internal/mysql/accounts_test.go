@@ -26,6 +26,22 @@ func TestNormalizeAccountSpecsDefaults(t *testing.T) {
 	}
 }
 
+func TestNormalizeAccountSpecsKeepsMultipleCustomUsers(t *testing.T) {
+	items := NormalizeAccountSpecs([]AccountSpec{
+		{Role: "custom_app", Username: "app_user", Password: "secret-1", Host: "10.0.0.%", Enabled: true, Privileges: []string{"SELECT"}},
+		{Role: "custom_report", Username: "report_user", Password: "secret-2", Host: "10.0.1.%", Enabled: true, Privileges: []string{"SELECT", "SHOW VIEW"}},
+	})
+	if len(items) != 5 {
+		t.Fatalf("expected 3 preset and 2 custom accounts, got %d", len(items))
+	}
+	if items[3].Username != "app_user" || items[4].Username != "report_user" {
+		t.Fatalf("custom account order or names changed: %#v", items[3:])
+	}
+	if err := ValidateAccountSpecs(items); err != nil {
+		t.Fatalf("custom accounts should validate: %v", err)
+	}
+}
+
 // TestNormalizeAccountSpecsOverrideAndDisable 测试账号规格的覆盖和禁用功能。
 func TestNormalizeAccountSpecsOverrideAndDisable(t *testing.T) {
 	items := NormalizeAccountSpecs([]AccountSpec{

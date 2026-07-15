@@ -403,7 +403,7 @@ func (m *MachineMenu) CreateCredential(reader *bufio.Reader) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	item, err := m.core.MachineService.CreateSSHCredential(ctx, name, sshUser, sshPassword)
+	item, err := m.core.MachineService.CreateSSHCredential(ctx, name, sshUser, "password", sshPassword, "", "")
 	if err != nil {
 		return err
 	}

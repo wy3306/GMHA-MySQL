@@ -1,5 +1,34 @@
 # GMHA 架构说明文档
 
+## Web 启动器与 Release 程序包
+
+Release 程序包提供独立的 `gmha-web` 启动器。执行 `./start-web.sh` 后访问 `http://服务器IP:8079`，在启动页点击“启动 Manager”，等待健康检查通过后即可进入完整 GMHA 控制台。程序包同时包含 Manager、内嵌前端和可部署到受管机器的 Agent，不要求目标机器安装 Go 或 Node.js。
+
+本地构建 Linux x86_64 程序包：
+
+```bash
+./scripts/build-release.sh v0.1.0
+```
+
+构建结果位于 `dist/gmha-v0.1.0-linux-amd64.tar.gz`，并同时生成 SHA-256 校验文件。
+
+## 数据库配置
+
+Manager 的元数据存储默认使用 SQLite（无需额外安装服务），也可切换至 MySQL 或 PostgreSQL。三种数据库使用同一套表结构和仓储逻辑；切换前请使用新的空数据库，当前版本不自动迁移已有 SQLite 数据。
+
+```bash
+# 默认：SQLite，数据写入 ./data/manager.db
+./gmha serve
+
+# MySQL：--db-dsn 使用标准 MySQL DSN
+./gmha serve --db-driver mysql --db-dsn 'gmha:password@tcp(127.0.0.1:3306)/gmha?charset=utf8mb4&parseTime=true'
+
+# PostgreSQL：--db-dsn 使用 PostgreSQL URL
+./gmha serve --db-driver postgres --db-dsn 'postgres://gmha:password@127.0.0.1:5432/gmha?sslmode=disable'
+```
+
+`--db` 保留为兼容参数：SQLite 时表示数据库文件路径；在 MySQL/PostgreSQL 模式下，如未提供 `--db-dsn`，它将作为连接串使用。
+
 ## 1. 项目概述
 
 **GMHA**（Go MySQL High Availability）是一个用 Go 语言编写的 MySQL 高可用管理平台。它提供了完整的 MySQL 实例生命周期管理能力，包括机器纳管、Agent 部署、MySQL 安装/卸载、心跳监控、自动恢复和计划性故障转移等功能。

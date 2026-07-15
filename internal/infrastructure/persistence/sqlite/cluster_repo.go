@@ -12,10 +12,10 @@ import (
 
 // ClusterRepository 是集群实体的 SQLite 仓储实现。
 type ClusterRepository struct {
-	db *sql.DB
+	db *DB
 }
 
-func NewClusterRepository(db *sql.DB) *ClusterRepository {
+func NewClusterRepository(db *DB) *ClusterRepository {
 	return &ClusterRepository{db: db}
 }
 

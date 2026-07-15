@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"gmha/internal/app"
+	hadomain "gmha/internal/domain/ha"
 )
 
 // HAHandler 是高可用相关 HTTP API 的请求处理器，负责 VIP 管理和故障切换操作。
@@ -27,6 +28,20 @@ func (h *HAHandler) HandleClusterActions(w http.ResponseWriter, r *http.Request)
 	}
 	clusterID := parts[0]
 	switch {
+	case len(parts) == 3 && parts[1] == "vip" && parts[2] == "config" && r.Method == http.MethodGet:
+		items, err := h.ha.ListVIPConfigs(r.Context(), clusterID)
+		writeHAJSON(w, items, err)
+	case len(parts) == 3 && parts[1] == "vip" && parts[2] == "config" && r.Method == http.MethodPost:
+		var req hadomain.ClusterVIPConfig
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeHAError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		item, err := h.ha.SaveVIPConfig(r.Context(), clusterID, req)
+		writeHAJSON(w, item, err)
+	case len(parts) == 3 && parts[1] == "vip" && parts[2] == "config" && r.Method == http.MethodDelete:
+		err := h.ha.DeleteVIPConfig(r.Context(), clusterID, r.URL.Query().Get("vip"))
+		writeHAJSON(w, map[string]bool{"deleted": err == nil}, err)
 	case len(parts) == 3 && parts[1] == "vip" && parts[2] == "status" && r.Method == http.MethodGet:
 		items, err := h.ha.VIP().Status(r.Context(), clusterID)
 		writeHAJSON(w, items, err)
@@ -45,6 +60,36 @@ func (h *HAHandler) HandleClusterActions(w http.ResponseWriter, r *http.Request)
 		writeHAJSON(w, items, err)
 	case len(parts) == 3 && parts[1] == "failover" && parts[2] == "plan" && r.Method == http.MethodPost:
 		item, err := h.ha.PlanFailover(r.Context(), clusterID)
+		writeHAJSON(w, item, err)
+	case len(parts) == 3 && parts[1] == "architecture" && parts[2] == "plan" && r.Method == http.MethodPost:
+		var req hadomain.ArchitectureAdjustmentRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeHAError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		item, err := h.ha.PlanArchitectureAdjustment(r.Context(), clusterID, req)
+		writeHAJSON(w, item, err)
+	case len(parts) == 3 && parts[1] == "architecture" && parts[2] == "start" && r.Method == http.MethodPost:
+		var req hadomain.ArchitectureAdjustmentRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeHAError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		item, err := h.ha.StartArchitectureAdjustment(r.Context(), clusterID, req)
+		writeHAJSON(w, item, err)
+	case len(parts) == 3 && parts[1] == "architecture" && r.Method == http.MethodGet:
+		item, ok, err := h.ha.GetArchitectureRun(r.Context(), clusterID, parts[2])
+		if err != nil {
+			writeHAError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if !ok {
+			writeHAError(w, http.StatusNotFound, "architecture run not found")
+			return
+		}
+		writeHAJSON(w, item, nil)
+	case len(parts) == 4 && parts[1] == "architecture" && parts[3] == "force" && r.Method == http.MethodPost:
+		item, err := h.ha.ConfirmArchitectureForce(r.Context(), clusterID, parts[2])
 		writeHAJSON(w, item, err)
 	case len(parts) == 3 && parts[1] == "failover" && parts[2] == "start" && r.Method == http.MethodPost:
 		item, err := h.ha.StartFailover(r.Context(), clusterID)

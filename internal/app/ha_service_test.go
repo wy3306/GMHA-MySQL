@@ -50,11 +50,11 @@ func TestVIPInterfaceSelectorDoesNotDefaultEth0(t *testing.T) {
 	}
 }
 
-func TestBGPDriverIsNotImplemented(t *testing.T) {
-	driver := NotImplementedVipDriver{Mode: hadomain.VipRouteModeBGP, Message: "BGP VIP driver is not implemented; automatic failover is blocked to avoid unsafe L2 VIP drift across L3 network."}
+func TestBGPDriverRequiresArchitectureStateMachine(t *testing.T) {
+	driver := ArchitectureManagedVIPDriver{Mode: hadomain.VipRouteModeBGP}
 	_, err := driver.Move(context.Background(), MoveVipRequest{VIP: "10.0.0.10", ToInterface: "eth1"})
-	if err == nil || !strings.Contains(err.Error(), "BGP VIP driver is not implemented") {
-		t.Fatalf("expected BGP not implemented error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "architecture adjustment state machine") {
+		t.Fatalf("expected architecture state-machine guard, got %v", err)
 	}
 }
 
@@ -83,6 +83,9 @@ func (f fakeHARepo) ListMachineInterfaces(context.Context, string) ([]hadomain.M
 	return f.ifaces, nil
 }
 func (f fakeHARepo) AcquireFailoverLock(context.Context, string, string, string, time.Duration) error {
+	return errors.New("not implemented")
+}
+func (f fakeHARepo) RenewFailoverLock(context.Context, string, string, time.Duration) error {
 	return errors.New("not implemented")
 }
 func (f fakeHARepo) ReleaseFailoverLock(context.Context, string, string) error {

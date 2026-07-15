@@ -1,0 +1,86 @@
+/* Unified native select controls. Keep semantic <select> behaviour while
+   presenting one consistent control across tables, toolbars and forms. */
+select:not([multiple]):not([size]) {
+  min-height: 36px;
+  padding: 7px 34px 7px 11px !important;
+  border: 1px solid #cbd7e6 !important;
+  border-radius: 6px !important;
+  outline: none;
+  background-color: #fff !important;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1.5 1.5 6 6l4.5-4.5' fill='none' stroke='%2364778f' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") !important;
+  background-repeat: no-repeat !important;
+  background-position: right 11px center !important;
+  background-size: 12px 8px !important;
+  color: #263950;
+  font: inherit;
+  font-size: 13px;
+  line-height: 20px;
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+  transition: border-color .16s ease, box-shadow .16s ease, background-color .16s ease;
+}
+
+select:not([multiple]):not([size]):hover:not(:disabled) {
+  border-color: #8eb9ed !important;
+  background-color: #fbfdff !important;
+}
+
+select:not([multiple]):not([size]):focus,
+select:not([multiple]):not([size]):focus-visible {
+  border-color: #2f7de1 !important;
+  box-shadow: 0 0 0 3px rgb(47 125 225 / 14%);
+}
+
+select:not([multiple]):not([size]):disabled {
+  border-color: #dce4ed !important;
+  background-color: #f3f6f9 !important;
+  color: #94a2b3;
+  cursor: not-allowed;
+  opacity: 1;
+}
+
+select:not([multiple]):not([size]) option,
+select:not([multiple]):not([size]) optgroup {
+  background: #fff;
+  color: #263950;
+  font: inherit;
+}
+
+/* Compact selects used beside row actions and in dense table cells. */
+.alert-event-actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  white-space: nowrap;
+}
+
+.alert-event-actions select:not([multiple]):not([size]) {
+  width: 112px;
+  min-height: 30px !important;
+  height: 30px !important;
+  padding: 4px 28px 4px 9px !important;
+  background-position: right 8px center !important;
+  font-size: 12px;
+}
+
+.alert-event-actions button {
+  flex: none;
+}
+
+.task-toolbar select,
+.agent-list-toolbar select,
+.param-toolbar select {
+  min-height: 34px;
+}
+
+@media (max-width: 720px) {
+  .alert-event-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .alert-event-actions select {
+    width: 100%;
+  }
+}

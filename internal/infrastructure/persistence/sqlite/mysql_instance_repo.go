@@ -11,10 +11,10 @@ import (
 
 // MySQLInstanceRepository 是 MySQL 实例实体的 SQLite 仓储实现。
 type MySQLInstanceRepository struct {
-	db *sql.DB
+	db *DB
 }
 
-func NewMySQLInstanceRepository(db *sql.DB) *MySQLInstanceRepository {
+func NewMySQLInstanceRepository(db *DB) *MySQLInstanceRepository {
 	return &MySQLInstanceRepository{db: db}
 }
 
@@ -34,6 +34,8 @@ func (r *MySQLInstanceRepository) Migrate() error {
 			base_dir text not null,
 			profile text not null default '',
 			package_name text not null default '',
+			version text not null default '',
+			architecture text not null default '',
 			systemd_unit text not null default '',
 			my_cnf_path text not null default '',
 			socket_path text not null default '',
@@ -55,6 +57,8 @@ func (r *MySQLInstanceRepository) Migrate() error {
 		`alter table mysql_instances add column redo_dir text not null default ''`,
 		`alter table mysql_instances add column undo_dir text not null default ''`,
 		`alter table mysql_instances add column tmp_dir text not null default ''`,
+		`alter table mysql_instances add column version text not null default ''`,
+		`alter table mysql_instances add column architecture text not null default ''`,
 	} {
 		_, _ = r.db.Exec(stmt)
 	}
@@ -68,8 +72,8 @@ func (r *MySQLInstanceRepository) Save(ctx context.Context, item mysqlapp.Instan
 	_, err := r.db.ExecContext(ctx, `
 		insert into mysql_instances (
 			machine_id, port, server_id, mysql_user, instance_dir, data_dir, binlog_dir, redo_dir, undo_dir, tmp_dir,
-			base_dir, profile, package_name, systemd_unit, my_cnf_path, socket_path, status, last_task_id, updated_at
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			base_dir, profile, package_name, version, architecture, systemd_unit, my_cnf_path, socket_path, status, last_task_id, updated_at
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		on conflict(machine_id, port) do update set
 			server_id = excluded.server_id,
 			mysql_user = excluded.mysql_user,
@@ -82,20 +86,22 @@ func (r *MySQLInstanceRepository) Save(ctx context.Context, item mysqlapp.Instan
 			base_dir = excluded.base_dir,
 			profile = excluded.profile,
 			package_name = excluded.package_name,
+			version = excluded.version,
+			architecture = excluded.architecture,
 			systemd_unit = excluded.systemd_unit,
 			my_cnf_path = excluded.my_cnf_path,
 			socket_path = excluded.socket_path,
 			status = excluded.status,
 			last_task_id = excluded.last_task_id,
 			updated_at = excluded.updated_at
-	`, item.MachineID, item.Port, item.ServerID, item.MySQLUser, item.InstanceDir, item.DataDir, item.BinlogDir, item.RedoDir, item.UndoDir, item.TmpDir, item.BaseDir, item.Profile, item.PackageName, item.SystemdUnit, item.MyCnfPath, item.SocketPath, item.Status, item.LastTaskID, item.UpdatedAt.UTC().Format(time.RFC3339))
+	`, item.MachineID, item.Port, item.ServerID, item.MySQLUser, item.InstanceDir, item.DataDir, item.BinlogDir, item.RedoDir, item.UndoDir, item.TmpDir, item.BaseDir, item.Profile, item.PackageName, item.Version, item.Architecture, item.SystemdUnit, item.MyCnfPath, item.SocketPath, item.Status, item.LastTaskID, item.UpdatedAt.UTC().Format(time.RFC3339))
 	return err
 }
 
 func (r *MySQLInstanceRepository) List(ctx context.Context) ([]mysqlapp.Instance, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		select machine_id, port, server_id, mysql_user, instance_dir, data_dir, binlog_dir, redo_dir, undo_dir, tmp_dir,
-			base_dir, profile, package_name, systemd_unit, my_cnf_path, socket_path, status, last_task_id, updated_at
+			base_dir, profile, package_name, version, architecture, systemd_unit, my_cnf_path, socket_path, status, last_task_id, updated_at
 		from mysql_instances order by updated_at desc
 	`)
 	if err != nil {
@@ -116,7 +122,7 @@ func (r *MySQLInstanceRepository) List(ctx context.Context) ([]mysqlapp.Instance
 func (r *MySQLInstanceRepository) Get(ctx context.Context, machineID string, port int) (mysqlapp.Instance, bool, error) {
 	row := r.db.QueryRowContext(ctx, `
 		select machine_id, port, server_id, mysql_user, instance_dir, data_dir, binlog_dir, redo_dir, undo_dir, tmp_dir,
-			base_dir, profile, package_name, systemd_unit, my_cnf_path, socket_path, status, last_task_id, updated_at
+			base_dir, profile, package_name, version, architecture, systemd_unit, my_cnf_path, socket_path, status, last_task_id, updated_at
 		from mysql_instances where machine_id = ? and port = ?
 	`, machineID, port)
 	item, err := scanMySQLInstance(row)
@@ -174,9 +180,15 @@ func scanMySQLInstance(scanner interface {
 }) (mysqlapp.Instance, error) {
 	var item mysqlapp.Instance
 	var updatedAt string
-	if err := scanner.Scan(&item.MachineID, &item.Port, &item.ServerID, &item.MySQLUser, &item.InstanceDir, &item.DataDir, &item.BinlogDir, &item.RedoDir, &item.UndoDir, &item.TmpDir, &item.BaseDir, &item.Profile, &item.PackageName, &item.SystemdUnit, &item.MyCnfPath, &item.SocketPath, &item.Status, &item.LastTaskID, &updatedAt); err != nil {
+	if err := scanner.Scan(&item.MachineID, &item.Port, &item.ServerID, &item.MySQLUser, &item.InstanceDir, &item.DataDir, &item.BinlogDir, &item.RedoDir, &item.UndoDir, &item.TmpDir, &item.BaseDir, &item.Profile, &item.PackageName, &item.Version, &item.Architecture, &item.SystemdUnit, &item.MyCnfPath, &item.SocketPath, &item.Status, &item.LastTaskID, &updatedAt); err != nil {
 		return mysqlapp.Instance{}, err
 	}
 	item.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
+	if item.Version == "" {
+		item.Version, _ = mysqlapp.PackageVersion(item.PackageName)
+	}
+	if item.Architecture == "" {
+		item.Architecture, _ = mysqlapp.PackageArchitecture(item.PackageName)
+	}
 	return item, nil
 }

@@ -17,6 +17,9 @@ const (
 	TypeMySQLInstall       Type = "mysql_install"
 	TypeMySQLUninstall     Type = "mysql_uninstall"
 	TypeMySQLTopology      Type = "mysql_topology"
+	TypeMySQLUpgrade       Type = "mysql_upgrade"
+	TypeArchitecture       Type = "architecture_adjustment"
+	TypePlatformOperation  Type = "platform_operation"
 )
 
 type Status string
@@ -85,6 +88,42 @@ type Event struct {
 
 // ExecSpec 是命令执行任务的规格参数。
 type ExecSpec struct {
+	Command         string            `json:"command,omitempty"`
+	Commands        []ExecCommandStep `json:"commands,omitempty"`
+	RollbackCommand string            `json:"rollback_command,omitempty"`
+	Operation       string            `json:"operation,omitempty"`
+	DisplayName     string            `json:"display_name,omitempty"`
+	Port            int               `json:"port,omitempty"`
+	PackageName     string            `json:"package_name,omitempty"`
+}
+
+// PlatformOperationSpec describes a synchronous operation performed through
+// the management platform. RelatedTaskIDs links submission/batch operations to
+// the Agent tasks that continue executing after the HTTP request completes.
+type PlatformOperationSpec struct {
+	Operation      string   `json:"operation"`
+	DisplayName    string   `json:"display_name"`
+	Method         string   `json:"method"`
+	Path           string   `json:"path"`
+	Target         string   `json:"target,omitempty"`
+	HTTPStatus     int      `json:"http_status"`
+	DurationMillis int64    `json:"duration_millis"`
+	RelatedTaskIDs []string `json:"related_task_ids,omitempty"`
+}
+
+type ListQuery struct {
+	Offset   int
+	Limit    int
+	Keyword  string
+	Statuses []Status
+	Types    []Type
+}
+
+// ExecCommandStep allows an exec task to expose a complete, individually
+// logged workflow while remaining compatible with the existing Agent exec
+// capability.
+type ExecCommandStep struct {
+	Name    string `json:"name"`
 	Command string `json:"command"`
 }
 
@@ -105,64 +144,73 @@ type MySQLStaticCollectSpec struct {
 
 // MySQLInstallSpec 是 MySQL 安装任务的规格参数，包含端口、目录、配置、账号等所有安装信息。
 type MySQLInstallSpec struct {
-	Port               int                `json:"port"`
-	ServerID           int                `json:"server_id"`
-	MySQLUser          string             `json:"mysql_user"`
-	InstanceDir        string             `json:"instance_dir"`
-	DataDir            string             `json:"data_dir"`
-	BinlogDir          string             `json:"binlog_dir"`
-	RedoDir            string             `json:"redo_dir"`
-	UndoDir            string             `json:"undo_dir"`
-	TmpDir             string             `json:"tmp_dir"`
-	BaseDir            string             `json:"base_dir"`
-	RootPassword       string             `json:"root_password"`
-	Profile            string             `json:"profile"`
-	PackageName        string             `json:"package_name"`
-	PackageDownloadURL string             `json:"package_download_url"`
-	MyCnfPath          string             `json:"my_cnf_path"`
-	MyCnfContent       string             `json:"my_cnf_content"`
-	SocketPath         string             `json:"socket_path"`
-	ErrorLog           string             `json:"error_log"`
-	PIDFile            string             `json:"pid_file"`
-	CharacterSetsDir   string             `json:"character_sets_dir"`
-	PluginDir          string             `json:"plugin_dir"`
-	SystemdUnitName    string             `json:"systemd_unit_name"`
-	SystemdContent     string             `json:"systemd_content"`
-	LimitsPath         string             `json:"limits_path"`
-	LimitsContent      string             `json:"limits_content"`
-	SysctlPath         string             `json:"sysctl_path"`
-	SysctlContent      string             `json:"sysctl_content"`
-	EnvFilePath        string             `json:"env_file_path"`
-	EnvContent         string             `json:"env_content"`
-	Accounts           []MySQLAccountSpec `json:"accounts"`
+	Port                      int                `json:"port"`
+	ServerID                  int                `json:"server_id"`
+	MySQLUser                 string             `json:"mysql_user"`
+	InstanceDir               string             `json:"instance_dir"`
+	DataDir                   string             `json:"data_dir"`
+	BinlogDir                 string             `json:"binlog_dir"`
+	RedoDir                   string             `json:"redo_dir"`
+	UndoDir                   string             `json:"undo_dir"`
+	TmpDir                    string             `json:"tmp_dir"`
+	BaseDir                   string             `json:"base_dir"`
+	RootPassword              string             `json:"root_password"`
+	Profile                   string             `json:"profile"`
+	PackageName               string             `json:"package_name"`
+	Version                   string             `json:"version"`
+	Architecture              string             `json:"architecture"`
+	PackageDownloadURL        string             `json:"package_download_url"`
+	MyCnfPath                 string             `json:"my_cnf_path"`
+	MyCnfContent              string             `json:"my_cnf_content"`
+	SocketPath                string             `json:"socket_path"`
+	ErrorLog                  string             `json:"error_log"`
+	PIDFile                   string             `json:"pid_file"`
+	CharacterSetsDir          string             `json:"character_sets_dir"`
+	PluginDir                 string             `json:"plugin_dir"`
+	SystemdUnitName           string             `json:"systemd_unit_name"`
+	SystemdContent            string             `json:"systemd_content"`
+	LimitsPath                string             `json:"limits_path"`
+	LimitsContent             string             `json:"limits_content"`
+	SysctlPath                string             `json:"sysctl_path"`
+	SysctlContent             string             `json:"sysctl_content"`
+	EnvFilePath               string             `json:"env_file_path"`
+	EnvContent                string             `json:"env_content"`
+	InstallPTTools            bool               `json:"install_pt_tools,omitempty"`
+	PTToolsPackageName        string             `json:"pt_tools_package_name,omitempty"`
+	PTToolsPackageDownloadURL string             `json:"pt_tools_package_download_url,omitempty"`
+	RuntimeParameters         map[string]string  `json:"runtime_parameters,omitempty"`
+	Accounts                  []MySQLAccountSpec `json:"accounts"`
 }
 
 type MySQLAccountSpec struct {
-	Role           string `json:"role"`
-	Username       string `json:"username"`
-	Password       string `json:"password"`
-	Host           string `json:"host"`
-	Enabled        bool   `json:"enabled"`
-	ExtendedBackup bool   `json:"extended_backup,omitempty"`
+	Role           string   `json:"role"`
+	Username       string   `json:"username"`
+	Password       string   `json:"password"`
+	Host           string   `json:"host"`
+	Enabled        bool     `json:"enabled"`
+	ExtendedBackup bool     `json:"extended_backup,omitempty"`
+	Privileges     []string `json:"privileges,omitempty"`
 }
 
 type MySQLInstallResult struct {
-	Port        int                     `json:"port"`
-	ServerID    int                     `json:"server_id"`
-	MySQLUser   string                  `json:"mysql_user"`
-	InstanceDir string                  `json:"instance_dir"`
-	DataDir     string                  `json:"data_dir"`
-	BinlogDir   string                  `json:"binlog_dir"`
-	RedoDir     string                  `json:"redo_dir"`
-	UndoDir     string                  `json:"undo_dir"`
-	TmpDir      string                  `json:"tmp_dir"`
-	BaseDir     string                  `json:"base_dir"`
-	Profile     string                  `json:"profile"`
-	PackageName string                  `json:"package_name"`
-	SystemdUnit string                  `json:"systemd_unit"`
-	MyCnfPath   string                  `json:"my_cnf_path"`
-	SocketPath  string                  `json:"socket_path"`
-	AccountInit *MySQLAccountInitResult `json:"account_init,omitempty"`
+	Port         int                     `json:"port"`
+	ServerID     int                     `json:"server_id"`
+	MySQLUser    string                  `json:"mysql_user"`
+	InstanceDir  string                  `json:"instance_dir"`
+	DataDir      string                  `json:"data_dir"`
+	BinlogDir    string                  `json:"binlog_dir"`
+	RedoDir      string                  `json:"redo_dir"`
+	UndoDir      string                  `json:"undo_dir"`
+	TmpDir       string                  `json:"tmp_dir"`
+	BaseDir      string                  `json:"base_dir"`
+	Profile      string                  `json:"profile"`
+	PackageName  string                  `json:"package_name"`
+	Version      string                  `json:"version"`
+	Architecture string                  `json:"architecture"`
+	SystemdUnit  string                  `json:"systemd_unit"`
+	MyCnfPath    string                  `json:"my_cnf_path"`
+	SocketPath   string                  `json:"socket_path"`
+	AccountInit  *MySQLAccountInitResult `json:"account_init,omitempty"`
 }
 
 type MySQLAccountInitResult struct {
@@ -245,6 +293,7 @@ type MySQLTopologyNodeSpec struct {
 	SourceMachineName        string `json:"source_machine_name,omitempty"`
 	SourceIP                 string `json:"source_ip,omitempty"`
 	SourcePort               int    `json:"source_port,omitempty"`
+	ReplicationDelaySeconds  int    `json:"replication_delay_seconds,omitempty"`
 	InstanceDir              string `json:"instance_dir"`
 	DataDir                  string `json:"data_dir"`
 	BaseDir                  string `json:"base_dir"`
@@ -322,4 +371,5 @@ type Repository interface {
 	UpdateTask(ctx context.Context, task Task) error
 	UpdateStep(ctx context.Context, step Step) error
 	AppendEvent(ctx context.Context, event Event) error
+	DeleteTask(ctx context.Context, taskID string) error
 }

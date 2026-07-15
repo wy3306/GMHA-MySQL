@@ -124,7 +124,7 @@ func topologyConfigureMyCNFCommand(spec taskdomain.MySQLTopologySpec) string {
 		"gtid_mode=ON",
 		"enforce_gtid_consistency=ON",
 		"log_replica_updates=ON",
-		"skip_slave_start=ON",
+		"skip_replica_start=ON",
 		fmt.Sprintf("auto_increment_offset=%d", node.AutoIncrementOffset),
 		fmt.Sprintf("auto_increment_increment=%d", node.AutoIncrementIncrement),
 		fmt.Sprintf("replica_parallel_type=%s", spec.ParallelType),
@@ -141,7 +141,7 @@ func topologyConfigureMyCNFCommand(spec taskdomain.MySQLTopologySpec) string {
 		mysqlUser = "mysql"
 	}
 	managedBlock := "# gmha topology managed\n" + strings.Join(configLines, "\n") + "\n"
-	managedKeys := "server_id|binlog_format|gtid_mode|enforce_gtid_consistency|log_replica_updates|skip_slave_start|auto_increment_offset|auto_increment_increment|replica_parallel_type|replica_parallel_workers|slave_parallel_type|slave_parallel_workers|read_only|super_read_only"
+	managedKeys := "server_id|binlog_format|gtid_mode|enforce_gtid_consistency|log_replica_updates|skip_replica_start|skip_slave_start|auto_increment_offset|auto_increment_increment|replica_parallel_type|replica_parallel_workers|slave_parallel_type|slave_parallel_workers|read_only|super_read_only"
 	return fmt.Sprintf(`
 set -eu
 cnf=%s
@@ -269,20 +269,22 @@ func topologyReplicationCommand(spec taskdomain.MySQLTopologySpec) string {
 		)
 	}
 	newSQL := fmt.Sprintf(
-		"CHANGE REPLICATION SOURCE TO SOURCE_HOST='%s', SOURCE_PORT=%d, SOURCE_USER='%s', SOURCE_PASSWORD='%s', SOURCE_AUTO_POSITION=1, SOURCE_CONNECT_RETRY=2, SOURCE_RETRY_COUNT=30; START REPLICA; SET GLOBAL read_only=%s; SET GLOBAL super_read_only=%s;",
+		"CHANGE REPLICATION SOURCE TO SOURCE_HOST='%s', SOURCE_PORT=%d, SOURCE_USER='%s', SOURCE_PASSWORD='%s', SOURCE_AUTO_POSITION=1, SOURCE_CONNECT_RETRY=2, SOURCE_RETRY_COUNT=30, SOURCE_DELAY=%d; START REPLICA; SET GLOBAL read_only=%s; SET GLOBAL super_read_only=%s;",
 		mysqlSQLEscape(node.SourceIP),
 		node.SourcePort,
 		mysqlSQLEscape(spec.ReplicationUser),
 		mysqlSQLEscape(spec.ReplicationPassword),
+		node.ReplicationDelaySeconds,
 		mysqlBool(node.ReadOnly),
 		mysqlBool(node.SuperReadOnly),
 	)
 	oldSQL := fmt.Sprintf(
-		"CHANGE MASTER TO MASTER_HOST='%s', MASTER_PORT=%d, MASTER_USER='%s', MASTER_PASSWORD='%s', MASTER_AUTO_POSITION=1, MASTER_CONNECT_RETRY=2, MASTER_RETRY_COUNT=30; START SLAVE; SET GLOBAL read_only=%s; SET GLOBAL super_read_only=%s;",
+		"CHANGE MASTER TO MASTER_HOST='%s', MASTER_PORT=%d, MASTER_USER='%s', MASTER_PASSWORD='%s', MASTER_AUTO_POSITION=1, MASTER_CONNECT_RETRY=2, MASTER_RETRY_COUNT=30, MASTER_DELAY=%d; START SLAVE; SET GLOBAL read_only=%s; SET GLOBAL super_read_only=%s;",
 		mysqlSQLEscape(node.SourceIP),
 		node.SourcePort,
 		mysqlSQLEscape(spec.ReplicationUser),
 		mysqlSQLEscape(spec.ReplicationPassword),
+		node.ReplicationDelaySeconds,
 		mysqlBool(node.ReadOnly),
 		mysqlBool(node.SuperReadOnly),
 	)

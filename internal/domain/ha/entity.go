@@ -68,6 +68,12 @@ type ClusterVIPConfig struct {
 	ArpingCount          int       `json:"arping_count"`
 	CheckAfterBind       bool      `json:"check_after_bind"`
 	ExternalCheckEnabled bool      `json:"external_check_enabled"`
+	BGPEnabled           bool      `json:"bgp_enabled"`
+	BGPLocalAS           int       `json:"bgp_local_as,omitempty"`
+	BGPPeerAS            int       `json:"bgp_peer_as,omitempty"`
+	BGPPeerAddress       string    `json:"bgp_peer_address,omitempty"`
+	BGPRouterID          string    `json:"bgp_router_id,omitempty"`
+	BGPCommunity         string    `json:"bgp_community,omitempty"`
 	Enabled              bool      `json:"enabled"`
 	CreatedAt            time.Time `json:"created_at"`
 	UpdatedAt            time.Time `json:"updated_at"`

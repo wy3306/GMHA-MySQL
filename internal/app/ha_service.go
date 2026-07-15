@@ -8,12 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
 
 	hadomain "gmha/internal/domain/ha"
 	machinedomain "gmha/internal/domain/machine"
+	taskdomain "gmha/internal/domain/task"
 	mysqlapp "gmha/internal/mysql"
 )
 
@@ -27,6 +29,7 @@ type HARepository interface {
 	GetVIPBindingStates(ctx context.Context, clusterID string) ([]hadomain.VIPBindingState, error)
 	ListMachineInterfaces(ctx context.Context, machineID string) ([]hadomain.MachineNetworkInterface, error)
 	AcquireFailoverLock(ctx context.Context, clusterID, failoverID, owner string, ttl time.Duration) error
+	RenewFailoverLock(ctx context.Context, clusterID, failoverID string, ttl time.Duration) error
 	ReleaseFailoverLock(ctx context.Context, clusterID, failoverID string) error
 	SaveFailoverEvent(ctx context.Context, event hadomain.FailoverEvent) error
 	GetFailoverEvent(ctx context.Context, clusterID, failoverID string) (hadomain.FailoverEvent, bool, error)
@@ -39,6 +42,7 @@ type HAService struct {
 	machines  machinedomain.Repository
 	instances MySQLInstanceRepository
 	vip       *VIPService
+	tasks     *TaskService
 }
 
 func NewHAService(repo HARepository, machines machinedomain.Repository, instances MySQLInstanceRepository) *HAService {
@@ -49,6 +53,84 @@ func NewHAService(repo HARepository, machines machinedomain.Repository, instance
 
 func (s *HAService) VIP() *VIPService {
 	return s.vip
+}
+
+type vipConfigWriter interface {
+	UpsertVIPConfig(context.Context, hadomain.ClusterVIPConfig) (hadomain.ClusterVIPConfig, error)
+	DeleteVIPConfig(context.Context, string, string) error
+}
+
+func (s *HAService) ListVIPConfigs(ctx context.Context, clusterID string) ([]hadomain.ClusterVIPConfig, error) {
+	return s.repo.ListVIPConfigs(ctx, strings.TrimSpace(clusterID))
+}
+
+func (s *HAService) SaveVIPConfig(ctx context.Context, clusterID string, cfg hadomain.ClusterVIPConfig) (hadomain.ClusterVIPConfig, error) {
+	writer, ok := s.repo.(vipConfigWriter)
+	if !ok {
+		return hadomain.ClusterVIPConfig{}, errors.New("VIP config repository is not writable")
+	}
+	cfg.ClusterID = strings.TrimSpace(clusterID)
+	cfg.VIPAddress = strings.TrimSpace(cfg.VIPAddress)
+	parsedVIP := net.ParseIP(cfg.VIPAddress)
+	if cfg.ClusterID == "" || parsedVIP == nil {
+		return hadomain.ClusterVIPConfig{}, errors.New("valid cluster and VIP address are required")
+	}
+	if parsedVIP.To4() == nil {
+		return hadomain.ClusterVIPConfig{}, errors.New("current ARP, BGP and Keepalived VIP drivers require an IPv4 address")
+	}
+	if cfg.VIPPrefix <= 0 || cfg.VIPPrefix > 32 {
+		return hadomain.ClusterVIPConfig{}, errors.New("IPv4 VIP prefix must be between 1 and 32")
+	}
+	switch cfg.VIPRouteMode {
+	case hadomain.VipRouteModeL2ARP:
+		cfg.ArpingEnabled = true
+	case hadomain.VipRouteModeBGP:
+		cfg.BGPEnabled = true
+		peerIP := net.ParseIP(cfg.BGPPeerAddress)
+		if cfg.BGPLocalAS <= 0 || cfg.BGPPeerAS <= 0 || peerIP == nil || peerIP.To4() == nil {
+			return hadomain.ClusterVIPConfig{}, errors.New("BGP mode requires local AS, peer AS and peer address")
+		}
+		if cfg.BGPRouterID != "" {
+			routerID := net.ParseIP(cfg.BGPRouterID)
+			if routerID == nil || routerID.To4() == nil {
+				return hadomain.ClusterVIPConfig{}, errors.New("BGP router ID must be an IPv4 address")
+			}
+		}
+		if cfg.BGPCommunity != "" && !regexp.MustCompile(`^[0-9]{1,10}:[0-9]{1,10}$`).MatchString(cfg.BGPCommunity) {
+			return hadomain.ClusterVIPConfig{}, errors.New("BGP community must use ASN:value format")
+		}
+	case hadomain.VipRouteModeKeepalived:
+		if strings.TrimSpace(cfg.DefaultInterface) == "" {
+			return hadomain.ClusterVIPConfig{}, errors.New("Keepalived mode requires an explicit network interface")
+		}
+	default:
+		return hadomain.ClusterVIPConfig{}, fmt.Errorf("unsupported VIP route mode %s", cfg.VIPRouteMode)
+	}
+	if cfg.DefaultInterface != "" && !regexp.MustCompile(`^[A-Za-z0-9_.:-]+$`).MatchString(cfg.DefaultInterface) {
+		return hadomain.ClusterVIPConfig{}, errors.New("invalid VIP network interface")
+	}
+	if cfg.ArpingCount <= 0 {
+		cfg.ArpingCount = 3
+	}
+	cfg.Enabled, cfg.CheckAfterBind, cfg.ExternalCheckEnabled = true, true, true
+	return writer.UpsertVIPConfig(ctx, cfg)
+}
+
+func (s *HAService) DeleteVIPConfig(ctx context.Context, clusterID, vip string) error {
+	writer, ok := s.repo.(vipConfigWriter)
+	if !ok {
+		return errors.New("VIP config repository is not writable")
+	}
+	return writer.DeleteVIPConfig(ctx, strings.TrimSpace(clusterID), strings.TrimSpace(vip))
+}
+
+// ConfigureArchitectureExecutor 注入 Agent 任务服务，启用在线架构调整执行器。
+func (s *HAService) ConfigureArchitectureExecutor(tasks *TaskService) {
+	s.tasks = tasks
+	s.vip.tasks = tasks
+	if recovery, ok := s.repo.(architectureRunRecoveryRepository); ok {
+		_ = recovery.MarkInterruptedArchitectureRuns(context.Background())
+	}
 }
 
 func (s *HAService) PlanFailover(ctx context.Context, clusterID string) (hadomain.FailoverEvent, error) {
@@ -120,6 +202,7 @@ type VIPService struct {
 	instances MySQLInstanceRepository
 	selector  *VIPInterfaceSelector
 	drivers   map[string]VipDriver
+	tasks     *TaskService
 }
 
 func NewVIPService(repo HARepository, machines machinedomain.Repository, instances MySQLInstanceRepository) *VIPService {
@@ -132,9 +215,9 @@ func NewVIPService(repo HARepository, machines machinedomain.Repository, instanc
 		drivers: map[string]VipDriver{
 			hadomain.VipRouteModeL2ARP:      NewL2ARPVipDriver(nil),
 			hadomain.VipRouteModeManual:     NotImplementedVipDriver{Mode: hadomain.VipRouteModeManual, Message: "MANUAL VIP driver does not execute add/del; automatic failover is blocked"},
-			hadomain.VipRouteModeBGP:        NotImplementedVipDriver{Mode: hadomain.VipRouteModeBGP, Message: "BGP VIP driver is not implemented; automatic failover is blocked to avoid unsafe L2 VIP drift across L3 network."},
+			hadomain.VipRouteModeBGP:        ArchitectureManagedVIPDriver{Mode: hadomain.VipRouteModeBGP},
 			hadomain.VipRouteModeCloudAPI:   NotImplementedVipDriver{Mode: hadomain.VipRouteModeCloudAPI, Message: "CLOUD_API VIP driver is not implemented; automatic failover is blocked"},
-			hadomain.VipRouteModeKeepalived: NotImplementedVipDriver{Mode: hadomain.VipRouteModeKeepalived, Message: "KEEPALIVED VIP driver is not implemented; automatic failover is blocked"},
+			hadomain.VipRouteModeKeepalived: ArchitectureManagedVIPDriver{Mode: hadomain.VipRouteModeKeepalived},
 		},
 	}
 }
@@ -144,6 +227,9 @@ func (s *VIPService) Status(ctx context.Context, clusterID string) ([]hadomain.V
 }
 
 func (s *VIPService) Scan(ctx context.Context, clusterID string) ([]hadomain.VIPBindingState, error) {
+	if s.tasks == nil {
+		return nil, errors.New("live VIP scan requires the Agent task executor")
+	}
 	configs, err := s.repo.ListVIPConfigs(ctx, clusterID)
 	if err != nil {
 		return nil, err
@@ -151,14 +237,47 @@ func (s *VIPService) Scan(ctx context.Context, clusterID string) ([]hadomain.VIP
 	if len(configs) == 0 {
 		return nil, nil
 	}
+	machines, err := s.machines.List(ctx)
+	if err != nil {
+		return nil, err
+	}
 	var out []hadomain.VIPBindingState
 	for _, cfg := range configs {
+		var holders []string
+		for _, machine := range machines {
+			if machine.Cluster != clusterID {
+				continue
+			}
+			command := "if ip -o addr show | awk '{print $4}' | cut -d/ -f1 | grep -Fxq " + shellQuote(cfg.VIPAddress) + "; then echo BOUND; else echo UNBOUND; fi"
+			detail, createErr := s.tasks.CreateExecTask(ctx, machine.IP, command)
+			if createErr != nil {
+				return nil, createErr
+			}
+			completed, waitErr := s.tasks.WaitForTask(ctx, detail.Task.ID, 30*time.Second)
+			if waitErr != nil || completed.Task.Status != taskdomain.StatusSuccess {
+				return nil, fmt.Errorf("VIP scan failed on %s", machine.Name)
+			}
+			if len(completed.Steps) > 0 && strings.TrimSpace(completed.Steps[len(completed.Steps)-1].Message) == "BOUND" {
+				holders = append(holders, machine.ID)
+			}
+		}
+		status := hadomain.VipStatusUnbound
+		if len(holders) == 1 {
+			status = hadomain.VipStatusBound
+		}
+		if len(holders) > 1 {
+			status = hadomain.VipStatusConflict
+		}
 		state := hadomain.VIPBindingState{
 			ClusterID:       clusterID,
 			VIPConfigID:     cfg.ID,
 			VIPAddress:      cfg.VIPAddress,
-			VIPStatus:       hadomain.VipStatusUnbound,
-			LastCheckResult: "no live Agent VIP checker configured; marked UNBOUND from persisted state",
+			VIPStatus:       status,
+			DetectedHolders: strings.Join(holders, ","),
+			LastCheckResult: fmt.Sprintf("live Agent scan found %d holder(s)", len(holders)),
+		}
+		if len(holders) == 1 {
+			state.CurrentHolderMachineID = holders[0]
 		}
 		if err := s.repo.UpsertVIPBindingState(ctx, state); err != nil {
 			return nil, err
@@ -178,18 +297,21 @@ func (s *VIPService) Adopt(ctx context.Context, clusterID, vip string) (hadomain
 		if cfg.VIPAddress != vip {
 			continue
 		}
-		state := hadomain.VIPBindingState{
-			ClusterID:       clusterID,
-			VIPConfigID:     cfg.ID,
-			VIPAddress:      cfg.VIPAddress,
-			VIPStatus:       hadomain.VipStatusUnbound,
-			LastCheckResult: "manual adopt requested; no live Agent VIP checker configured, persisted as UNBOUND",
+		states, scanErr := s.Scan(ctx, clusterID)
+		if scanErr != nil {
+			return hadomain.VIPBindingState{}, scanErr
 		}
-		if err := s.repo.UpsertVIPBindingState(ctx, state); err != nil {
-			return hadomain.VIPBindingState{}, err
+		for _, state := range states {
+			if state.VIPAddress != vip {
+				continue
+			}
+			if state.VIPStatus == hadomain.VipStatusConflict {
+				return hadomain.VIPBindingState{}, fmt.Errorf("cannot adopt VIP %s while multiple holders are detected", vip)
+			}
+			_ = s.repo.InsertVIPOperationLog(ctx, clusterID, "", cfg.VIPAddress, "ADOPT", state.CurrentHolderMachineID, "", state.CurrentInterface, "live Agent scan", 0, "", "", "gmha-manager", "SUCCESS")
+			return state, nil
 		}
-		_ = s.repo.InsertVIPOperationLog(ctx, clusterID, "", cfg.VIPAddress, "ADOPT", "", "", "", "", 0, "", "", "gmha-manager", "SUCCESS")
-		return state, nil
+		return hadomain.VIPBindingState{}, fmt.Errorf("VIP %s was not returned by live scan", vip)
 	}
 	return hadomain.VIPBindingState{}, fmt.Errorf("vip %s is not configured for cluster %s", vip, clusterID)
 }

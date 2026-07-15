@@ -27,8 +27,16 @@ type AgentRepository interface {
 
 // CreateExecTaskRequest 是创建命令执行任务的请求参数。
 type CreateExecTaskRequest struct {
-	Machine string
-	Command string
+	Machine         string
+	Command         string
+	Commands        []taskdomain.ExecCommandStep
+	RollbackCommand string
+	Operation       string
+	DisplayName     string
+	StepName        string
+	Port            int
+	PackageName     string
+	TaskType        taskdomain.Type
 }
 
 // CreateExecTaskResult 是创建命令执行任务的结果，包含任务、步骤和事件。
@@ -56,8 +64,15 @@ func (u *CreateExecTaskUsecase) Execute(ctx context.Context, req CreateExecTaskR
 	if target == "" {
 		return CreateExecTaskResult{}, errors.New("machine is required")
 	}
-	if command == "" {
+	if command == "" && len(req.Commands) == 0 {
 		return CreateExecTaskResult{}, errors.New("command is required")
+	}
+	for i := range req.Commands {
+		req.Commands[i].Name = strings.TrimSpace(req.Commands[i].Name)
+		req.Commands[i].Command = strings.TrimSpace(req.Commands[i].Command)
+		if req.Commands[i].Name == "" || req.Commands[i].Command == "" {
+			return CreateExecTaskResult{}, fmt.Errorf("workflow step %d requires name and command", i+1)
+		}
 	}
 
 	machine, ok, err := u.resolveMachine(ctx, target)
@@ -80,13 +95,24 @@ func (u *CreateExecTaskUsecase) Execute(ctx context.Context, req CreateExecTaskR
 	}
 
 	now := time.Now().UTC()
-	specJSON, _ := json.Marshal(taskdomain.ExecSpec{Command: command})
+	operation := strings.TrimSpace(req.Operation)
+	displayName := strings.TrimSpace(req.DisplayName)
+	stepName := strings.TrimSpace(req.StepName)
+	if stepName == "" {
+		stepName = "exec"
+	}
+	specJSON, _ := json.Marshal(taskdomain.ExecSpec{
+		Command: command, Commands: req.Commands, RollbackCommand: strings.TrimSpace(req.RollbackCommand), Operation: operation, DisplayName: displayName, Port: req.Port, PackageName: strings.TrimSpace(req.PackageName),
+	})
 	taskID := fmt.Sprintf("task-%d", now.UnixNano())
-	stepID := fmt.Sprintf("task-step-%d", now.UnixNano())
 
+	taskType := req.TaskType
+	if taskType == "" {
+		taskType = taskdomain.TypeExec
+	}
 	task := taskdomain.Task{
 		ID:              taskID,
-		Type:            taskdomain.TypeExec,
+		Type:            taskType,
 		MachineID:       machine.ID,
 		AgentID:         agent.ID,
 		Status:          taskdomain.StatusPending,
@@ -95,28 +121,35 @@ func (u *CreateExecTaskUsecase) Execute(ctx context.Context, req CreateExecTaskR
 		SpecJSON:        specJSON,
 		CreatedAt:       now,
 	}
-	step := taskdomain.Step{
-		ID:       stepID,
-		TaskID:   taskID,
-		StepNo:   1,
-		StepName: "exec",
-		Status:   taskdomain.StepPending,
-		Message:  "等待 Agent 接收任务",
+	steps := make([]taskdomain.Step, 0, max(1, len(req.Commands)))
+	if len(req.Commands) == 0 {
+		steps = append(steps, taskdomain.Step{ID: fmt.Sprintf("task-step-%d-1", now.UnixNano()), TaskID: taskID, StepNo: 1, StepName: stepName, Status: taskdomain.StepPending, Message: "等待 Agent 接收任务"})
+	} else {
+		for i, item := range req.Commands {
+			steps = append(steps, taskdomain.Step{ID: fmt.Sprintf("task-step-%d-%d", now.UnixNano(), i+1), TaskID: taskID, StepNo: i + 1, StepName: item.Name, Status: taskdomain.StepPending, Message: "等待 Agent 接收任务"})
+		}
 	}
 	event := taskdomain.Event{
 		ID:        fmt.Sprintf("task-event-%d", now.UnixNano()),
 		TaskID:    taskID,
-		StepID:    stepID,
+		StepID:    steps[0].ID,
 		EventType: taskdomain.EventInfo,
-		Content:   "task created",
+		Content:   taskCreatedEvent(displayName),
 		CreatedAt: now,
 	}
 
 	return CreateExecTaskResult{
 		Task:   task,
-		Steps:  []taskdomain.Step{step},
+		Steps:  steps,
 		Events: []taskdomain.Event{event},
 	}, nil
+}
+
+func taskCreatedEvent(displayName string) string {
+	if displayName == "" {
+		return "task created"
+	}
+	return displayName + "任务已创建"
 }
 
 // resolveMachine 根据选择器（IP 或名称）解析机器信息。
