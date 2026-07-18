@@ -19,6 +19,8 @@ const (
 	TypeMySQLTopology      Type = "mysql_topology"
 	TypeMySQLUpgrade       Type = "mysql_upgrade"
 	TypeArchitecture       Type = "architecture_adjustment"
+	TypeClusterBootstrap   Type = "mysql_cluster_bootstrap"
+	TypeBatchOperation     Type = "batch_operation"
 	TypePlatformOperation  Type = "platform_operation"
 )
 
@@ -52,6 +54,7 @@ const (
 // Task 是任务实体的领域模型，表示一个需要 Agent 执行的工作单元。
 type Task struct {
 	ID              string
+	ParentTaskID    string
 	Type            Type
 	MachineID       string
 	AgentID         string
@@ -62,6 +65,10 @@ type Task struct {
 	CreatedAt       time.Time
 	StartedAt       *time.Time
 	FinishedAt      *time.Time
+	// Children is populated for task-center reads so execution tasks remain
+	// visually grouped beneath their business parent. Persistence continues to
+	// store the relationship through ParentTaskID.
+	Children []Task `json:"Children,omitempty"`
 }
 
 // Step 表示任务的一个执行步骤，用于跟踪任务的分步执行进度。
@@ -105,6 +112,7 @@ type PlatformOperationSpec struct {
 	DisplayName    string   `json:"display_name"`
 	Method         string   `json:"method"`
 	Path           string   `json:"path"`
+	RequestID      string   `json:"request_id,omitempty"`
 	Target         string   `json:"target,omitempty"`
 	HTTPStatus     int      `json:"http_status"`
 	DurationMillis int64    `json:"duration_millis"`
@@ -127,6 +135,12 @@ type ExecCommandStep struct {
 	Command string `json:"command"`
 }
 
+// CapabilityMySQLDefaultsFile marks Agents that can replace the Manager-side
+// credential placeholder with a short-lived local MySQL defaults file. It is
+// deliberately separate from the generic exec task capability: older Agents
+// can execute shell commands but would pass the placeholder to mysql literally.
+const CapabilityMySQLDefaultsFile = "feature:mysql-defaults-file-v1"
+
 type CollectMachineInfoSpec struct{}
 
 type CollectStaticInfoSpec struct {
@@ -144,42 +158,46 @@ type MySQLStaticCollectSpec struct {
 
 // MySQLInstallSpec 是 MySQL 安装任务的规格参数，包含端口、目录、配置、账号等所有安装信息。
 type MySQLInstallSpec struct {
-	Port                      int                `json:"port"`
-	ServerID                  int                `json:"server_id"`
-	MySQLUser                 string             `json:"mysql_user"`
-	InstanceDir               string             `json:"instance_dir"`
-	DataDir                   string             `json:"data_dir"`
-	BinlogDir                 string             `json:"binlog_dir"`
-	RedoDir                   string             `json:"redo_dir"`
-	UndoDir                   string             `json:"undo_dir"`
-	TmpDir                    string             `json:"tmp_dir"`
-	BaseDir                   string             `json:"base_dir"`
-	RootPassword              string             `json:"root_password"`
-	Profile                   string             `json:"profile"`
-	PackageName               string             `json:"package_name"`
-	Version                   string             `json:"version"`
-	Architecture              string             `json:"architecture"`
-	PackageDownloadURL        string             `json:"package_download_url"`
-	MyCnfPath                 string             `json:"my_cnf_path"`
-	MyCnfContent              string             `json:"my_cnf_content"`
-	SocketPath                string             `json:"socket_path"`
-	ErrorLog                  string             `json:"error_log"`
-	PIDFile                   string             `json:"pid_file"`
-	CharacterSetsDir          string             `json:"character_sets_dir"`
-	PluginDir                 string             `json:"plugin_dir"`
-	SystemdUnitName           string             `json:"systemd_unit_name"`
-	SystemdContent            string             `json:"systemd_content"`
-	LimitsPath                string             `json:"limits_path"`
-	LimitsContent             string             `json:"limits_content"`
-	SysctlPath                string             `json:"sysctl_path"`
-	SysctlContent             string             `json:"sysctl_content"`
-	EnvFilePath               string             `json:"env_file_path"`
-	EnvContent                string             `json:"env_content"`
-	InstallPTTools            bool               `json:"install_pt_tools,omitempty"`
-	PTToolsPackageName        string             `json:"pt_tools_package_name,omitempty"`
-	PTToolsPackageDownloadURL string             `json:"pt_tools_package_download_url,omitempty"`
-	RuntimeParameters         map[string]string  `json:"runtime_parameters,omitempty"`
-	Accounts                  []MySQLAccountSpec `json:"accounts"`
+	Port                         int                `json:"port"`
+	ServerID                     int                `json:"server_id"`
+	MySQLUser                    string             `json:"mysql_user"`
+	InstanceDir                  string             `json:"instance_dir"`
+	DataDir                      string             `json:"data_dir"`
+	BinlogDir                    string             `json:"binlog_dir"`
+	RedoDir                      string             `json:"redo_dir"`
+	UndoDir                      string             `json:"undo_dir"`
+	TmpDir                       string             `json:"tmp_dir"`
+	BaseDir                      string             `json:"base_dir"`
+	RootPassword                 string             `json:"root_password"`
+	Profile                      string             `json:"profile"`
+	PackageName                  string             `json:"package_name"`
+	Version                      string             `json:"version"`
+	Architecture                 string             `json:"architecture"`
+	PackageDownloadURL           string             `json:"package_download_url"`
+	MyCnfPath                    string             `json:"my_cnf_path"`
+	MyCnfContent                 string             `json:"my_cnf_content"`
+	SocketPath                   string             `json:"socket_path"`
+	ErrorLog                     string             `json:"error_log"`
+	PIDFile                      string             `json:"pid_file"`
+	CharacterSetsDir             string             `json:"character_sets_dir"`
+	PluginDir                    string             `json:"plugin_dir"`
+	SystemdUnitName              string             `json:"systemd_unit_name"`
+	SystemdContent               string             `json:"systemd_content"`
+	LimitsPath                   string             `json:"limits_path"`
+	LimitsContent                string             `json:"limits_content"`
+	SysctlPath                   string             `json:"sysctl_path"`
+	SysctlContent                string             `json:"sysctl_content"`
+	EnvFilePath                  string             `json:"env_file_path"`
+	EnvContent                   string             `json:"env_content"`
+	InstallPTTools               bool               `json:"install_pt_tools,omitempty"`
+	PTToolsPackageName           string             `json:"pt_tools_package_name,omitempty"`
+	PTToolsPackageDownloadURL    string             `json:"pt_tools_package_download_url,omitempty"`
+	InstallXtraBackup            bool               `json:"install_xtrabackup,omitempty"`
+	XtraBackupPackageName        string             `json:"xtrabackup_package_name,omitempty"`
+	XtraBackupPackageDownloadURL string             `json:"xtrabackup_package_download_url,omitempty"`
+	MemoryAllocator              string             `json:"memory_allocator,omitempty"`
+	RuntimeParameters            map[string]string  `json:"runtime_parameters,omitempty"`
+	Accounts                     []MySQLAccountSpec `json:"accounts"`
 }
 
 type MySQLAccountSpec struct {

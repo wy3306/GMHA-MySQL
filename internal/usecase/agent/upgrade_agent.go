@@ -164,34 +164,46 @@ func (u *UpgradeAgentUsecase) Execute(ctx context.Context, req UpgradeAgentReque
 	}
 
 	tmpAgentPath := fmt.Sprintf("%s/.agentd.%d.tmp", installDir, time.Now().UnixNano())
+	backupAgentPath := fmt.Sprintf("%s/agentd.backup-%s", installDir, strings.ReplaceAll(strings.TrimSpace(agent.Version), "/", "_"))
 	if err := u.sshClient.Upload(ctx, endpoint, auth, tmpAgentPath, binary, "0755"); err != nil {
 		return u.fail(ctx, machine.ID, installDir, agent.ID, fmt.Errorf("failed to upload agent binary to %s: %w", installDir, err))
 	}
-	if err := u.sshClient.Run(ctx, endpoint, auth, fmt.Sprintf("chmod 0755 %s && mv -f %s %s", shellQuote(tmpAgentPath), shellQuote(tmpAgentPath), shellQuote(installDir+"/agentd"))); err != nil {
+	if err := u.sshClient.Run(ctx, endpoint, auth, fmt.Sprintf("chmod 0755 %s && if test -f %s; then cp -p %s %s; fi && mv -f %s %s", shellQuote(tmpAgentPath), shellQuote(installDir+"/agentd"), shellQuote(installDir+"/agentd"), shellQuote(backupAgentPath), shellQuote(tmpAgentPath), shellQuote(installDir+"/agentd"))); err != nil {
 		return u.fail(ctx, machine.ID, installDir, agent.ID, fmt.Errorf("failed to replace agent binary: %w", err))
 	}
+	rollback := func(baseErr error) (UpgradeAgentResponse, error) {
+		rollbackCmd := fmt.Sprintf("if test -f %s; then cp -p %s %s && systemctl restart gmha-agent; fi", shellQuote(backupAgentPath), shellQuote(backupAgentPath), shellQuote(installDir+"/agentd"))
+		rollbackCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if rollbackErr := u.sshClient.Run(rollbackCtx, endpoint, auth, rollbackCmd); rollbackErr != nil {
+			baseErr = fmt.Errorf("%w; automatic rollback failed: %v", baseErr, rollbackErr)
+		} else {
+			baseErr = fmt.Errorf("%w; previous Agent binary restored", baseErr)
+		}
+		return u.fail(ctx, machine.ID, installDir, agent.ID, baseErr)
+	}
 	if err := u.sshClient.Upload(ctx, endpoint, auth, installDir+"/agent.yaml", configBytes, "0644"); err != nil {
-		return u.fail(ctx, machine.ID, installDir, agent.ID, fmt.Errorf("failed to upload agent config to %s: %w", installDir, err))
+		return rollback(fmt.Errorf("failed to upload agent config to %s: %w", installDir, err))
 	}
 	if err := u.sshClient.Upload(ctx, endpoint, auth, "/etc/systemd/system/gmha-agent.service", systemdBytes, "0644"); err != nil {
-		return u.fail(ctx, machine.ID, installDir, agent.ID, fmt.Errorf("failed to upload systemd unit: %w", err))
+		return rollback(fmt.Errorf("failed to upload systemd unit: %w", err))
 	}
+	startedAt := time.Now().UTC()
 	for _, cmd := range []string{
 		"systemctl daemon-reload",
 		"systemctl enable gmha-agent",
 		"systemctl restart gmha-agent",
 	} {
 		if err := u.sshClient.Run(ctx, endpoint, auth, cmd); err != nil {
-			return u.fail(ctx, machine.ID, installDir, agent.ID, err)
+			return rollback(err)
 		}
 	}
 
 	if u.heartbeat != nil {
 		waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
-		startedAt := time.Now().UTC()
 		if err := u.heartbeat.WaitForFreshHeartbeat(waitCtx, machine.ID, startedAt, 30*time.Second); err != nil {
-			return u.fail(ctx, machine.ID, installDir, agent.ID, u.wrapStartupFailure(ctx, endpoint, auth, err))
+			return rollback(u.wrapStartupFailure(ctx, endpoint, auth, err))
 		}
 	}
 

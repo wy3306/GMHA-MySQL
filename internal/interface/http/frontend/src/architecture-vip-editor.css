@@ -1,0 +1,687 @@
+.topology-vip-editor > header > div {
+  display: grid;
+  gap: 2px;
+}
+
+.topology-vip-editor > header > span {
+  display: flex;
+  gap: 4px;
+}
+
+.topology-vip-editor > header button {
+  width: 25px;
+  height: 25px;
+  border: 1px solid #d8e2ee;
+  border-radius: 5px;
+  background: #f7f9fc;
+  color: #526b88;
+  cursor: pointer;
+}
+
+.topology-vip-editor > header .vip-header-action {
+  width: auto;
+  padding: 0 9px;
+  color: #1769c5;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.topology-vip-editor-body {
+  display: grid;
+  gap: 9px;
+  padding: 12px 14px 14px;
+}
+
+.topology-vip-editor-body label {
+  display: grid;
+  gap: 4px;
+  color: #617188;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.topology-vip-editor-body input,
+.topology-vip-editor-body select {
+  width: 100%;
+  min-width: 0;
+  height: 36px;
+  padding: 0 8px;
+  border: 1px solid #d4deea;
+  border-radius: 5px;
+  background: #fff;
+  color: #293b53;
+  font: inherit;
+  font-size: 12px;
+  box-sizing: border-box;
+}
+
+.topology-vip-editor-body input:focus,
+.topology-vip-editor-body select:focus {
+  border-color: #78a8df;
+  box-shadow: 0 0 0 2px #2878d214;
+  outline: none;
+}
+
+.topology-vip-editor-body input:disabled {
+  background: #f3f6f9;
+  color: #64748b;
+}
+
+.topology-vip-live {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 7px;
+  align-items: center;
+  padding: 9px 10px;
+  border: 1px solid #dae5f1;
+  border-left: 3px solid #6f9fd4;
+  border-radius: 6px;
+  background: #f8fbff;
+}
+
+.topology-vip-live > span {
+  grid-row: 1 / span 2;
+  align-self: center;
+  font-size: 10px;
+}
+
+.topology-vip-live > b {
+  color: #263b55;
+  font-size: 14px;
+}
+
+.topology-vip-live > small {
+  overflow: hidden;
+  color: #7a899c;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.topology-vip-live.new {
+  border-left-color: #2aa67c;
+  background: #f2fbf7;
+}
+
+.topology-vip-live.new > span {
+  padding: 3px 5px;
+  border-radius: 4px;
+  background: #dff5ec;
+  color: #16805f;
+  font-weight: 800;
+}
+
+.topology-vip-inline {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 62px;
+  gap: 7px;
+}
+
+.topology-vip-facts {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px 10px;
+  margin: 0;
+  padding: 7px 9px;
+  border-radius: 5px;
+  background: #f6f8fb;
+}
+
+.topology-vip-facts div {
+  min-width: 0;
+  display: grid;
+  gap: 1px;
+  padding: 3px 0;
+}
+
+.topology-vip-facts dt {
+  color: #8a97a8;
+  font-size: 10px;
+}
+
+.topology-vip-facts dd {
+  overflow: hidden;
+  margin: 0;
+  color: #455970;
+  font-size: 10px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.topology-vip-switch {
+  display: flex !important;
+  align-items: center;
+  grid-template-columns: none !important;
+  gap: 6px !important;
+}
+
+.topology-vip-switch input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: #2563eb;
+}
+
+.topology-vip-switch span {
+  color: #41566f;
+  font-size: 11px;
+}
+
+.topology-vip-error {
+  margin: 0;
+  padding: 7px 8px;
+  border-radius: 5px;
+  background: #fff1f2;
+  color: #b42332;
+  font-size: 8px;
+  line-height: 1.5;
+}
+
+.topology-vip-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
+  padding-top: 2px;
+}
+
+.topology-vip-actions .primary {
+  min-height: 36px;
+  padding: 8px 12px;
+  box-shadow: none;
+  font-size: 11px;
+}
+
+.topology-vip-actions .danger-link {
+  margin-right: auto;
+  font-size: 10px;
+}
+
+.topology-vip-actions > small {
+  color: #64748b;
+  font-size: 9px;
+  line-height: 1.5;
+  text-align: right;
+}
+
+.topology-vip-palette {
+  display: grid;
+  width: min(520px, 100%);
+  margin: 0 auto;
+  padding: 11px 13px;
+  gap: 9px;
+  border: 1px solid #cfe0f2;
+  border-radius: 9px;
+  background: #fff;
+  box-shadow: 0 7px 18px #31577c14;
+}
+
+.topology-vip-palette > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.topology-vip-palette > header > div {
+  display: grid;
+  gap: 2px;
+}
+
+.topology-vip-palette > header b { color: #273d58; font-size: 12px; }
+.topology-vip-palette > header small { color: #8090a5; font-size: 9px; }
+.topology-vip-palette > header > span { padding: 3px 7px; border-radius: 9px; background: #eaf3ff; color: #216bc1; font-size: 9px; font-weight: 750; }
+.topology-unbound-vips { display: flex; gap: 8px; flex-wrap: wrap; }
+
+.topology-vip-chip,
+.topology-node-vip-card {
+  display: flex;
+  min-width: 172px;
+  padding: 8px 9px;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid #9ec5f2;
+  border-radius: 7px;
+  background: linear-gradient(135deg,#f5faff,#fff);
+  box-shadow: 0 5px 13px #2563a51c;
+  cursor: grab;
+  user-select: none;
+}
+
+.topology-vip-chip:active,
+.topology-node-vip-card:active { cursor: grabbing; }
+.topology-vip-chip.dragging,
+.topology-node-vip-card.dragging { opacity: .45; transform: scale(.98); }
+.topology-vip-chip > i,
+.topology-node-vip-card > i { display: grid; width: 31px; height: 31px; border-radius: 7px; background: #2879d5; color: #fff; place-items: center; font-size: 9px; font-style: normal; font-weight: 850; }
+.topology-vip-chip > span,
+.topology-node-vip-card > span { display: grid; min-width: 0; flex: 1; gap: 2px; }
+.topology-vip-chip b,
+.topology-node-vip-card b { overflow: hidden; color: #263c57; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.topology-vip-chip small,
+.topology-node-vip-card small { color: #71849b; font-size: 8px; }
+.topology-vip-chip > em,
+.topology-node-vip-card > em { color: #8ba0b8; font-style: normal; letter-spacing: -2px; }
+.topology-vip-placed-hint { padding: 7px 9px; border-radius: 5px; background: #f3f8fd; color: #60778f; font-size: 9px; text-align: center; }
+
+.topology-edit-node.vip-drop-target {
+  transition: transform .28s cubic-bezier(.22,1,.36,1), border-color .25s ease, box-shadow .25s ease;
+}
+
+.vip-magnet-halo {
+  position: absolute;
+  z-index: 0;
+  inset: -34px;
+  border: 1px dashed transparent;
+  border-radius: 30px;
+  background: radial-gradient(circle at 50% 50%,#3b91ec12 0,transparent 68%);
+  opacity: 0;
+  pointer-events: none;
+  transform: scale(.82);
+  transition: opacity .24s ease,transform .3s cubic-bezier(.22,1,.36,1),border-color .24s ease;
+}
+
+.topology-edit-node.vip-drop-target .vip-magnet-halo {
+  opacity: .5;
+  pointer-events: auto;
+  transform: scale(1);
+}
+
+.topology-edit-node.vip-magnet-active {
+  z-index: 5;
+  border-color: #4b9ae9;
+  box-shadow: 0 18px 42px #1e73ca2b,0 0 0 5px #4b9ae916;
+  transform: translateY(-5px) scale(1.025);
+}
+
+.topology-edit-node.vip-magnet-active .vip-magnet-halo {
+  border-color: #64a9ec8f;
+  background: radial-gradient(circle at 50% 50%,#3b91ec26 0,#3b91ec0c 48%,transparent 72%);
+  opacity: 1;
+  transform: scale(1.08);
+  animation: vip-magnet-breathe 1.35s ease-in-out infinite;
+}
+
+.topology-node-vip-card {
+  position: absolute;
+  z-index: 6;
+  top: -20px;
+  right: -16px;
+  min-width: 150px;
+  padding: 6px 7px;
+  border-color: #63a5ed;
+  background: #f4f9ff;
+}
+
+.topology-node-vip-card.pending { border-style: dashed; background: #fff9eb; }
+.topology-node-vip-card.pending > i { background: #d49222; }
+.topology-node-vip-card.snapping { animation: vip-magnetic-snap .52s cubic-bezier(.2,1.35,.3,1) both; }
+
+.topology-vip-magnet-preview {
+  position: absolute;
+  z-index: 8;
+  top: -20px;
+  right: -16px;
+  display: flex;
+  min-width: 150px;
+  padding: 6px 7px;
+  align-items: center;
+  gap: 8px;
+  border: 1px dashed #438fdc;
+  border-radius: 7px;
+  background: #eff7ffde;
+  box-shadow: 0 10px 24px #226cba26;
+  pointer-events: none;
+  animation: vip-preview-arrive .3s cubic-bezier(.22,1,.36,1) both;
+}
+
+.topology-vip-magnet-preview > i { display:grid;width:31px;height:31px;border-radius:7px;background:#2879d5cc;color:#fff;place-items:center;font-size:9px;font-style:normal;font-weight:850; }
+.topology-vip-magnet-preview > span { display:grid;gap:2px; }
+.topology-vip-magnet-preview b { color:#263c57;font-size:11px; }
+.topology-vip-magnet-preview small { color:#64809d;font-size:8px; }
+
+@keyframes vip-magnet-breathe {
+  0%,100% { box-shadow: 0 0 0 0 #4b9ae900; }
+  50% { box-shadow: 0 0 0 9px #4b9ae913; }
+}
+
+@keyframes vip-preview-arrive {
+  from { opacity:0; transform:translate(28px,-10px) scale(.82); }
+  to { opacity:.9; transform:translate(0,0) scale(1); }
+}
+
+@keyframes vip-magnetic-snap {
+  0% { opacity:.35; transform:translate(46px,-18px) scale(.78); }
+  62% { opacity:1; transform:translate(-5px,2px) scale(1.045); }
+  82% { transform:translate(2px,-1px) scale(.99); }
+  100% { transform:translate(0,0) scale(1); }
+}
+.topology-vip-drag-help { display: flex; padding: 9px 10px; align-items: center; gap: 8px; border: 1px dashed #8cb9ea; border-radius: 6px; background: #f4f9ff; }
+.topology-vip-drag-help > i { display: grid; width: 25px; height: 25px; border-radius: 50%; background: #dcecff; color: #1f6fc8; place-items: center; font-style: normal; }
+.topology-vip-drag-help > span { display: grid; gap: 2px; }
+.topology-vip-drag-help b { color: #31506f; font-size: 10px; }
+.topology-vip-drag-help small { color: #70839a; font-size: 8px; line-height: 1.4; }
+
+.vip-drift-mask { z-index: 135; padding: 24px; }
+.vip-drift-modal { width: min(640px,calc(100vw - 48px)); overflow: hidden; border-radius: 13px; }
+.vip-drift-modal > header { display: flex; padding: 19px 21px 15px; align-items: flex-start; gap: 11px; border-bottom: 1px solid #e5ebf2; }
+.vip-drift-modal > header > span { display: grid; width: 39px; height: 39px; flex: 0 0 auto; border-radius: 9px; background: #2879d5; color: #fff; place-items: center; font-size: 10px; font-weight: 850; }
+.vip-drift-modal > header > div { display: grid; flex: 1; gap: 2px; }
+.vip-drift-modal > header p,.vip-drift-modal > header h2,.vip-drift-modal > header small { margin: 0; }
+.vip-drift-modal > header p { color: #2876ca; font-size: 9px; font-weight: 800; letter-spacing: 1px; }
+.vip-drift-modal > header h2 { color: #243a55; font-size: 19px; }
+.vip-drift-modal > header small { color: #8090a5; font-size: 10px; }
+.vip-drift-modal > header button { border: 0; background: transparent; color: #8392a5; cursor: pointer; font-size: 20px; }
+.vip-drift-route { display: grid; padding: 18px 22px 12px; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 13px; }
+.vip-drift-route > article { display: grid; padding: 13px 14px; gap: 3px; border: 1px solid #dce5ef; border-radius: 8px; background: #f8fafc; }
+.vip-drift-route > article.target { border-color: #8db9ec; background: #f1f7ff; }
+.vip-drift-route > article small { color: #8795a7; font-size: 9px; }
+.vip-drift-route > article b { color: #2b405a; font-size: 14px; }
+.vip-drift-route > article span { color: #63778e; font-size: 9px; }
+.vip-drift-route > i { color: #2879d5; font-size: 20px; font-style: normal; }
+.vip-drift-safety { display: grid; margin: 0; padding: 8px 22px 14px; grid-template-columns: repeat(4,1fr); gap: 7px; list-style: none; }
+.vip-drift-safety li { display: flex; min-width: 0; padding: 9px; align-items: flex-start; gap: 6px; border-radius: 6px; background: #f5f7fa; }
+.vip-drift-safety li > i { display: grid; width: 19px; height: 19px; flex: 0 0 auto; border-radius: 50%; background: #dcecff; color: #1f6fc8; place-items: center; font-size: 8px; font-style: normal; font-weight: 800; }
+.vip-drift-safety li > span { display: grid; min-width: 0; gap: 2px; }
+.vip-drift-safety b { color: #3a506a; font-size: 9px; }
+.vip-drift-safety small { color: #8390a1; font-size: 7px; line-height: 1.35; }
+.vip-drift-warning { margin: 0 22px 16px; padding: 9px 11px; border-left: 3px solid #e3a331; border-radius: 5px; background: #fff8e9; }
+.vip-drift-warning b { color: #7b5a1e; font-size: 10px; }
+.vip-drift-warning p { margin: 3px 0 0; color: #816e4d; font-size: 9px; }
+.vip-drift-modal > footer { display: flex; padding: 13px 21px; justify-content: flex-end; gap: 8px; border-top: 1px solid #e5ebf2; background: #fafbfd; }
+
+@media(max-width:700px) {
+  .topology-node-vip-card { position: static; margin: 8px; }
+  .vip-drift-safety { grid-template-columns: 1fr 1fr; }
+  .vip-drift-route { grid-template-columns: 1fr; }
+  .vip-drift-route > i { transform: rotate(90deg); text-align: center; }
+}
+
+.topology-vip-safety {
+  color: #8794a5;
+  font-size: 8px;
+  line-height: 1.45;
+  text-align: center;
+}
+
+.architecture-execution-mask {
+  z-index: 120;
+  padding: 24px;
+}
+
+.architecture-execution-modal {
+  width: min(760px, calc(100vw - 48px));
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+  border-radius: 12px;
+}
+
+.architecture-execution-modal > header {
+  display: flex;
+  padding: 20px 22px 16px;
+  align-items: flex-start;
+  justify-content: space-between;
+  border-bottom: 1px solid #e4eaf1;
+}
+
+.architecture-execution-modal > header p,
+.architecture-execution-modal > header h2,
+.architecture-execution-modal > header small {
+  margin: 0;
+}
+
+.architecture-execution-modal > header p {
+  color: #2876ca;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 1.2px;
+}
+
+.architecture-execution-modal > header h2 {
+  margin-top: 4px;
+  color: #243a55;
+  font-size: 20px;
+}
+
+.architecture-execution-modal > header small {
+  display: block;
+  margin-top: 5px;
+  color: #8090a5;
+  font-size: 11px;
+}
+
+.architecture-execution-modal > header > button {
+  border: 0;
+  background: transparent;
+  color: #718198;
+  cursor: pointer;
+  font-size: 24px;
+}
+
+.architecture-dialog-verdict {
+  display: flex;
+  padding: 13px 22px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: #f7f9fc;
+}
+
+.architecture-dialog-verdict small {
+  color: #708198;
+  font-size: 11px;
+}
+
+.architecture-dialog-progress {
+  position: relative;
+  height: 28px;
+  overflow: hidden;
+  background: #edf2f7;
+}
+
+.architecture-dialog-progress i {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, #2677d3, #2eaa7e);
+  transition: width .5s ease;
+}
+
+.architecture-dialog-progress span {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  color: #1f3855;
+  place-items: center;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.architecture-dialog-steps {
+  display: grid;
+  margin: 0;
+  padding: 18px 22px;
+  gap: 9px;
+  list-style: none;
+}
+
+.architecture-dialog-steps li {
+  position: relative;
+  display: grid;
+  min-height: 48px;
+  padding: 11px 12px;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid #dfe7f0;
+  border-radius: 8px;
+  background: #fbfcfe;
+  opacity: 0;
+  transform: translateY(8px);
+  animation: architecture-step-enter .32s ease forwards;
+}
+
+.architecture-dialog-steps li > i {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: #e8f1fc;
+  color: #2874c6;
+  place-items: center;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 800;
+}
+
+.architecture-dialog-steps li > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.architecture-dialog-steps li b {
+  color: #304760;
+  font-size: 12px;
+}
+
+.architecture-dialog-steps li small {
+  overflow: hidden;
+  color: #74869c;
+  font-size: 10px;
+  line-height: 1.45;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.architecture-dialog-steps li > em {
+  padding: 4px 8px;
+  border-radius: 10px;
+  background: #eef2f6;
+  color: #6f8094;
+  font-size: 9px;
+  font-style: normal;
+}
+
+.architecture-dialog-steps li.running {
+  border-color: #76a9e5;
+  background: #f2f8ff;
+  box-shadow: 0 0 0 3px #2c78ce12;
+}
+
+.architecture-dialog-steps li.success > i {
+  background: #dff5eb;
+  color: #17805d;
+}
+
+.architecture-dialog-steps li.failed > i,
+.architecture-dialog-steps li.danger > i {
+  background: #ffeaed;
+  color: #c83e52;
+}
+
+.step-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid #9ec5ef;
+  border-top-color: #226fc3;
+  border-radius: 50%;
+  animation: architecture-step-spin .7s linear infinite;
+}
+
+.architecture-execution-modal > footer {
+  display: flex;
+  padding: 14px 22px 18px;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 9px;
+  border-top: 1px solid #e5ebf2;
+}
+
+@keyframes architecture-step-enter {
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes architecture-step-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (max-width: 1050px) {
+  .topology-vip-editor {
+    grid-column: 1 / -1;
+  }
+
+  .topology-vip-editor-body {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .topology-vip-live,
+  .topology-vip-facts,
+  .topology-vip-actions,
+  .topology-vip-safety,
+  .topology-vip-error {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: 700px) {
+  .topology-vip-editor-body {
+    grid-template-columns: 1fr;
+  }
+
+  .topology-vip-inline {
+    grid-template-columns: minmax(0, 1fr) 62px;
+  }
+
+  .architecture-execution-mask { padding: 10px; }
+  .architecture-execution-modal { width: calc(100vw - 20px); max-height: calc(100vh - 20px); }
+  .architecture-dialog-steps li { grid-template-columns: 28px minmax(0, 1fr); }
+  .architecture-dialog-steps li > em { grid-column: 2; justify-self: start; }
+  .architecture-execution-modal > footer { align-items: stretch; flex-direction: column; }
+}
+
+@media (min-width: 701px) {
+  .architecture-execution-modal { width: min(920px, calc(100vw - 64px)); border-radius: 15px; }
+  .architecture-execution-modal > header { padding: 25px 30px 20px; }
+  .architecture-execution-modal > header p { font-size: 11px; }
+  .architecture-execution-modal > header h2 { font-size: 25px; }
+  .architecture-execution-modal > header small { font-size: 13px; }
+  .architecture-dialog-verdict { padding: 16px 30px; }
+  .architecture-dialog-verdict small { font-size: 12px; }
+  .architecture-dialog-steps { padding: 18px 30px 24px; gap: 11px; }
+  .architecture-dialog-steps li { min-height: 68px; padding: 13px 15px; }
+  .architecture-dialog-steps li > div b { font-size: 14px; }
+  .architecture-dialog-steps li > div small { font-size: 11px; line-height: 1.55; }
+  .architecture-execution-modal > footer { padding: 17px 30px; }
+  .architecture-execution-modal > footer button { min-height: 40px; padding: 10px 16px; font-size: 13px; }
+  .vip-drift-modal { width: min(840px, calc(100vw - 64px)); }
+  .vip-drift-modal > header { padding: 25px 28px 21px; gap: 15px; }
+  .vip-drift-modal > header > span { width: 48px; height: 48px; border-radius: 11px; font-size: 12px; }
+  .vip-drift-modal > header p { font-size: 11px; }
+  .vip-drift-modal > header h2 { font-size: 25px; }
+  .vip-drift-modal > header small { font-size: 13px; }
+  .vip-drift-route { padding: 24px 30px 16px; gap: 18px; }
+  .vip-drift-route > article { padding: 17px 18px; }
+  .vip-drift-route > article small { font-size: 11px; }
+  .vip-drift-route > article b { font-size: 18px; }
+  .vip-drift-route > article span { font-size: 11px; }
+  .vip-drift-safety { padding: 11px 30px 18px; gap: 10px; }
+  .vip-drift-safety li { padding: 12px; gap: 8px; }
+  .vip-drift-safety li > i { width: 24px; height: 24px; font-size: 10px; }
+  .vip-drift-safety b { font-size: 11px; }
+  .vip-drift-safety small { font-size: 9px; }
+  .vip-drift-warning { margin: 0 30px 22px; padding: 13px 15px; }
+  .vip-drift-warning b { font-size: 12px; }
+  .vip-drift-warning p { font-size: 11px; }
+  .vip-drift-modal > footer { padding: 17px 28px; }
+  .vip-drift-modal > footer button { min-height: 40px; padding: 10px 16px; font-size: 13px; }
+  .topology-vip-palette { width: min(620px,100%); padding: 14px 16px; }
+  .topology-vip-palette > header b { font-size: 14px; }
+  .topology-vip-palette > header small { font-size: 11px; }
+  .topology-node-vip-card { min-width: 178px; padding: 8px 9px; }
+  .topology-node-vip-card b { font-size: 13px; }
+  .topology-node-vip-card small { font-size: 10px; }
+  .topology-vip-editor-body { padding: 15px 16px 17px; gap: 12px; }
+  .topology-vip-editor-body label { font-size: 12px; }
+  .topology-vip-editor-body input,.topology-vip-editor-body select { height: 40px; font-size: 13px; }
+}

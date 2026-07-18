@@ -1,6 +1,7 @@
 /* Unified native select controls. Keep semantic <select> behaviour while
    presenting one consistent control across tables, toolbars and forms. */
 select:not([multiple]):not([size]) {
+  box-sizing: border-box;
   min-height: 36px;
   padding: 7px 34px 7px 11px !important;
   border: 1px solid #cbd7e6 !important;
@@ -15,10 +16,25 @@ select:not([multiple]):not([size]) {
   font: inherit;
   font-size: 13px;
   line-height: 20px;
-  appearance: none;
-  -webkit-appearance: none;
+  appearance: none !important;
+  -webkit-appearance: none !important;
+  -moz-appearance: none !important;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   cursor: pointer;
   transition: border-color .16s ease, box-shadow .16s ease, background-color .16s ease;
+}
+
+select:not([multiple]):not([size])::-ms-expand {
+  display: none;
+}
+
+/* Legacy wrappers used to draw their own arrow. The select itself now owns
+   the only arrow, so wrappers must remain visually neutral. */
+.select-control::after {
+  display: none !important;
+  content: none !important;
 }
 
 select:not([multiple]):not([size]):hover:not(:disabled) {
@@ -72,6 +88,18 @@ select:not([multiple]):not([size]) optgroup {
 .agent-list-toolbar select,
 .param-toolbar select {
   min-height: 34px;
+}
+
+/* Role selectors live in fixed-width topology cards and need a compact arrow
+   gutter instead of the full form-control padding. */
+.topology-edit-node > header select:not([multiple]):not([size]) {
+  width: 66px;
+  min-height: 28px;
+  height: 28px;
+  padding: 3px 24px 3px 9px !important;
+  background-position: right 8px center !important;
+  background-size: 10px 7px !important;
+  font-size: 12px;
 }
 
 @media (max-width: 720px) {

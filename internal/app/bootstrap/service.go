@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"gmha/internal/buildinfo"
 	"gmha/internal/domain"
 	"gmha/internal/platform/config"
 	"gmha/internal/platform/system"
@@ -109,7 +110,7 @@ func (s *Service) pushAndStartAgent(ctx context.Context, host domain.Host, token
 		BootstrapToken:    token,
 		ManagerURL:        s.cfg.PublicURL,
 		HeartbeatInterval: 15 * time.Second,
-		Version:           "0.1.0",
+		Version:           buildinfo.CurrentVersion(),
 	})
 	if err != nil {
 		return err

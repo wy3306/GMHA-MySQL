@@ -91,7 +91,7 @@ func BuildMySQLUninstallCommands(spec taskdomain.MySQLUninstallSpec) ([]MySQLUni
 	return []MySQLUninstallCommand{
 		{Title: "停止 MySQL", Command: stopMySQLCommand(spec)},
 		{Title: "取消开机自启", Command: fmt.Sprintf("systemctl disable %s 2>/dev/null || true", shellEscape(spec.SystemdUnitName))},
-		{Title: "删除 systemd 管理文件", Command: fmt.Sprintf("rm -f /etc/systemd/system/%s.service", shellEscape(spec.SystemdUnitName))},
+		{Title: "删除 systemd 管理文件", Command: fmt.Sprintf("rm -f /etc/systemd/system/%s.service; rm -rf -- /etc/systemd/system/%s.service.d", shellEscape(spec.SystemdUnitName), shellEscape(spec.SystemdUnitName))},
 		{Title: "删除实例数据目录", Command: removeInstancePathsCommand(spec)},
 		{Title: "删除临时安装包", Command: removePackageCommand(spec)},
 		{Title: "删除安装目录和软链接", Command: uninstallBaseDirCommand(spec)},
@@ -214,6 +214,7 @@ func verifyUninstallCommand(spec taskdomain.MySQLUninstallSpec) string {
 		checks = append(checks, "test ! -e "+shellEscape(path))
 	}
 	checks = append(checks, "test ! -e /etc/systemd/system/"+shellEscape(spec.SystemdUnitName)+".service")
+	checks = append(checks, "test ! -e /etc/systemd/system/"+shellEscape(spec.SystemdUnitName)+".service.d")
 	if installDir == "" {
 		checks = append(checks, "test ! -e "+shellEscape(baseDir))
 		return strings.Join(checks, " && ")

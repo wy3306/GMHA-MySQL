@@ -22,13 +22,14 @@ func NewRouter(core *app.App) http.Handler {
 	mux.Handle("/", frontendHandler())
 	machineHandler := handler.NewMachineHandler(core.MachineService)
 	managerHandler := handler.NewManagerHandler(core.ManagerRuntime)
+	upgradeHandler := handler.NewUpgradeHandler(core.UpgradeService)
 	agentHandler := handler.NewAgentHandler(core.AgentService, core.RecoveryService)
 	mysqlHandler := handler.NewMySQLHandler(core.MySQLService)
 	taskHandler := handler.NewTaskHandler(core.TaskService)
 	packageHandler := handler.NewPackageHandler(core.PackageService)
 	dynamicHandler := handler.NewDynamicCollectHandler(core.HeartbeatService, core.AlertService)
 	haHandler := handler.NewHAHandler(core.HAService)
-	topologyHandler := handler.NewClusterTopologyHandler(core.MachineService, core.MySQLService)
+	topologyHandler := handler.NewClusterTopologyHandler(core.MachineService, core.MySQLService, core.HeartbeatService)
 	backupHandler := handler.NewBackupHandler(core.BackupService)
 	alertHandler := handler.NewAlertHandler(core.AlertService, core.HeartbeatService)
 	mux.HandleFunc("/api/v1/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -36,6 +37,7 @@ func NewRouter(core *app.App) http.Handler {
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
 	mux.HandleFunc("/api/v1/machines", machineHandler.HandleMachines)
+	mux.HandleFunc("/api/v1/machines/batch-delete", machineHandler.HandleBatchDeleteMachines)
 	mux.HandleFunc("/api/v1/machines/precheck", machineHandler.HandlePrecheck)
 	mux.HandleFunc("/api/v1/machines/cleanup", machineHandler.HandleCleanup)
 	mux.HandleFunc("/api/v1/manager/status", managerHandler.HandleStatus)
@@ -44,6 +46,11 @@ func NewRouter(core *app.App) http.Handler {
 	mux.HandleFunc("/api/v1/manager/start", managerHandler.HandleAction)
 	mux.HandleFunc("/api/v1/manager/restart", managerHandler.HandleAction)
 	mux.HandleFunc("/api/v1/manager/stop", managerHandler.HandleAction)
+	mux.HandleFunc("/api/v1/upgrades/overview", upgradeHandler.HandleOverview)
+	mux.HandleFunc("/api/v1/upgrades/jobs", upgradeHandler.HandleJobs)
+	mux.HandleFunc("/api/v1/upgrades/agent", upgradeHandler.HandleAgent)
+	mux.HandleFunc("/api/v1/upgrades/manager", upgradeHandler.HandleManager)
+	mux.HandleFunc("/api/v1/upgrades/", upgradeHandler.HandleJob)
 	mux.HandleFunc("/api/v1/machines/", machineHandler.HandleMachineByID)
 	mux.HandleFunc("/api/v1/ssh-credentials", machineHandler.HandleCredentials)
 	mux.HandleFunc("/api/v1/ssh-credentials/", machineHandler.HandleCredentialByID)
@@ -65,7 +72,7 @@ func NewRouter(core *app.App) http.Handler {
 			machineHandler.HandleClusterMembers(w, r)
 			return
 		}
-		if strings.Contains(r.URL.Path, "/vip/") || strings.Contains(r.URL.Path, "/failover/") || strings.Contains(r.URL.Path, "/architecture/") {
+		if isHAClusterActionPath(r.URL.Path) {
 			haHandler.HandleClusterActions(w, r)
 			return
 		}
@@ -76,6 +83,7 @@ func NewRouter(core *app.App) http.Handler {
 	mux.HandleFunc("/api/v1/mysql/account-presets", mysqlHandler.HandleAccountPresets)
 	mux.HandleFunc("/api/v1/agents/retry-install", agentHandler.HandleRetryInstall)
 	mux.HandleFunc("/api/v1/agents/upgrade", agentHandler.HandleUpgrade)
+	mux.HandleFunc("/api/v1/agents/detect-version", agentHandler.HandleDetectVersion)
 	mux.HandleFunc("/api/v1/agents/repair-mysql-config", agentHandler.HandleRepairMySQLConfig)
 	mux.HandleFunc("/api/v1/agents/uninstall", agentHandler.HandleUninstall)
 	mux.HandleFunc("/api/v1/agents/recovery-tasks", agentHandler.HandleRecoveryTasks)
@@ -90,7 +98,9 @@ func NewRouter(core *app.App) http.Handler {
 	mux.HandleFunc("/api/v1/tasks/cluster-automation/artifacts/", taskHandler.HandleClusterAutomationArtifact)
 	mux.HandleFunc("/api/v1/tasks/mysql-install", taskHandler.HandleCreateMySQLInstallTask)
 	mux.HandleFunc("/api/v1/tasks/mysql-parameters", taskHandler.HandleMySQLParameters)
+	mux.HandleFunc("/api/v1/tasks/mysql-users", taskHandler.HandleMySQLUsers)
 	mux.HandleFunc("/api/v1/tasks/mysql-upgrade", taskHandler.HandleMySQLUpgrade)
+	mux.HandleFunc("/api/v1/tasks/mysql-upgrade/precheck", taskHandler.HandleMySQLUpgradePrecheck)
 	mux.HandleFunc("/api/v1/tasks/mysql-uninstall", taskHandler.HandleCreateMySQLUninstallTask)
 	mux.HandleFunc("/api/v1/tasks/mysql-topology", taskHandler.HandleCreateMySQLTopologyTasks)
 	mux.HandleFunc("/api/v1/tasks/cluster-mysql-install", taskHandler.HandleCreateClusterMySQLInstallTasks)
@@ -114,6 +124,11 @@ func NewRouter(core *app.App) http.Handler {
 	mux.HandleFunc("/api/v1/software/mysql/", taskHandler.HandleMySQLPackageDownload)
 	mux.Handle("/ws/agent/tasks", taskHandler.HandleAgentWS())
 	return trackPlatformOperations(mux, core.TaskService)
+}
+
+func isHAClusterActionPath(path string) bool {
+	trimmed := strings.Trim(path, "/")
+	return strings.HasSuffix(trimmed, "/bootstrap") || strings.Contains(trimmed, "/vip/") || strings.Contains(trimmed, "/failover/") || strings.Contains(trimmed, "/architecture/")
 }
 
 // Serve 在指定地址启动 HTTP 服务器。

@@ -1,15 +1,25 @@
 package http
 
 import (
+	"context"
 	"database/sql"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 
 	"gmha/internal/app"
 	persistence "gmha/internal/infrastructure/persistence/sqlite"
 	_ "modernc.org/sqlite"
 )
+
+func TestRelatedTaskIDsRecognizesEveryParentTaskPrefix(t *testing.T) {
+	got := relatedTaskIDs([]byte(`{"parent":{"Task":{"ID":"batch-task-1"}},"bootstrap":{"task_id":"cluster-bootstrap-2"},"run_id":"arch-run-3","child":{"task_id":"task-4"}}`))
+	want := []string{"arch-run-3", "batch-task-1", "cluster-bootstrap-2", "task-4"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("relatedTaskIDs() = %v, want %v", got, want)
+	}
+}
 
 func newOperationTrackingTestService(t *testing.T) *app.TaskService {
 	t.Helper()
@@ -114,5 +124,58 @@ func TestTrackPlatformOperationsSkipsAgentHeartbeat(t *testing.T) {
 	}
 	if len(items) != 0 {
 		t.Fatalf("heartbeat should not flood task center: %+v", items)
+	}
+}
+
+func TestTrackPlatformOperationsDeduplicatesIdempotentRequest(t *testing.T) {
+	service := newOperationTrackingTestService(t)
+	handler := trackPlatformOperations(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"cred-production"}`))
+	}), service)
+
+	for range 2 {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/ssh-credentials", nil)
+		req.Header.Set("X-Idempotency-Key", "credential-submit-1")
+		handler.ServeHTTP(httptest.NewRecorder(), req)
+	}
+
+	items, err := service.ListTasks(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("idempotent retry created %d operation tasks: %+v", len(items), items)
+	}
+}
+
+func TestTrackPlatformOperationsWrapsReturnedWorkflowParent(t *testing.T) {
+	service := newOperationTrackingTestService(t)
+	parent, err := service.CreateBatchTrackingTask(context.Background(), "vip_scan", "扫描集群 VIP", "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.FinalizeBatchTrackingTask(context.Background(), parent.Task.ID, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	handler := trackPlatformOperations(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"task_id":"` + parent.Task.ID + `"}`))
+	}), service)
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/api/v1/clusters/demo/vip/scan", nil))
+
+	items, err := service.ListTasks(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Type != "platform_operation" {
+		t.Fatalf("workflow parent was not wrapped into one user operation: %+v", items)
+	}
+	detail, err := service.GetTaskDetail(context.Background(), items[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(detail.Children) != 1 || detail.Children[0].ID != parent.Task.ID {
+		t.Fatalf("workflow parent relationship missing: %+v", detail.Children)
 	}
 }

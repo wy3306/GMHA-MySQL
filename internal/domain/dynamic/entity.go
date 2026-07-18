@@ -61,9 +61,8 @@ type MetricBatchResult struct {
 	Items       []MetricResult `json:"items"`
 }
 
-// BuildDefaultDynamicCollectConfig 构建默认的主机级动态采集配置，包含18项基础指标：
-// CPU使用率、内存使用率、IO状态、负载均值、NTP偏移、SSH探活、inode使用率、
-// MySQL进程存活、端口监听、Socket状态、连接状态、数据盘/Binlog盘/Redo盘/Tmp盘/Undo盘使用率。
+// BuildDefaultDynamicCollectConfig 构建默认的主机级动态采集配置。
+// MySQL 指标由独立的多实例采集器负责，不能在没有已登记实例时按默认 3306 采集。
 func BuildDefaultDynamicCollectConfig() DynamicCollectConfig {
 	now := time.Now().UTC()
 	names := []string{
@@ -72,19 +71,12 @@ func BuildDefaultDynamicCollectConfig() DynamicCollectConfig {
 		"agent_cpu_usage_percent",
 		"agent_memory_rss_mb",
 		"io_status",
+		"filesystem_usage",
+		"network_throughput",
 		"load_average",
 		"ntp_offset_ms",
 		"ssh_probe",
 		"inode_usage",
-		"mysql_process_alive",
-		"mysql_port_listening",
-		"mysql_socket_ok",
-		"mysql_connectivity",
-		"mysql_data_disk_usage",
-		"mysql_binlog_disk_usage",
-		"mysql_redo_disk_usage",
-		"mysql_tmp_disk_usage",
-		"mysql_undo_disk_usage",
 	}
 	tasks := make([]CollectTaskSpec, 0, len(names))
 	for _, name := range names {
@@ -92,9 +84,11 @@ func BuildDefaultDynamicCollectConfig() DynamicCollectConfig {
 		switch name {
 		case "agent_cpu_usage_percent", "agent_memory_rss_mb":
 			interval = 15
+		case "filesystem_usage":
+			interval = 30
 		case "ntp_offset_ms":
 			interval = 60
-		case "ssh_probe", "inode_usage", "mysql_data_disk_usage", "mysql_binlog_disk_usage", "mysql_redo_disk_usage", "mysql_tmp_disk_usage", "mysql_undo_disk_usage":
+		case "ssh_probe", "inode_usage":
 			interval = 30
 		}
 		tasks = append(tasks, CollectTaskSpec{
@@ -183,6 +177,7 @@ func BuildDefaultMySQLDynamicCollectConfig() DynamicCollectConfig {
 	add("mysql_long_sleep_connections", "connection", 5, "长时间Sleep连接数", map[string]string{"query": "select count(*) from information_schema.processlist where command = 'Sleep' and time > 300"})
 	status("mysql_qps", "performance", 5, "QPS", "Questions")
 	status("mysql_tps", "performance", 5, "TPS", "Com_commit")
+	status("mysql_uptime", "performance", 5, "运行时长", "Uptime")
 	status("mysql_com_commit_per_sec", "performance", 5, "每秒提交事务数", "Com_commit")
 	status("mysql_com_rollback_per_sec", "performance", 5, "每秒回滚事务数", "Com_rollback")
 	status("mysql_select_per_sec", "performance", 5, "每秒Select次数", "Com_select")
@@ -285,10 +280,15 @@ func BuildDefaultMySQLDynamicCollectConfig() DynamicCollectConfig {
 	add("mysql_slow_sql_hot_table_stats", "performance", 30, "慢SQL热点表统计", nil)
 	add("mysql_last_replication_error_time", "replication", 30, "最近一次复制错误时间", nil)
 	add("mysql_tmp_dir_space_change", "storage", 30, "临时目录空间占用变化", nil)
+	add("mysql_data_disk_usage", "storage", 30, "数据盘使用率", nil)
+	add("mysql_binlog_disk_usage", "storage", 30, "Binlog盘使用率", nil)
+	add("mysql_redo_disk_usage", "storage", 30, "Redo盘使用率", nil)
+	add("mysql_tmp_disk_usage", "storage", 30, "临时盘使用率", nil)
+	add("mysql_undo_disk_usage", "storage", 30, "Undo盘使用率", nil)
 
-	add("mysql_tablespace_fragment_total_bytes", "storage", 300, "所有表空间总碎片大小", nil)
-	add("mysql_index_data_total_bytes", "storage", 300, "所有索引数据量大小", nil)
-	add("mysql_table_data_total_bytes", "storage", 300, "所有数据量大小", nil)
+	add("mysql_tablespace_fragment_total_bytes", "storage", 300, "所有表空间总碎片大小", map[string]string{"query": "select coalesce(sum(data_free),0) from information_schema.tables where table_schema not in ('mysql','information_schema','performance_schema','sys')"})
+	add("mysql_index_data_total_bytes", "storage", 300, "所有索引数据量大小", map[string]string{"query": "select coalesce(sum(index_length),0) from information_schema.tables where table_schema not in ('mysql','information_schema','performance_schema','sys')"})
+	add("mysql_table_data_total_bytes", "storage", 300, "所有数据量大小", map[string]string{"query": "select coalesce(sum(data_length),0) from information_schema.tables where table_schema not in ('mysql','information_schema','performance_schema','sys')"})
 	variable("mysql_slow_query_threshold", "variables", 300, "慢查询阈值", "long_query_time")
 	variable("mysql_slow_query_log_enabled", "variables", 300, "慢查询日志是否开启", "slow_query_log")
 	add("mysql_slow_query_log_growth", "performance", 300, "慢查询日志增长量", nil)
@@ -343,6 +343,11 @@ func mysqlImplementedNoParamCollectors() map[string]bool {
 		"mysql_internal_tmp_disk_table_ratio",
 		"mysql_memory_tmp_to_disk_ratio",
 		"mysql_thread_cache_hit_ratio",
+		"mysql_data_disk_usage",
+		"mysql_binlog_disk_usage",
+		"mysql_redo_disk_usage",
+		"mysql_tmp_disk_usage",
+		"mysql_undo_disk_usage",
 	} {
 		out[name] = true
 	}

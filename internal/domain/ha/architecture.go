@@ -3,10 +3,10 @@ package ha
 import "time"
 
 const (
-	ArchitectureMasterSlave          = "master_slave"
-	ArchitectureDualMaster           = "dual_master"
-	ArchitectureMultiMaster          = "multi_master"
-	ArchitectureKeepalivedDualMaster = "keepalived_dual_master"
+	ArchitectureStandalone  = "standalone"
+	ArchitectureMasterSlave = "master_slave"
+	ArchitectureDualMaster  = "dual_master"
+	ArchitectureMultiMaster = "multi_master"
 )
 
 const (
@@ -29,16 +29,25 @@ type ArchitectureNodeRequest struct {
 
 // ArchitectureAdjustmentRequest 是架构调整预检与执行共用的请求。
 type ArchitectureAdjustmentRequest struct {
-	Architecture                string                    `json:"architecture"`
-	CurrentMasterMachineID      string                    `json:"current_master_machine_id,omitempty"`
-	PreferredNewMasterMachineID string                    `json:"preferred_new_master_machine_id,omitempty"`
-	MoveVIP                     bool                      `json:"move_vip"`
-	ForceAfterTimeout           bool                      `json:"force_after_timeout"`
-	ManagementUsers             []string                  `json:"management_users,omitempty"`
-	RootPassword                string                    `json:"root_password,omitempty"`
-	ReplicationUser             string                    `json:"replication_user,omitempty"`
-	ReplicationPassword         string                    `json:"replication_password,omitempty"`
-	Nodes                       []ArchitectureNodeRequest `json:"nodes"`
+	Architecture                string `json:"architecture"`
+	CurrentArchitecture         string `json:"current_architecture,omitempty"`
+	CurrentMasterMachineID      string `json:"current_master_machine_id,omitempty"`
+	PreferredNewMasterMachineID string `json:"preferred_new_master_machine_id,omitempty"`
+	MoveVIP                     bool   `json:"move_vip"`
+	// InitializeVIP marks the first binding, where no machine currently owns the VIP.
+	InitializeVIP bool `json:"initialize_vip,omitempty"`
+	// VIPOnly runs the ordered VIP safety workflow without changing MySQL roles or
+	// replication. It is used when a VIP card is dropped onto an existing master.
+	VIPOnly           bool     `json:"vip_only,omitempty"`
+	ForceAfterTimeout bool     `json:"force_after_timeout"`
+	ManagementUsers   []string `json:"management_users,omitempty"`
+	RootPassword      string   `json:"root_password,omitempty"`
+	// RootPasswords is used only while executing a combined install/bootstrap
+	// flow. It is keyed by machine ID and is never serialized or persisted.
+	RootPasswords       map[string]string         `json:"-"`
+	ReplicationUser     string                    `json:"replication_user,omitempty"`
+	ReplicationPassword string                    `json:"replication_password,omitempty"`
+	Nodes               []ArchitectureNodeRequest `json:"nodes"`
 }
 
 // ArchitecturePlanStep 是 Manager 必须按顺序执行的安全步骤。

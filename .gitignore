@@ -22,6 +22,9 @@ bin/
 
 # Compiled binaries (project-specific)
 gmha
+gmha-web
+gmha-web.*
+gmha.*
 gmha-agent
 agentd
 demo

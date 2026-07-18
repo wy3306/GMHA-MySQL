@@ -99,6 +99,25 @@ func TestPackageSelectorSelectsIndependentVersionAndArchitecture(t *testing.T) {
 	}
 }
 
+func TestPackageSelectorMatchesExactGlibc217Package(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{
+		"mysql-8.0.44-linux-glibc2.17-x86_64.tar.xz",
+		"mysql-8.0.44-linux-glibc2.28-x86_64.tar.xz",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	item, err := NewPackageSelector(dir).SelectVersionArchitecture(collectdomain.MachineInfo{Arch: "x86_64", GlibcVersion: "2.17"}, "8.0.44", "x86_64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.FileName != "mysql-8.0.44-linux-glibc2.17-x86_64.tar.xz" {
+		t.Fatalf("unexpected package: %s", item.FileName)
+	}
+}
+
 func TestPackageSelectorRejectsArchitectureDifferentFromMachine(t *testing.T) {
 	dir := t.TempDir()
 	name := "mysql-8.4.6-linux-glibc2.17-aarch64.tar.xz"

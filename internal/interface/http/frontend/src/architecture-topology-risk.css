@@ -1,5 +1,8 @@
 .topology-level{position:relative}.topology-level-label{display:block;width:max-content;margin:0 auto 12px;padding:4px 10px;border-radius:12px;background:#e7f1ff;color:#2869ae;font-size:10px;font-weight:700}.topology-master-level{padding:0 6%}.topology-root-grid{grid-template-columns:repeat(auto-fit,minmax(205px,260px));justify-content:center}.topology-replica-level{margin-top:0}.topology-replica-level .topology-level-label{background:#e8f6f1;color:#327862}.topology-leaf-grid{grid-template-columns:repeat(auto-fit,minmax(205px,1fr))}.topology-edit-node.root-node{border-top:3px solid #3981d6}.topology-edit-node.leaf-node{border-top:3px solid #37a884}.topology-branch-connector{position:relative;height:60px;margin:0 9%}.topology-branch-connector i{position:absolute;top:0;bottom:20px;left:50%;width:2px;background:#afc4da;transform:translateX(-50%)}.topology-branch-connector span{position:absolute;right:0;bottom:20px;left:0;height:2px;background:#afc4da}.topology-branch-connector span:before,.topology-branch-connector span:after{position:absolute;top:0;width:2px;height:20px;background:#afc4da;content:""}.topology-branch-connector span:before{left:0}.topology-branch-connector span:after{right:0}.topology-risk-mask{z-index:80}.topology-risk-modal{width:min(570px,calc(100vw - 30px));padding:0;overflow:hidden}.topology-risk-modal>header{display:grid;padding:20px 22px;grid-template-columns:42px 1fr 28px;align-items:center;gap:12px;border-bottom:1px solid #f0dadd;background:#fff8f8}.topology-risk-modal>header>span{display:grid;width:38px;height:38px;border-radius:50%;background:#e54858;color:#fff;place-items:center;font-size:21px;font-weight:800}.topology-risk-modal>header p{margin:0 0 3px;color:#c13d4b;font-size:9px;font-weight:800;letter-spacing:1px}.topology-risk-modal>header h2{margin:0;color:#402b31;font-size:19px}.topology-risk-modal>header button{border:0;background:transparent;color:#a89096;cursor:pointer;font-size:20px}.topology-risk-target{display:grid;margin:17px 22px 0;padding:12px 14px;grid-template-columns:1fr auto;gap:4px;border:1px solid #e3e9f0;border-radius:6px;background:#fafbfd}.topology-risk-target small{grid-column:1/-1;color:#8897a9;font-size:9px}.topology-risk-target b{color:#2e425a;font-size:13px}.topology-risk-target span{padding:3px 8px;border-radius:10px;background:#fff0f1;color:#c23f4d;font-size:10px}.topology-risk-warning{margin:12px 22px;padding:12px 14px;border-left:3px solid #e54858;border-radius:5px;background:#fff5f6}.topology-risk-warning b{color:#bd3443;font-size:13px}.topology-risk-warning p{margin:6px 0 0;color:#79555c;font-size:11px;line-height:1.6}.topology-risk-modal>ul{display:flex;margin:0;padding:2px 22px 18px;flex-direction:column;gap:11px;list-style:none}.topology-risk-modal>ul li{display:grid;grid-template-columns:25px 1fr;gap:10px}.topology-risk-modal>ul i{display:grid;width:24px;height:24px;border-radius:50%;background:#eef3f8;color:#657a93;place-items:center;font-size:10px;font-style:normal}.topology-risk-modal>ul span{display:flex;flex-direction:column;gap:3px}.topology-risk-modal>ul b{color:#384c64;font-size:11px}.topology-risk-modal>ul small{color:#7e8da1;font-size:10px;line-height:1.45}.topology-risk-modal>footer{display:flex;padding:14px 22px;justify-content:flex-end;gap:9px;border-top:1px solid #e8edf3;background:#fafbfd}.topology-risk-modal>footer button{min-height:36px}@media(max-width:700px){.topology-master-level{padding:0}.topology-root-grid,.topology-leaf-grid{grid-template-columns:1fr}.topology-branch-connector{margin:0 50%}.topology-branch-connector span{display:none}.topology-risk-modal>footer{flex-direction:column-reverse}.topology-risk-modal>footer button{width:100%}}
 .topology-risk-replacement{display:flex;margin:12px 22px 0;flex-direction:column;gap:6px;color:#435971;font-size:11px;font-weight:700}.topology-risk-replacement select{height:36px;padding:0 9px;border:1px solid #d2deea;border-radius:5px;background:#fff}.topology-risk-replacement small{color:#7d8da1;font-size:9px;font-weight:400;line-height:1.45}
+.topology-risk-modal>footer>small{max-width:190px;margin-right:auto;align-self:center;color:#7d8da1;font-size:9px;line-height:1.45}.topology-draft-feedback{display:grid;margin:0 0 14px;padding:12px 14px;grid-template-columns:28px 1fr auto;align-items:start;gap:10px;border:1px solid #b9e3d3;border-radius:7px;background:#f0fbf7;color:#285f50}.topology-draft-feedback>span{display:grid;width:26px;height:26px;border-radius:50%;background:#2e9b78;color:#fff;place-items:center;font-weight:800}.topology-draft-feedback b{font-size:12px}.topology-draft-feedback p{margin:4px 0 0;color:#477466;font-size:11px;line-height:1.55}.topology-draft-actions{display:flex;align-items:center;gap:6px}.topology-draft-actions button{padding:5px 8px;border:1px solid #99cfbd;border-radius:5px;background:#fff;color:#33735f;cursor:pointer;font-size:10px}.topology-draft-actions button:last-child{width:25px;height:25px;padding:0;border:0;background:transparent;color:#6e968a;font-size:18px}@media(max-width:700px){.topology-risk-modal>footer>small{max-width:none;margin:0;text-align:center}.topology-draft-feedback{grid-template-columns:28px 1fr}.topology-draft-actions{grid-column:1/-1;justify-content:flex-end}}
+.architecture-preset-bar{display:grid;margin-bottom:14px;padding:10px;grid-template-columns:minmax(180px,1fr) repeat(3,minmax(145px,190px));gap:8px;border:1px solid #dce5ef;border-radius:9px;background:#fff}.architecture-preset-bar>span{display:flex;padding:4px 8px;flex-direction:column;justify-content:center;gap:3px}.architecture-preset-bar>span b{color:#283e59;font-size:13px}.architecture-preset-bar>span small{color:#8391a3;font-size:9px}.architecture-preset-bar>button{display:grid;min-height:54px;padding:8px 10px;grid-template-columns:27px 1fr;grid-template-rows:auto auto;align-items:center;column-gap:8px;border:1px solid #dce5ef;border-radius:7px;background:#f8fafc;color:#53677f;cursor:pointer;text-align:left;transition:border-color .2s ease,background .2s ease,transform .2s ease,box-shadow .2s ease}.architecture-preset-bar>button:hover{border-color:#91b8e4;transform:translateY(-1px)}.architecture-preset-bar>button.active{border-color:#4388d4;background:#eef6ff;box-shadow:0 0 0 2px #d9eaff}.architecture-preset-bar>button i{display:grid;width:27px;height:27px;grid-row:1/span 2;border-radius:7px;background:#e7eef7;color:#3578c2;place-items:center;font-style:normal;font-weight:800}.architecture-preset-bar>button b{font-size:11px}.architecture-preset-bar>button small{color:#8593a4;font-size:8px}.topology-independent-level{margin-top:22px;padding-top:16px;border-top:1px dashed #d8c9ea}.topology-independent-level .topology-level-label{background:#f1eafd;color:#71539b}.topology-edit-node.independent-node{border-top:3px solid #8b6abb}.topology-edit-node.independent-node footer small{color:#745b94}.topology-independent-note{margin:2px 0 0;padding:9px 10px;border-left:3px solid #8b6abb;border-radius:4px;background:#f7f3fc;color:#6e5a86;font-size:10px;line-height:1.55}@media(max-width:900px){.architecture-preset-bar{grid-template-columns:1fr 1fr}.architecture-preset-bar>span{grid-column:1/-1}}@media(max-width:560px){.architecture-preset-bar{grid-template-columns:1fr}}
+.topology-edit-node.changed{animation:topology-role-change .42s cubic-bezier(.2,.8,.2,1)}.topology-draft-edges>span{animation:topology-edge-enter .34s ease both}.topology-branch-connector i,.topology-branch-connector span{animation:topology-edge-draw .38s ease both}@keyframes topology-role-change{0%{opacity:.35;transform:translateY(10px) scale(.97)}65%{transform:translateY(-2px) scale(1.01)}100%{opacity:1;transform:none}}@keyframes topology-edge-enter{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:none}}@keyframes topology-edge-draw{from{opacity:0}to{opacity:1}}@media(prefers-reduced-motion:reduce){.topology-edit-node.changed,.topology-draft-edges>span,.topology-branch-connector i,.topology-branch-connector span{animation:none!important;transition:none!important}}
 .topology-node-grid{display:flex!important;flex-wrap:wrap;justify-content:center;align-items:flex-start}.topology-edit-node,.topology-add-node-tile{width:224px!important;min-width:224px!important;max-width:224px!important;height:168px!important;min-height:168px!important;max-height:168px!important;flex:0 0 224px;box-sizing:border-box}.topology-edit-node{cursor:grab;user-select:none}.topology-edit-node:active{cursor:grabbing}.topology-edit-node.dragging{opacity:.42;transform:scale(.97)}.topology-level.drag-active{margin-right:-8px;margin-left:-8px;padding-right:8px;padding-left:8px;border-radius:10px;outline:1px dashed #9ab8d7;outline-offset:5px}.topology-level.drag-active .topology-level-label:after{margin-left:5px;content:"· 可放置";font-weight:400}.topology-edit-node[draggable=true] .topology-db-icon:after{margin-left:3px;color:#8ca0b7;content:"⋮⋮";font-size:8px;letter-spacing:-2px}
 
 /* 固定尺寸卡片使用明确的三段高度，避免内容撑出卡片并覆盖下一拓扑层。 */
@@ -85,5 +88,496 @@
 
   .topology-draft-canvas {
     overflow-x: auto;
+  }
+}
+
+/* 快速转换必须有明确的确认入口，避免草稿更新后用户找不到执行链路。 */
+.architecture-quick-confirm {
+  display: flex;
+  margin: -4px 0 14px;
+  padding: 13px 14px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border: 1px solid #b9d5f3;
+  border-radius: 9px;
+  background: linear-gradient(100deg, #f1f7ff, #f8fbff);
+  box-shadow: 0 5px 16px rgba(42, 108, 178, .08);
+  animation: architecture-confirm-enter .28s ease both;
+}
+
+.architecture-quick-confirm.planned {
+  border-color: #b9dfd1;
+  background: linear-gradient(100deg, #f0faf6, #f8fcfa);
+  box-shadow: 0 5px 16px rgba(42, 135, 100, .08);
+}
+
+.architecture-quick-confirm > div {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 11px;
+}
+
+.architecture-quick-confirm > div > i {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+  border-radius: 50%;
+  background: #2f7ed0;
+  color: #fff;
+  place-items: center;
+  font-size: 15px;
+  font-style: normal;
+  font-weight: 800;
+}
+
+.architecture-quick-confirm.planned > div > i {
+  background: #2c9973;
+}
+
+.architecture-quick-confirm > div > span {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.architecture-quick-confirm b {
+  color: #294563;
+  font-size: 13px;
+}
+
+.architecture-quick-confirm small {
+  color: #6f8298;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.architecture-quick-confirm > button {
+  min-height: 40px;
+  padding-right: 17px;
+  padding-left: 17px;
+  flex: 0 0 auto;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+@keyframes architecture-confirm-enter {
+  from { opacity: 0; transform: translateY(-5px); }
+  to { opacity: 1; transform: none; }
+}
+
+@media (max-width: 760px) {
+  .architecture-quick-confirm {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .architecture-quick-confirm > button {
+    width: 100%;
+  }
+}
+
+/* 角色切换确认弹窗：把选择、角色结果和风险拆成稳定的信息层级。 */
+.topology-risk-modal {
+  display: flex;
+  width: min(720px, calc(100vw - 32px));
+  max-height: calc(100vh - 36px);
+  padding: 0;
+  flex-direction: column;
+  overflow: hidden;
+  border-radius: 12px;
+}
+
+.topology-risk-modal > header {
+  flex: 0 0 auto;
+  padding: 22px 26px;
+  grid-template-columns: 44px minmax(0, 1fr) 30px;
+  gap: 14px;
+}
+
+.topology-risk-modal > header > span {
+  width: 40px;
+  height: 40px;
+  font-size: 21px;
+}
+
+.topology-risk-modal > header p {
+  margin-bottom: 4px;
+  font-size: 10px;
+  letter-spacing: 1.2px;
+}
+
+.topology-risk-modal > header h2 {
+  font-size: 20px;
+  line-height: 1.3;
+}
+
+.topology-risk-body {
+  display: flex;
+  min-height: 0;
+  padding: 20px 26px 22px;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 16px;
+  overflow-y: auto;
+}
+
+.topology-risk-summary {
+  display: grid;
+  grid-template-columns: minmax(0, .9fr) minmax(280px, 1.35fr);
+  align-items: stretch;
+  gap: 14px;
+}
+
+.topology-risk-summary > .topology-risk-target:only-child {
+  grid-column: 1 / -1;
+}
+
+.topology-risk-target {
+  display: grid;
+  min-height: 78px;
+  margin: 0;
+  padding: 14px 16px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-content: center;
+  gap: 7px 12px;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.topology-risk-target small {
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.topology-risk-target b {
+  overflow: hidden;
+  color: #283e59;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+}
+
+.topology-risk-target span {
+  align-self: center;
+  padding: 5px 10px;
+  border-radius: 12px;
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.topology-risk-replacement {
+  display: flex;
+  min-width: 0;
+  margin: 0;
+  padding: 13px 15px;
+  flex-direction: column;
+  gap: 9px;
+  border: 1px solid #dce6f0;
+  border-radius: 8px;
+  background: #fff;
+  color: #344b65;
+  font-size: 12px;
+}
+
+.topology-risk-replacement > span {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.topology-risk-replacement > span b {
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.topology-risk-replacement > span small {
+  color: #7a8ca1;
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.45;
+}
+
+.topology-risk-replacement select {
+  width: 100%;
+  height: 42px;
+  margin: 0;
+  padding: 0 34px 0 12px;
+  border: 1px solid #bfcfe0;
+  border-radius: 7px;
+  background-color: #f9fbfd;
+  color: #2f465f;
+  font-size: 12px;
+  font-weight: 600;
+  box-shadow: 0 1px 2px rgba(32, 58, 86, .04);
+}
+
+.topology-risk-replacement select:focus {
+  border-color: #6b9ed8;
+  outline: 3px solid rgba(72, 137, 207, .14);
+}
+
+.topology-role-impact {
+  padding: 15px 16px 16px;
+  border: 1px solid #dce5ef;
+  border-radius: 9px;
+  background: #fbfcfe;
+}
+
+.topology-role-impact > header {
+  display: flex;
+  margin-bottom: 12px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.topology-role-impact > header > div {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.topology-role-impact > header b {
+  color: #30465f;
+  font-size: 13px;
+}
+
+.topology-role-impact > header small {
+  color: #7d8ea2;
+  font-size: 11px;
+}
+
+.topology-role-impact > header > em {
+  padding: 4px 9px;
+  border-radius: 12px;
+  background: #eef3f8;
+  color: #60758e;
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.topology-role-impact-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.topology-role-impact-grid article {
+  display: grid;
+  min-width: 0;
+  min-height: 64px;
+  padding: 11px 12px;
+  grid-template-columns: 30px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid;
+  border-radius: 8px;
+  animation: topology-impact-enter .32s ease both;
+}
+
+.topology-role-impact-grid article > span {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  place-items: center;
+  font-size: 15px;
+  font-weight: 800;
+}
+
+.topology-role-impact-grid article > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.topology-role-impact-grid article small {
+  font-size: 10px;
+  line-height: 1.3;
+}
+
+.topology-role-impact-grid article b {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+.topology-role-impact-grid article > em {
+  padding: 4px 7px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.topology-role-impact-grid article.promoted {
+  border-color: #b8dfd0;
+  background: #f2fbf7;
+  color: #276a54;
+}
+
+.topology-role-impact-grid article.promoted > span,
+.topology-role-impact-grid article.promoted > em {
+  background: #dff4ea;
+  color: #24785b;
+}
+
+.topology-role-impact-grid article.demoted {
+  border-color: #edced1;
+  background: #fff7f7;
+  color: #8b4650;
+  animation-delay: 70ms;
+}
+
+.topology-role-impact-grid article.demoted > span,
+.topology-role-impact-grid article.demoted > em {
+  background: #fde7e9;
+  color: #b23f4e;
+}
+
+.topology-risk-warning {
+  margin: 0;
+  padding: 13px 15px;
+  border-radius: 7px;
+}
+
+.topology-risk-warning b {
+  font-size: 13px;
+}
+
+.topology-risk-warning p {
+  margin-top: 5px;
+  font-size: 11px;
+  line-height: 1.65;
+}
+
+.topology-risk-effects {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  list-style: none;
+}
+
+.topology-risk-effects li {
+  display: grid;
+  min-width: 0;
+  padding: 10px 11px;
+  grid-template-columns: 25px minmax(0, 1fr);
+  align-items: start;
+  gap: 9px;
+  border: 1px solid #e4eaf1;
+  border-radius: 7px;
+  background: #fff;
+}
+
+.topology-risk-effects i {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: #eef3f8;
+  color: #657a93;
+  place-items: center;
+  font-size: 10px;
+  font-style: normal;
+}
+
+.topology-risk-effects span {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.topology-risk-effects b {
+  color: #384c64;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.topology-risk-effects small {
+  color: #7e8da1;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.topology-risk-modal > footer {
+  flex: 0 0 auto;
+  padding: 15px 26px;
+  align-items: center;
+  gap: 10px;
+}
+
+.topology-risk-modal > footer > small {
+  max-width: 270px;
+  margin-right: auto;
+  color: #73869c;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.topology-risk-modal > footer button {
+  min-height: 40px;
+  padding-right: 16px;
+  padding-left: 16px;
+  font-size: 12px;
+}
+
+@keyframes topology-impact-enter {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+
+@media (max-width: 680px) {
+  .topology-risk-modal {
+    width: min(720px, calc(100vw - 18px));
+    max-height: calc(100vh - 18px);
+  }
+
+  .topology-risk-modal > header,
+  .topology-risk-body,
+  .topology-risk-modal > footer {
+    padding-right: 16px;
+    padding-left: 16px;
+  }
+
+  .topology-risk-summary,
+  .topology-role-impact-grid,
+  .topology-risk-effects {
+    grid-template-columns: 1fr;
+  }
+
+  .topology-risk-modal > footer {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .topology-risk-modal > footer > small {
+    max-width: none;
+    margin: 0 0 2px;
+    text-align: center;
+  }
+
+  .topology-risk-modal > footer button {
+    width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .architecture-quick-confirm,
+  .topology-role-impact-grid article {
+    animation: none;
   }
 }

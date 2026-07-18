@@ -95,7 +95,7 @@ func DefaultAccountSpecs() []AccountSpec {
 
 // AvailablePrivileges 返回 Web 可选择的受控 MySQL 权限白名单，避免任意 SQL 权限拼接。
 func AvailablePrivileges() []string {
-	return []string{"SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "DROP", "SHOW VIEW", "TRIGGER", "EVENT", "PROCESS", "RELOAD", "LOCK TABLES", "REPLICATION CLIENT", "REPLICATION SLAVE", "CONNECTION_ADMIN", "BACKUP_ADMIN", "CLONE_ADMIN"}
+	return []string{"SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "CREATE USER", "ALTER", "DROP", "SHOW VIEW", "TRIGGER", "EVENT", "PROCESS", "RELOAD", "LOCK TABLES", "REPLICATION CLIENT", "REPLICATION SLAVE", "CONNECTION_ADMIN", "SYSTEM_VARIABLES_ADMIN", "REPLICATION_SLAVE_ADMIN", "BACKUP_ADMIN", "CLONE_ADMIN"}
 }
 
 // DefaultPrivileges 返回各预设角色的默认授权集合。
@@ -104,7 +104,7 @@ func DefaultPrivileges(role string) []string {
 	case AccountRoleMonitor:
 		return []string{"SELECT", "PROCESS", "REPLICATION CLIENT"}
 	case AccountRoleMHA:
-		return []string{"CREATE", "ALTER", "DROP", "INSERT", "UPDATE", "DELETE", "SELECT", "SHOW VIEW", "TRIGGER", "EVENT", "PROCESS", "RELOAD", "LOCK TABLES", "REPLICATION CLIENT", "REPLICATION SLAVE", "CONNECTION_ADMIN", "BACKUP_ADMIN", "CLONE_ADMIN"}
+		return []string{"CREATE", "CREATE USER", "ALTER", "DROP", "INSERT", "UPDATE", "DELETE", "SELECT", "SHOW VIEW", "TRIGGER", "EVENT", "PROCESS", "RELOAD", "LOCK TABLES", "REPLICATION CLIENT", "REPLICATION SLAVE", "CONNECTION_ADMIN", "SYSTEM_VARIABLES_ADMIN", "REPLICATION_SLAVE_ADMIN", "BACKUP_ADMIN", "CLONE_ADMIN"}
 	case AccountRoleBackup:
 		return []string{"SELECT", "PROCESS", "RELOAD", "LOCK TABLES", "REPLICATION CLIENT"}
 	default:
@@ -147,6 +147,9 @@ func NormalizeAccountSpecs(input []AccountSpec) []AccountSpec {
 		if item.Privileges != nil {
 			base.Privileges = normalizePrivileges(item.Privileges)
 		}
+		if role == AccountRoleMHA {
+			base.Privileges = ensureManagementPrivileges(base.Privileges)
+		}
 		byRole[role] = base
 	}
 	out := make([]AccountSpec, 0, len(order))
@@ -169,6 +172,20 @@ func NormalizeAccountSpecs(input []AccountSpec) []AccountSpec {
 		out = append(out, item)
 	}
 	return out
+}
+
+func ensureManagementPrivileges(items []string) []string {
+	result := append([]string(nil), items...)
+	seen := make(map[string]bool, len(result))
+	for _, item := range result {
+		seen[item] = true
+	}
+	for _, required := range DefaultPrivileges(AccountRoleMHA) {
+		if !seen[required] {
+			result = append(result, required)
+		}
+	}
+	return result
 }
 
 // ValidateAccountSpecs 验证账号规格列表的合法性，检查用户名、主机地址和密码是否符合规范。
@@ -365,16 +382,7 @@ func basePrivileges(spec AccountSpec) []string {
 	if spec.Privileges != nil {
 		return filterStaticPrivileges(spec.Privileges)
 	}
-	switch spec.Role {
-	case AccountRoleMonitor:
-		return []string{"SELECT", "PROCESS", "REPLICATION CLIENT"}
-	case AccountRoleMHA:
-		return []string{"CREATE", "ALTER", "DROP", "INSERT", "UPDATE", "DELETE", "SELECT", "SHOW VIEW", "TRIGGER", "EVENT", "PROCESS", "RELOAD", "LOCK TABLES", "REPLICATION CLIENT", "REPLICATION SLAVE", "CONNECTION_ADMIN"}
-	case AccountRoleBackup:
-		return []string{"SELECT", "PROCESS", "RELOAD", "LOCK TABLES", "REPLICATION CLIENT"}
-	default:
-		return []string{"SELECT"}
-	}
+	return filterStaticPrivileges(DefaultPrivileges(spec.Role))
 }
 
 // dynamicPrivileges 根据账号角色返回 MySQL 8.0 动态权限列表，如 BACKUP_ADMIN、CLONE_ADMIN 等。
@@ -382,15 +390,11 @@ func dynamicPrivileges(spec AccountSpec) []string {
 	if spec.Privileges != nil {
 		return filterDynamicPrivileges(spec.Privileges)
 	}
-	switch spec.Role {
-	case AccountRoleMHA:
-		return []string{"BACKUP_ADMIN", "CLONE_ADMIN"}
-	case AccountRoleBackup:
-		if spec.ExtendedBackup {
-			return []string{"BACKUP_ADMIN", "CLONE_ADMIN"}
-		}
+	privileges := DefaultPrivileges(spec.Role)
+	if spec.Role == AccountRoleBackup && spec.ExtendedBackup {
+		privileges = append(privileges, "BACKUP_ADMIN", "CLONE_ADMIN")
 	}
-	return nil
+	return filterDynamicPrivileges(privileges)
 }
 
 func normalizePrivileges(items []string) []string {
@@ -422,7 +426,7 @@ func validatePrivileges(items []string) error {
 }
 
 func filterStaticPrivileges(items []string) []string {
-	dynamic := map[string]bool{"CONNECTION_ADMIN": true, "BACKUP_ADMIN": true, "CLONE_ADMIN": true}
+	dynamic := map[string]bool{"CONNECTION_ADMIN": true, "SYSTEM_VARIABLES_ADMIN": true, "REPLICATION_SLAVE_ADMIN": true, "BACKUP_ADMIN": true, "CLONE_ADMIN": true}
 	out := make([]string, 0, len(items))
 	for _, item := range normalizePrivileges(items) {
 		if !dynamic[item] {
@@ -433,8 +437,8 @@ func filterStaticPrivileges(items []string) []string {
 }
 
 func filterDynamicPrivileges(items []string) []string {
-	dynamic := map[string]bool{"CONNECTION_ADMIN": true, "BACKUP_ADMIN": true, "CLONE_ADMIN": true}
-	out := make([]string, 0, 3)
+	dynamic := map[string]bool{"CONNECTION_ADMIN": true, "SYSTEM_VARIABLES_ADMIN": true, "REPLICATION_SLAVE_ADMIN": true, "BACKUP_ADMIN": true, "CLONE_ADMIN": true}
+	out := make([]string, 0, 5)
 	for _, item := range normalizePrivileges(items) {
 		if dynamic[item] {
 			out = append(out, item)
@@ -445,7 +449,11 @@ func filterDynamicPrivileges(items []string) []string {
 
 // grantSQL 生成 GRANT 语句，将指定权限授予对应账号。
 func grantSQL(spec AccountSpec, privileges []string) string {
-	return fmt.Sprintf("GRANT %s ON *.* TO %s", strings.Join(privileges, ", "), accountIdent(spec.Username, spec.Host))
+	sql := fmt.Sprintf("GRANT %s ON *.* TO %s", strings.Join(privileges, ", "), accountIdent(spec.Username, spec.Host))
+	if normalizeRole(spec.Role) == AccountRoleMHA {
+		sql += " WITH GRANT OPTION"
+	}
+	return sql
 }
 
 // accountIdent 生成 MySQL 账号标识符，格式为 'username'@'host'。

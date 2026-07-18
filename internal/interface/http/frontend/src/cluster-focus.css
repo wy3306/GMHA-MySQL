@@ -1,0 +1,104 @@
+/*
+ * 集群详情沉浸模式：一级导航始终保持原位，集群工作台作为上层覆盖它。
+ * 触碰屏幕左缘时，工作台整体向右让位，恢复“一级导航 + 集群导航 + 内容”的原始结构。
+ */
+.shell.cluster-focus-mode {
+  --cluster-primary-nav-width: 208px;
+}
+
+.cluster-sidebar-edge-trigger {
+  display: none;
+}
+
+.shell.cluster-focus-mode > .cluster-sidebar-edge-trigger {
+  position: fixed;
+  z-index: 32;
+  top: 56px;
+  bottom: 0;
+  left: 0;
+  display: block;
+  width: 8px;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  cursor: ew-resize;
+}
+
+.shell.cluster-focus-mode > .cluster-sidebar-edge-trigger:focus-visible {
+  outline: 2px solid #1677ff;
+  outline-offset: -2px;
+}
+
+.shell.cluster-focus-mode > .cluster-dashboard {
+  position: fixed !important;
+  z-index: 30;
+  top: 56px;
+  right: auto;
+  bottom: 0;
+  left: 0;
+  width: 100vw;
+  max-width: none;
+  height: calc(100vh - 56px);
+  overflow: auto;
+  grid-column: auto;
+  box-shadow: none;
+  transition: left 180ms ease, width 180ms ease, box-shadow 180ms ease;
+  will-change: left, width;
+}
+
+/* 桌面端沿用一级侧栏的宽度和表面样式，避免品牌区与集群菜单出现错位断层。 */
+@media (min-width: 1101px) {
+  .shell.cluster-focus-mode > .cluster-dashboard:has(.cluster-context-nav) {
+    padding-left: calc(var(--cluster-primary-nav-width) + 36px) !important;
+  }
+
+  .shell.cluster-focus-mode > .cluster-dashboard .cluster-context-nav {
+    position: fixed;
+    top: 56px;
+    bottom: 0;
+    left: 0;
+    height: calc(100vh - 56px);
+    width: var(--cluster-primary-nav-width);
+    box-sizing: border-box;
+    overflow-y: auto;
+    border-right: 1px solid #e2e7ef;
+    background: #fff;
+    transition: left 180ms ease;
+  }
+
+  .shell.cluster-focus-mode > .cluster-sidebar-edge-trigger:hover ~ .cluster-dashboard .cluster-context-nav,
+  .shell.cluster-focus-mode > .cluster-sidebar-edge-trigger:focus ~ .cluster-dashboard .cluster-context-nav,
+  .shell.cluster-focus-mode > .sidebar:hover ~ .cluster-dashboard .cluster-context-nav,
+  .shell.cluster-focus-mode > .sidebar:focus-within ~ .cluster-dashboard .cluster-context-nav {
+    left: var(--cluster-primary-nav-width);
+  }
+}
+
+.shell.cluster-focus-mode > .cluster-sidebar-edge-trigger:hover ~ .cluster-dashboard,
+.shell.cluster-focus-mode > .cluster-sidebar-edge-trigger:focus ~ .cluster-dashboard,
+.shell.cluster-focus-mode > .sidebar:hover ~ .cluster-dashboard,
+.shell.cluster-focus-mode > .sidebar:focus-within ~ .cluster-dashboard {
+  left: var(--cluster-primary-nav-width);
+  width: calc(100vw - var(--cluster-primary-nav-width));
+  box-shadow: -12px 0 30px #1e344f2e;
+}
+
+@media (min-width: 901px) and (max-width: 1440px) {
+  .shell.cluster-focus-mode {
+    --cluster-primary-nav-width: 184px;
+  }
+}
+
+@media (max-width: 900px) {
+  .shell.cluster-focus-mode {
+    --cluster-primary-nav-width: 62px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .shell.cluster-focus-mode > .cluster-dashboard,
+  .shell.cluster-focus-mode > .cluster-dashboard .cluster-context-nav {
+    transition: none;
+  }
+}

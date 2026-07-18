@@ -43,6 +43,7 @@ type StaticInfo struct {
 // HostStaticInfo 定义主机的静态信息，包括系统状态、网络配置、SSH 访问、安全设置等。
 type HostStaticInfo struct {
 	MachineStatus  string             `json:"machine_status"`
+	Arch           string             `json:"arch"`
 	IPs            []string           `json:"ips"`
 	Interfaces     []NetworkInterface `json:"interfaces"`
 	SSHUser        string             `json:"ssh_user"`

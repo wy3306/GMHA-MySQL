@@ -28,3 +28,17 @@ func TestBrowserManagerURLUsesRequestHost(t *testing.T) {
 		t.Fatalf("browserManagerURL() = %q, want %q", got, want)
 	}
 }
+
+func TestManagerArgsIncludeConfiguredPublicKey(t *testing.T) {
+	controller, err := NewController(Config{ManagerPublicKey: "/opt/gmha/manager_ed25519.pub"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := controller.managerArgs()
+	for index, arg := range args {
+		if arg == "--manager-pubkey" && index+1 < len(args) && args[index+1] == "/opt/gmha/manager_ed25519.pub" {
+			return
+		}
+	}
+	t.Fatalf("managerArgs() did not include configured public key: %v", args)
+}

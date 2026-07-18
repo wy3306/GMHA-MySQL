@@ -34,6 +34,7 @@ func (c *StaticCollector) Collect(ctx context.Context, req taskdomain.CollectSta
 	now := time.Now().UTC()
 	return &collectdomain.StaticInfo{
 		Host: collectdomain.HostStaticInfo{
+			Arch:           machine.Arch,
 			IPs:            machine.IPs,
 			Interfaces:     machine.Interfaces,
 			GlibcVersion:   machine.GlibcVersion,

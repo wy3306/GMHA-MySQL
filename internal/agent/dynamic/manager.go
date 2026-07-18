@@ -79,11 +79,17 @@ func (m *DynamicCollectManager) UpdateCollectConfig(ctx context.Context, cfg dyn
 		if !ok {
 			runner.cancel()
 			delete(m.runners, name)
+			delete(m.last, name)
 			continue
 		}
 		if !sameSpec(runner.spec, spec) {
 			runner.cancel()
 			delete(m.runners, name)
+		}
+	}
+	for name := range m.last {
+		if _, ok := desired[name]; !ok {
+			delete(m.last, name)
 		}
 	}
 	for name, spec := range desired {

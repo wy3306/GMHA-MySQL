@@ -7,24 +7,31 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"gmha/internal/app"
 )
 
 // ClusterTopologyHandler 为 Web 提供与 CLI“查看当前集群架构”一致的只读拓扑视图。
 type ClusterTopologyHandler struct {
-	machines *app.MachineService
-	mysql    *app.MySQLService
+	machines  *app.MachineService
+	mysql     *app.MySQLService
+	heartbeat *app.HeartbeatService
 }
 
-func NewClusterTopologyHandler(machines *app.MachineService, mysql *app.MySQLService) *ClusterTopologyHandler {
-	return &ClusterTopologyHandler{machines: machines, mysql: mysql}
+func NewClusterTopologyHandler(machines *app.MachineService, mysql *app.MySQLService, heartbeat ...*app.HeartbeatService) *ClusterTopologyHandler {
+	var history *app.HeartbeatService
+	if len(heartbeat) > 0 {
+		history = heartbeat[0]
+	}
+	return &ClusterTopologyHandler{machines: machines, mysql: mysql, heartbeat: history}
 }
 
 type clusterTopologyView struct {
-	Cluster string                `json:"cluster"`
-	Nodes   []clusterTopologyNode `json:"nodes"`
-	Edges   []clusterTopologyEdge `json:"edges"`
+	Cluster  string                `json:"cluster"`
+	Nodes    []clusterTopologyNode `json:"nodes"`
+	Edges    []clusterTopologyEdge `json:"edges"`
+	Overview clusterOverviewView   `json:"overview"`
 }
 
 type clusterTopologyNode struct {
@@ -72,7 +79,11 @@ func (h *ClusterTopologyHandler) HandleTopology(w http.ResponseWriter, r *http.R
 		writeError(w, http.StatusBadRequest, http.ErrMissingFile)
 		return
 	}
-	view, err := h.build(r.Context(), cluster)
+	rangeMinutes, _ := strconv.Atoi(r.URL.Query().Get("range_minutes"))
+	if rangeMinutes != 15 && rangeMinutes != 60 && rangeMinutes != 360 && rangeMinutes != 1440 {
+		rangeMinutes = 60
+	}
+	view, err := h.build(r.Context(), cluster, rangeMinutes)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -80,7 +91,11 @@ func (h *ClusterTopologyHandler) HandleTopology(w http.ResponseWriter, r *http.R
 	writeJSON(w, http.StatusOK, view)
 }
 
-func (h *ClusterTopologyHandler) build(ctx context.Context, cluster string) (clusterTopologyView, error) {
+func (h *ClusterTopologyHandler) build(ctx context.Context, cluster string, ranges ...int) (clusterTopologyView, error) {
+	rangeMinutes := 60
+	if len(ranges) > 0 && ranges[0] > 0 {
+		rangeMinutes = ranges[0]
+	}
 	instances, err := h.mysql.ListInstanceViews(ctx)
 	if err != nil {
 		return clusterTopologyView{}, err
@@ -164,6 +179,7 @@ func (h *ClusterTopologyHandler) build(ctx context.Context, cluster string) (clu
 			node.Role = "readonly"
 		}
 	}
+	view.Overview = h.buildOverview(ctx, cluster, view.Nodes, rangeMinutes, time.Now().UTC())
 	return view, nil
 }
 

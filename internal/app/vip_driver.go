@@ -187,7 +187,7 @@ type NotImplementedVipDriver struct {
 }
 
 // ArchitectureManagedVIPDriver prevents a caller from bypassing the ordered
-// architecture state machine. BGP and Keepalived require cluster-wide remote
+// architecture state machine. BGP requires cluster-wide remote
 // target context, fencing and single-holder verification that the local
 // VipDriver interface intentionally does not carry.
 type ArchitectureManagedVIPDriver struct{ Mode string }

@@ -8,11 +8,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"encoding/json"
 	"fmt"
 	"gmha/internal/agent/mysqlcheck"
+	"gmha/internal/buildinfo"
 	agentdomain "gmha/internal/domain/agent"
 	dynamicdomain "gmha/internal/domain/dynamic"
 	hbdomain "gmha/internal/domain/heartbeat"
@@ -36,6 +38,8 @@ type AgentService struct {
 	binaryPath      string
 	managerHTTPAddr string
 	managerGRPCAddr string
+	upgradeMu       sync.Mutex
+	upgrading       map[string]struct{}
 }
 
 // NewAgentService 创建 Agent 管理服务实例。
@@ -54,6 +58,7 @@ func NewAgentService(repo agentdomain.Repository, machineRepo machinedomain.Repo
 		binaryPath:      binaryPath,
 		managerHTTPAddr: managerHTTPAddr,
 		managerGRPCAddr: managerGRPCAddr,
+		upgrading:       make(map[string]struct{}),
 	}
 }
 
@@ -76,6 +81,7 @@ type AgentView struct {
 	RecoveryState     string                       `json:"recovery_state"`
 	SuppressedUntil   string                       `json:"suppressed_until"`
 	InstallDir        string                       `json:"install_dir"`
+	Version           string                       `json:"version"`
 	LastError         string                       `json:"last_error"`
 	CheckSummary      string                       `json:"check_summary"`
 	Checks            []hbdomain.HealthCheck       `json:"checks"`
@@ -138,6 +144,7 @@ func (s *AgentService) ListViews(ctx context.Context) ([]AgentView, error) {
 		}
 		if agent, ok := agentByMachineID[machine.ID]; ok {
 			view.InstallState = string(agent.State)
+			view.Version = agent.Version
 			if strings.TrimSpace(agent.InstallDir) != "" {
 				view.InstallDir = agent.InstallDir
 			}
@@ -146,6 +153,7 @@ func (s *AgentService) ListViews(ctx context.Context) ([]AgentView, error) {
 			}
 		}
 		if hb, ok := heartbeatByMachineID[machine.ID]; ok {
+			view.Version = hb.Version
 			view.HeartbeatState = string(hb.CurrentState)
 			view.OverallHealth = string(hb.OverallHealth)
 			if !hb.LastHeartbeatAt.IsZero() {
@@ -160,6 +168,9 @@ func (s *AgentService) ListViews(ctx context.Context) ([]AgentView, error) {
 			view.Checks = append([]hbdomain.HealthCheck(nil), hb.Checks...)
 			view.Metrics = append([]dynamicdomain.MetricResult(nil), hb.Metrics...)
 			view.CheckSummary = healthCheckSummary(hb.Checks)
+			if status, _, authoritative := machineStatusFromHeartbeat(hb.CurrentState, hb.LastErrorSummary); authoritative {
+				view.MachineStatus = string(status)
+			}
 		}
 		if state, ok := recoveryByMachineID[machine.ID]; ok {
 			view.RecoveryState = state
@@ -273,6 +284,9 @@ func (s *AgentService) RetryInstallByIP(ctx context.Context, req agentusecase.In
 		req.InstallDir = agent.InstallDir
 	}
 	req.InstallDir = agentdomain.ResolveInstallDir(machine.SSHUser, req.InstallDir)
+	if strings.TrimSpace(req.Version) == "" {
+		req.Version = buildinfo.CurrentVersion()
+	}
 	targetOS, targetArch, err := s.detectRemotePlatform(ctx, machine)
 	if err != nil {
 		return agentusecase.InstallAgentResponse{}, err
@@ -284,8 +298,76 @@ func (s *AgentService) RetryInstallByIP(ctx context.Context, req agentusecase.In
 	return s.installer.Execute(ctx, req, binary)
 }
 
+// DetectVersionByIP reads the installed Agent binary version over SSH and
+// persists it. This also repairs legacy/adopted Agent records whose version was
+// never reported because the process could not establish a heartbeat.
+func (s *AgentService) DetectVersionByIP(ctx context.Context, ip string) (AgentView, error) {
+	machine, ok, err := s.resolveMachineByIP(ctx, ip)
+	if err != nil {
+		return AgentView{}, err
+	}
+	if !ok {
+		return AgentView{}, errors.New("machine not found")
+	}
+	if s.sshClient == nil {
+		return AgentView{}, errors.New("ssh client not configured")
+	}
+
+	agent, found, err := s.repo.GetByMachineID(ctx, machine.ID)
+	if err != nil {
+		return AgentView{}, err
+	}
+	if !found {
+		agent = agentdomain.Agent{ID: "agent-" + machine.ID, MachineID: machine.ID, State: agentdomain.StateOffline}
+	}
+	agent.InstallDir = agentdomain.ResolveInstallDir(machine.SSHUser, firstNonEmpty(agent.InstallDir, machine.AgentInstallDir))
+	endpoint := machinedomain.Endpoint{IP: machine.IP, SSHPort: machine.SSHPort}
+	auth := machinedomain.SSHAuth{User: machine.SSHUser}
+	output, err := s.sshClient.RunOutput(ctx, endpoint, auth, shellQuote(strings.TrimSuffix(agent.InstallDir, "/")+"/agentd")+" --version")
+	if err != nil {
+		return AgentView{}, fmt.Errorf("检测 Agent 版本失败: %w", err)
+	}
+	version, err := detectAgentVersionOutput(output)
+	if err != nil {
+		return AgentView{}, err
+	}
+	agent.Version = version
+	if _, err := s.repo.Save(ctx, agent); err != nil {
+		return AgentView{}, err
+	}
+	view, ok, err := s.GetViewByIP(ctx, machine.IP)
+	if err != nil {
+		return AgentView{}, err
+	}
+	if !ok {
+		return AgentView{}, errors.New("agent view not found after version detection")
+	}
+	return view, nil
+}
+
+func detectAgentVersionOutput(output []byte) (string, error) {
+	for _, field := range strings.Fields(string(output)) {
+		candidate := strings.Trim(field, " ,;()[]{}")
+		if _, ok := parseComponentVersion(candidate); ok {
+			return componentVersion(candidate), nil
+		}
+	}
+	return "", fmt.Errorf("Agent 版本输出无法识别: %s", strings.TrimSpace(string(output)))
+}
+
 // UninstallByIP 卸载指定 IP 机器上的 Agent，并清除心跳数据。
 func (s *AgentService) UninstallByIP(ctx context.Context, ip string) (agentusecase.UninstallAgentResponse, error) {
+	return s.uninstallByIP(ctx, ip, nil)
+}
+
+// UninstallByIPWithAuth uses the credential already resolved by MachineService.
+// Agent removal itself must use SSH because stopping the Agent also terminates
+// its task channel.
+func (s *AgentService) UninstallByIPWithAuth(ctx context.Context, ip string, auth machinedomain.SSHAuth) (agentusecase.UninstallAgentResponse, error) {
+	return s.uninstallByIP(ctx, ip, &auth)
+}
+
+func (s *AgentService) uninstallByIP(ctx context.Context, ip string, auth *machinedomain.SSHAuth) (agentusecase.UninstallAgentResponse, error) {
 	if s.uninstaller == nil {
 		return agentusecase.UninstallAgentResponse{}, errors.New("uninstaller not configured")
 	}
@@ -297,7 +379,7 @@ func (s *AgentService) UninstallByIP(ctx context.Context, ip string) (agentuseca
 		return agentusecase.UninstallAgentResponse{}, errors.New("machine not found")
 	}
 
-	resp, err := s.uninstaller.Execute(ctx, agentusecase.UninstallAgentRequest{MachineID: machine.ID})
+	resp, err := s.uninstaller.Execute(ctx, agentusecase.UninstallAgentRequest{MachineID: machine.ID, SSHAuth: auth})
 	if err != nil {
 		return agentusecase.UninstallAgentResponse{}, err
 	}
@@ -321,6 +403,10 @@ func (s *AgentService) UpgradeByIP(ctx context.Context, ip string) (agentusecase
 	if !ok {
 		return agentusecase.UpgradeAgentResponse{}, errors.New("machine not found")
 	}
+	if !s.beginAgentUpgrade(machine.ID) {
+		return agentusecase.UpgradeAgentResponse{}, errors.New("该机器的 Agent 正在升级，请勿重复提交")
+	}
+	defer s.finishAgentUpgrade(machine.ID)
 	agent, agentFound, err := s.repo.GetByMachineID(ctx, machine.ID)
 	if err != nil {
 		return agentusecase.UpgradeAgentResponse{}, err
@@ -336,13 +422,57 @@ func (s *AgentService) UpgradeByIP(ctx context.Context, ip string) (agentusecase
 	if err != nil {
 		return agentusecase.UpgradeAgentResponse{}, err
 	}
+	return s.upgradeByIPBinary(ctx, machine, agent.Version, binary)
+}
+
+// UpgradeByIPBinary upgrades an Agent with a versioned binary selected from the
+// Manager package repository. The normal platform binary remains the fallback
+// used by the legacy one-click action.
+func (s *AgentService) UpgradeByIPBinary(ctx context.Context, ip, version string, binary []byte) (agentusecase.UpgradeAgentResponse, error) {
+	if s.upgrader == nil {
+		return agentusecase.UpgradeAgentResponse{}, errors.New("upgrader not configured")
+	}
+	machine, ok, err := s.resolveMachineByIP(ctx, ip)
+	if err != nil {
+		return agentusecase.UpgradeAgentResponse{}, err
+	}
+	if !ok {
+		return agentusecase.UpgradeAgentResponse{}, errors.New("machine not found")
+	}
+	if !s.beginAgentUpgrade(machine.ID) {
+		return agentusecase.UpgradeAgentResponse{}, errors.New("该机器的 Agent 正在升级，请勿重复提交")
+	}
+	defer s.finishAgentUpgrade(machine.ID)
+	return s.upgradeByIPBinary(ctx, machine, version, binary)
+}
+
+func (s *AgentService) upgradeByIPBinary(ctx context.Context, machine machinedomain.Machine, version string, binary []byte) (agentusecase.UpgradeAgentResponse, error) {
 	return s.upgrader.Execute(ctx, agentusecase.UpgradeAgentRequest{
 		MachineID:       machine.ID,
 		IP:              machine.IP,
-		Version:         agent.Version,
+		Version:         version,
 		ManagerHTTPAddr: ResolveManagerHTTPAddrForTarget(s.managerHTTPAddr, machine.IP),
 		ManagerGRPCAddr: ResolveManagerGRPCAddrForTarget("", s.managerGRPCAddr, machine.IP),
 	}, binary)
+}
+
+func (s *AgentService) beginAgentUpgrade(machineID string) bool {
+	s.upgradeMu.Lock()
+	defer s.upgradeMu.Unlock()
+	if s.upgrading == nil {
+		s.upgrading = make(map[string]struct{})
+	}
+	if _, exists := s.upgrading[machineID]; exists {
+		return false
+	}
+	s.upgrading[machineID] = struct{}{}
+	return true
+}
+
+func (s *AgentService) finishAgentUpgrade(machineID string) {
+	s.upgradeMu.Lock()
+	delete(s.upgrading, machineID)
+	s.upgradeMu.Unlock()
 }
 
 // ListUninstallCandidates 列出可卸载 Agent 的候选机器。

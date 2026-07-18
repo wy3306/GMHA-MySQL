@@ -9,6 +9,7 @@ import (
 
 	hadomain "gmha/internal/domain/ha"
 	machinedomain "gmha/internal/domain/machine"
+	taskdomain "gmha/internal/domain/task"
 	mysqlapp "gmha/internal/mysql"
 )
 
@@ -45,18 +46,45 @@ func (s *HAService) PlanArchitectureAdjustment(ctx context.Context, clusterID st
 		return hadomain.ArchitectureAdjustmentPlan{}, errors.New("at least two target nodes are required")
 	}
 	scores := architectureCandidateScores(clusterID, req, machineByID, instancesByMachine)
-	selected, ranked, selectErr := NewCandidateSelector().Select(scores)
 	plan := hadomain.ArchitectureAdjustmentPlan{
 		PlanID: "arch-" + strings.TrimPrefix(newFailoverID(), "fo-"), ClusterID: clusterID,
-		Architecture: req.Architecture, RankedCandidates: ranked,
+		Architecture:            req.Architecture,
 		WaitDelayTimeoutSeconds: 60, RequiresForceConfirmation: true,
 		CreatedAt: time.Now().UTC(), Executable: true,
 	}
-	if selectErr != nil {
-		plan.Executable = false
-		plan.BlockingReasons = append(plan.BlockingReasons, selectErr.Error())
+	if s.tasks != nil && !req.VIPOnly {
+		for _, node := range req.Nodes {
+			if compatible, reason := s.tasks.MachineCapability(node.MachineID, taskdomain.CapabilityMySQLDefaultsFile); !compatible {
+				plan.Executable = false
+				name := node.MachineID
+				if machine, ok := machineByID[node.MachineID]; ok && strings.TrimSpace(machine.Name) != "" {
+					name = machine.Name
+				}
+				plan.BlockingReasons = append(plan.BlockingReasons, fmt.Sprintf("节点 %s 无法执行架构切换：%s，请先升级该节点 Agent", name, reason))
+			}
+		}
+	}
+	if req.VIPOnly {
+		plan.RequiresForceConfirmation = false
+	}
+	if req.Architecture == hadomain.ArchitectureStandalone {
+		plan.RankedCandidates = scores
+		plan.RequiresForceConfirmation = false
+		for _, score := range scores {
+			if !score.Eligible {
+				plan.Executable = false
+				plan.BlockingReasons = append(plan.BlockingReasons, fmt.Sprintf("independent target %s is not eligible: %s", score.MachineID, strings.Join(score.RejectReasons, ", ")))
+			}
+		}
 	} else {
-		plan.SelectedCandidate = selected
+		selected, ranked, selectErr := NewCandidateSelector().Select(scores)
+		plan.RankedCandidates = ranked
+		if selectErr != nil {
+			plan.Executable = false
+			plan.BlockingReasons = append(plan.BlockingReasons, selectErr.Error())
+		} else {
+			plan.SelectedCandidate = selected
+		}
 	}
 	network, networkErr := s.repo.GetNetworkPolicy(ctx, clusterID)
 	if networkErr == nil {
@@ -93,15 +121,6 @@ func (s *HAService) PlanArchitectureAdjustment(ctx context.Context, clusterID st
 				plan.Executable = false
 				plan.BlockingReasons = append(plan.BlockingReasons, "BGP driver is not configured with a live routing executor")
 			}
-		case hadomain.VipRouteModeKeepalived:
-			if s.tasks == nil {
-				plan.Executable = false
-				plan.BlockingReasons = append(plan.BlockingReasons, "Keepalived driver and dual-node health script are not configured")
-			}
-			if req.Architecture != hadomain.ArchitectureKeepalivedDualMaster {
-				plan.Executable = false
-				plan.BlockingReasons = append(plan.BlockingReasons, "Keepalived VIP requires keepalived_dual_master architecture")
-			}
 		default:
 			plan.Executable = false
 			plan.BlockingReasons = append(plan.BlockingReasons, fmt.Sprintf("VIP route mode %s cannot be executed automatically", plan.VIPRouteMode))
@@ -113,11 +132,11 @@ func (s *HAService) PlanArchitectureAdjustment(ctx context.Context, clusterID st
 
 func validateArchitectureRequest(req hadomain.ArchitectureAdjustmentRequest) error {
 	switch req.Architecture {
-	case hadomain.ArchitectureMasterSlave, hadomain.ArchitectureDualMaster, hadomain.ArchitectureMultiMaster, hadomain.ArchitectureKeepalivedDualMaster:
+	case hadomain.ArchitectureStandalone, hadomain.ArchitectureMasterSlave, hadomain.ArchitectureDualMaster, hadomain.ArchitectureMultiMaster:
 	default:
 		return fmt.Errorf("unsupported architecture %s", req.Architecture)
 	}
-	masters := 0
+	masters, independents := 0, 0
 	seen := make(map[string]bool)
 	for _, node := range req.Nodes {
 		if strings.TrimSpace(node.MachineID) == "" {
@@ -131,29 +150,73 @@ func validateArchitectureRequest(req hadomain.ArchitectureAdjustmentRequest) err
 			return fmt.Errorf("delay_seconds for machine %s cannot be negative", node.MachineID)
 		}
 		role := strings.ToUpper(strings.TrimSpace(node.Role))
-		if role != "M" && role != "S" {
-			return fmt.Errorf("node %s role must be M or S", node.MachineID)
+		if role != "M" && role != "S" && role != "I" {
+			return fmt.Errorf("node %s role must be M, S or I", node.MachineID)
 		}
 		if role == "M" {
 			masters++
 			if node.DelaySeconds > 0 {
 				return fmt.Errorf("master candidate %s cannot be a delayed replica", node.MachineID)
 			}
+		} else if role == "I" {
+			independents++
+			if node.SourceMachineID != "" || node.DelaySeconds != 0 {
+				return fmt.Errorf("independent node %s cannot have a replication source or delay", node.MachineID)
+			}
 		}
 	}
 	if req.CurrentMasterMachineID != "" && !seen[req.CurrentMasterMachineID] {
 		return errors.New("current master must be included in target nodes")
 	}
-	if req.MoveVIP && req.CurrentMasterMachineID == "" {
-		return errors.New("VIP migration requires the current master so business sessions can be drained and the old holder fenced")
+	if req.InitializeVIP && !req.MoveVIP {
+		return errors.New("VIP initialization requires move_vip")
 	}
-	if req.MoveVIP && req.PreferredNewMasterMachineID == req.CurrentMasterMachineID {
+	if req.InitializeVIP && req.CurrentMasterMachineID != "" {
+		return errors.New("VIP initialization cannot declare a current master")
+	}
+	if req.VIPOnly && !req.MoveVIP {
+		return errors.New("VIP-only workflow requires move_vip")
+	}
+	if req.VIPOnly && req.Architecture == hadomain.ArchitectureStandalone {
+		return errors.New("VIP-only workflow requires a replicated architecture")
+	}
+	if req.VIPOnly {
+		if strings.TrimSpace(req.PreferredNewMasterMachineID) == "" {
+			return errors.New("VIP-only workflow requires a target master")
+		}
+		targetIsMaster := false
+		for _, node := range req.Nodes {
+			if node.MachineID == req.PreferredNewMasterMachineID && strings.EqualFold(strings.TrimSpace(node.Role), "M") {
+				targetIsMaster = true
+				break
+			}
+		}
+		if !targetIsMaster {
+			return errors.New("VIP-only target must be a master in the target topology")
+		}
+	}
+	// When all current nodes are independent writers there is no current master
+	// to declare. The executor freezes every writer before scanning/removing the
+	// VIP, which provides the same fencing guarantee as the normal old-master path.
+	if req.MoveVIP && req.CurrentMasterMachineID != "" && !req.InitializeVIP && req.PreferredNewMasterMachineID == req.CurrentMasterMachineID {
 		return errors.New("VIP migration requires a different target master; the current master already owns the traffic endpoint")
+	}
+	if req.Architecture == hadomain.ArchitectureStandalone {
+		if independents != len(req.Nodes) || masters != 0 {
+			return errors.New("standalone architecture requires every node to use independent role I")
+		}
+		if req.MoveVIP {
+			return errors.New("standalone architecture cannot own or migrate a shared VIP")
+		}
+		return nil
+	}
+	if independents != 0 {
+		return errors.New("replicated architectures cannot contain independent role I")
 	}
 	if req.Architecture == hadomain.ArchitectureMasterSlave && masters != 1 {
 		return errors.New("master_slave requires exactly one master")
 	}
-	if (req.Architecture == hadomain.ArchitectureDualMaster || req.Architecture == hadomain.ArchitectureKeepalivedDualMaster) && masters != 2 {
+	if req.Architecture == hadomain.ArchitectureDualMaster && masters != 2 {
 		return errors.New("dual-master architecture requires exactly two masters")
 	}
 	if req.Architecture == hadomain.ArchitectureMultiMaster && masters < 3 {
@@ -197,11 +260,11 @@ func architectureCandidateScores(clusterID string, req hadomain.ArchitectureAdju
 			score.Eligible = false
 			score.RejectReasons = append(score.RejectReasons, "delayed replica cannot be elected automatically")
 		}
-		if !strings.EqualFold(strings.TrimSpace(node.Role), "M") {
+		if req.Architecture != hadomain.ArchitectureStandalone && !strings.EqualFold(strings.TrimSpace(node.Role), "M") {
 			score.Eligible = false
 			score.RejectReasons = append(score.RejectReasons, "target role is replica and cannot be promoted")
 		}
-		if req.CurrentMasterMachineID != "" && node.MachineID == req.CurrentMasterMachineID && req.PreferredNewMasterMachineID != req.CurrentMasterMachineID {
+		if req.Architecture != hadomain.ArchitectureStandalone && req.CurrentMasterMachineID != "" && node.MachineID == req.CurrentMasterMachineID && req.PreferredNewMasterMachineID != req.CurrentMasterMachineID {
 			score.Eligible = false
 			score.RejectReasons = append(score.RejectReasons, "candidate is current master")
 		}
@@ -233,6 +296,86 @@ func architectureInstanceForNode(node hadomain.ArchitectureNodeRequest, instance
 }
 
 func architecturePlanSteps(req hadomain.ArchitectureAdjustmentRequest) []hadomain.ArchitecturePlanStep {
+	if req.VIPOnly {
+		items := []hadomain.ArchitecturePlanStep{
+			{Code: "acquire_lock", Name: "获取集群切换锁", Description: "阻止并发 VIP 绑定、漂移和架构变更"},
+			{Code: "preflight", Name: "实时预检", Description: "确认 Agent、MHA 管理通道、目标主节点和业务网卡可用"},
+		}
+		if !req.InitializeVIP {
+			items = append(items,
+				hadomain.ArchitecturePlanStep{Code: "freeze_business_access", Name: "锁定业务入口", Description: "在全部相关 MySQL 节点启用 offline_mode，阻止新业务连接进入", Destructive: true},
+				hadomain.ArchitecturePlanStep{Code: "drain_business_sessions", Name: "排空业务会话", Description: "保留 MHA、复制、监控和备份连接，清理其余存量业务会话", Destructive: true},
+			)
+		}
+		items = append(items,
+			hadomain.ArchitecturePlanStep{Code: "check_vip_conflict", Name: "扫描 VIP 持有者", Description: "在全部集群机器检查 VIP，发现多持有者立即中止"},
+			hadomain.ArchitecturePlanStep{Code: "withdraw_vip", Name: "撤销旧 VIP", Description: "从全部集群机器撤销 VIP，关闭旧业务网络入口", Destructive: true},
+			hadomain.ArchitecturePlanStep{Code: "verify_zero_vip", Name: "确认零持有者屏障", Description: "再次扫描全部机器，只有确认 VIP 持有者为零才允许继续"},
+			hadomain.ArchitecturePlanStep{Code: "bind_vip", Name: reqVIPStepName(req), Description: "在目标主节点绑定 VIP，并自动执行 ARP/BGP 网络宣告", Destructive: true},
+			hadomain.ArchitecturePlanStep{Code: "verify_single_vip", Name: "防脑裂复核", Description: "连续从全部集群机器确认 VIP 仅由目标主节点持有"},
+		)
+		if !req.InitializeVIP {
+			items = append(items, hadomain.ArchitecturePlanStep{Code: "resume_business_connections", Name: "恢复业务访问", Description: "唯一持有者验证通过后关闭 offline_mode，恢复业务连接"})
+		}
+		items = append(items,
+			hadomain.ArchitecturePlanStep{Code: "release_lock", Name: "释放切换锁", Description: "记录审计结果并释放集群锁"},
+		)
+		for index := range items {
+			items[index].Order = index + 1
+		}
+		return items
+	}
+	if items := architectureConversionPlanSteps(req); len(items) > 0 {
+		return items
+	}
+	if req.Architecture == hadomain.ArchitectureStandalone {
+		items := []hadomain.ArchitecturePlanStep{
+			{Code: "acquire_lock", Name: "获取集群切换锁", Description: "阻止并发架构变更和脑裂"},
+			{Code: "preflight", Name: "实时预检", Description: "确认 Agent、MySQL、GTID 与 server_id 状态"},
+			{Code: "validate_independent_targets", Name: "确认拆分目标", Description: "逐节点读取实时 GTID 与只读状态，确认所有实例可安全拆分"},
+			{Code: "freeze_old_master", Name: "冻结当前主库写入", Description: "拆分前短暂冻结写入，建立一致的数据分界点", Destructive: true},
+			{Code: "kill_business_sessions", Name: "清理业务会话", Description: "清理非管理连接，防止校验期间产生新事务", Destructive: true},
+			{Code: "wait_replication_zero", Name: "等待所有从库追平", Description: "确认复制延迟、线程和 GTID 均已追平"},
+			{Code: "pt_verify_before_split", Name: "PT 数据一致性验证", Description: "使用 pt-table-checksum 验证拆分前各实例数据完全一致"},
+			{Code: "detach_replication", Name: "解除复制并转为独立实例", Description: "停止并清理复制关系，恢复每个实例独立可写", Destructive: true},
+			{Code: "verify_topology", Name: "验证独立实例", Description: "确认无复制通道、实例可写且自增参数已恢复"},
+			{Code: "resume_business_connections", Name: "恢复业务连接", Description: "所有校验通过后关闭 offline_mode，重新允许业务建立连接"},
+			{Code: "release_lock", Name: "释放切换锁", Description: "记录审计结果并释放集群锁"},
+		}
+		items = addArchitectureManagementRepairStep(items, req)
+		for index := range items {
+			items[index].Order = index + 1
+		}
+		return items
+	}
+	if req.CurrentMasterMachineID == "" && !req.InitializeVIP {
+		items := []hadomain.ArchitecturePlanStep{
+			{Code: "acquire_lock", Name: "获取集群切换锁", Description: "阻止并发架构变更和脑裂"},
+			{Code: "preflight", Name: "实时预检", Description: "确认 Agent、MySQL、GTID 与 server_id 状态"},
+			{Code: "freeze_old_master", Name: "冻结全部独立写入口", Description: "建立复制前冻结所有独立实例写入，阻止新的分叉事务", Destructive: true},
+			{Code: "kill_business_sessions", Name: "清理业务会话", Description: "保留管理连接，清理可能继续写入的业务会话", Destructive: true},
+			{Code: "elect_candidate", Name: "选举数据基准节点", Description: "比较实时 GTID 集合，仅允许包含全部事务历史的节点作为复制基准"},
+			{Code: "align_replica_gtid", Name: "对齐空实例 GTID 基线", Description: "仅当目标从节点不存在业务表时，清理其独立心跳 GTID 并标记主库基线", Destructive: true},
+			{Code: "promote_new_master", Name: "启用基准主节点", Description: "清理旧复制元数据并恢复目标主节点可写", Destructive: true},
+			{Code: "repoint_replicas", Name: "建立目标复制关系", Description: "通过 Agent 配置一主多从或双向复制", Destructive: true},
+			{Code: "verify_topology", Name: "验证复制拓扑", Description: "验证复制线程、GTID、只读状态和自增参数"},
+			{Code: "pt_repair_on_failure", Name: "按需 PT 修复", Description: "仅在显式强制路径中使用 pt-table-sync 修复", Destructive: true, RequiresConfirmation: true},
+			{Code: "pt_verify_replication", Name: "PT 复制一致性验证", Description: "使用 pt-table-checksum 验证新复制关系的数据一致性"},
+		}
+		if req.MoveVIP {
+			items = append(items,
+				hadomain.ArchitecturePlanStep{Code: "move_vip", Name: "迁移 VIP", Description: "在全部集群机器撤销 VIP，确认零持有者后绑定新主并自动宣告", Destructive: true},
+				hadomain.ArchitecturePlanStep{Code: "verify_single_vip", Name: "防脑裂复核", Description: "连续从全部集群机器确认 VIP 仅由新主持有"},
+			)
+		}
+		items = append(items, hadomain.ArchitecturePlanStep{Code: "resume_business_connections", Name: "恢复业务连接", Description: "拓扑、PT 与 VIP 校验全部通过后关闭 offline_mode"})
+		items = append(items, hadomain.ArchitecturePlanStep{Code: "release_lock", Name: "释放切换锁", Description: "记录审计结果并释放集群锁"})
+		items = addArchitectureManagementRepairStep(items, req)
+		for index := range items {
+			items[index].Order = index + 1
+		}
+		return items
+	}
 	definitions := []struct {
 		code, name, description string
 		destructive, confirm    bool
@@ -245,28 +388,32 @@ func architecturePlanSteps(req hadomain.ArchitectureAdjustmentRequest) []hadomai
 		{"kill_business_sessions", "清理业务会话", "保留 root、复制、监控、MHA、备份及请求中声明的管理用户", true, false},
 		{"wait_replication_zero", "等待复制追平", "最多等待 60 秒，必须同时满足延迟为 0 且 GTID/relay log 已执行完成", false, false},
 		{"force_gate", "强制切主确认", "超过 60 秒暂停流程并要求用户显式确认数据丢失风险", true, true},
-		{"fence_old_master", "隔离旧主", "先撤销写能力和旧 VIP；无法确认隔离成功时禁止继续", true, false},
+		{"fence_old_master", "隔离旧主", "再次验证 read_only 与 super_read_only，无法确认旧主不可写时禁止继续", true, false},
 		{"promote_new_master", "提升新主", "停止并重置复制，关闭只读，再次验证只有一个可写主节点", true, false},
 		{"repoint_replicas", "重定向复制关系", "按目标架构配置一主多从、双主及延时从库", true, false},
 		{"verify_topology", "验证新拓扑", "验证复制线程、GTID、只读状态和延时从库参数", false, false},
+		{"pt_repair_on_failure", "按需 PT 修复", "仅在强制切主后的复制重建失败时，使用 pt-table-sync 修复并重新校验", true, true},
+		{"pt_verify_replication", "PT 复制一致性验证", "新复制关系建立后必须运行 pt-table-checksum，任一实例存在差异都会阻断成功", false, false},
 	}
 	if req.MoveVIP {
 		definitions = append(definitions,
 			struct {
 				code, name, description string
 				destructive, confirm    bool
-			}{"move_vip", "迁移 VIP", "确认旧节点无 VIP 后绑定新主，并通过 ARP、BGP 或 Keepalived 宣告", true, false},
+			}{"move_vip", "迁移 VIP", "在全部集群机器撤销 VIP，确认零持有者后绑定新主并自动宣告", true, false},
 			struct {
 				code, name, description string
 				destructive, confirm    bool
-			}{"verify_single_vip", "防脑裂复核", "从所有节点和外部探测点确认 VIP 仅由新主持有", false, false},
+			}{"verify_single_vip", "防脑裂复核", "连续从全部集群机器确认 VIP 仅由新主持有；无法证明时撤销新节点绑定", false, false},
 		)
 	}
 	definitions = append(definitions,
 		struct {
 			code, name, description string
 			destructive, confirm    bool
-		}{"pt_repair_on_failure", "按需 PT 修复", "仅在强制切主后的复制重建失败时，校验兼容版本并使用 pt-table-checksum/pt-table-sync 修复", true, true},
+		}{"resume_business_connections", "恢复业务连接", "拓扑、PT 与 VIP 校验全部通过后关闭 offline_mode，重新允许业务建立连接", false, false},
+	)
+	definitions = append(definitions,
 		struct {
 			code, name, description string
 			destructive, confirm    bool
@@ -276,5 +423,84 @@ func architecturePlanSteps(req hadomain.ArchitectureAdjustmentRequest) []hadomai
 	for index, item := range definitions {
 		steps = append(steps, hadomain.ArchitecturePlanStep{Order: index + 1, Code: item.code, Name: item.name, Description: item.description, Destructive: item.destructive, RequiresConfirmation: item.confirm})
 	}
+	steps = addArchitectureManagementRepairStep(steps, req)
+	for index := range steps {
+		steps[index].Order = index + 1
+	}
 	return steps
+}
+
+func architectureTransitionKind(req hadomain.ArchitectureAdjustmentRequest) string {
+	current, target := strings.TrimSpace(req.CurrentArchitecture), strings.TrimSpace(req.Architecture)
+	switch {
+	case current == hadomain.ArchitectureDualMaster && target == hadomain.ArchitectureMasterSlave:
+		return "dual_to_master_slave"
+	case current == hadomain.ArchitectureMasterSlave && target == hadomain.ArchitectureDualMaster:
+		return "master_slave_to_dual"
+	default:
+		return ""
+	}
+}
+
+func architectureConversionPlanSteps(req hadomain.ArchitectureAdjustmentRequest) []hadomain.ArchitecturePlanStep {
+	kind := architectureTransitionKind(req)
+	if kind == "" {
+		return nil
+	}
+	freezeName, freezeDescription := "锁定当前写入口", "短暂阻止新业务连接，建立一致的拓扑变更边界"
+	reconfigureName, reconfigureDescription := "建立双向复制", "保留当前主库，补充反向复制和双主自增参数；不重复选举或提升现有主库"
+	if kind == "dual_to_master_slave" {
+		freezeName, freezeDescription = "隔离待降级主节点", "仅冻结将降为从库的主节点，不影响保留主节点的角色"
+		reconfigureName, reconfigureDescription = "降级为从库", "清理待降级节点的旧复制通道并指向保留主库；不重复提升保留主库"
+	}
+	items := []hadomain.ArchitecturePlanStep{
+		{Code: "acquire_lock", Name: "获取集群切换锁", Description: "阻止并发架构调整和 VIP 漂移"},
+		{Code: "preflight", Name: "实时预检", Description: "确认 Agent、GTID、复制线程和 MHA 管理通道可用"},
+		{Code: "freeze_business_access", Name: freezeName, Description: freezeDescription, Destructive: true},
+		{Code: "drain_business_sessions", Name: "排空受影响业务会话", Description: "保留管理与复制连接，清理受影响节点上的业务会话", Destructive: true},
+		{Code: "wait_replication_zero", Name: "等待复制追平", Description: "确认目标节点已执行完 relay log 且 GTID 无缺口"},
+		{Code: "reconfigure_topology", Name: reconfigureName, Description: reconfigureDescription, Destructive: true},
+		{Code: "verify_topology", Name: "验证目标拓扑", Description: "验证复制方向、线程、只读状态和双主自增参数"},
+		{Code: "pt_verify_replication", Name: "PT 数据一致性验证", Description: "验证拓扑转换后各实例业务数据一致"},
+	}
+	if req.MoveVIP {
+		items = append(items,
+			hadomain.ArchitecturePlanStep{Code: "check_vip_conflict", Name: "扫描 VIP 持有者", Description: "确认 VIP 当前不存在多节点持有"},
+			hadomain.ArchitecturePlanStep{Code: "move_vip", Name: "迁移 VIP", Description: "执行零持有者屏障后将 VIP 迁移到保留主节点", Destructive: true},
+			hadomain.ArchitecturePlanStep{Code: "verify_single_vip", Name: "防脑裂复核", Description: "确认 VIP 最终仅由目标主节点持有"},
+		)
+	}
+	items = append(items,
+		hadomain.ArchitecturePlanStep{Code: "resume_business_connections", Name: "恢复业务访问", Description: "全部拓扑与 VIP 校验通过后恢复业务连接"},
+		hadomain.ArchitecturePlanStep{Code: "release_lock", Name: "释放切换锁", Description: "记录审计结果并释放集群锁"},
+	)
+	for index := range items {
+		items[index].Order = index + 1
+	}
+	return items
+}
+
+func reqVIPStepName(req hadomain.ArchitectureAdjustmentRequest) string {
+	if req.InitializeVIP {
+		return "绑定 VIP"
+	}
+	return "漂移 VIP"
+}
+
+func addArchitectureManagementRepairStep(items []hadomain.ArchitecturePlanStep, req hadomain.ArchitectureAdjustmentRequest) []hadomain.ArchitecturePlanStep {
+	if strings.TrimSpace(req.RootPassword) == "" || len(req.RootPasswords) > 0 {
+		return items
+	}
+	repair := hadomain.ArchitecturePlanStep{
+		Code: "repair_management_privileges", Name: "修复 MHA 管理权限",
+		Description: "仅使用一次 root 凭据补齐旧实例的 MHA 管理权限，后续步骤切回 Agent 保存的 MHA 账号",
+	}
+	insertAt := 1
+	if len(items) < insertAt {
+		insertAt = len(items)
+	}
+	items = append(items, hadomain.ArchitecturePlanStep{})
+	copy(items[insertAt+1:], items[insertAt:])
+	items[insertAt] = repair
+	return items
 }

@@ -54,6 +54,8 @@ func RegisterBuiltinCollectors(reg *CollectorRegistry, mysqlConfigPath string) {
 	reg.Register("agent_cpu_usage_percent", func() DynamicCollector { return NewAgentCPUCollector() })
 	reg.Register("agent_memory_rss_mb", func() DynamicCollector { return builtinFunc("agent_memory_rss_mb", "agent", collectAgentRSS) })
 	reg.Register("io_status", func() DynamicCollector { return NewIOCollector() })
+	reg.Register("filesystem_usage", func() DynamicCollector { return builtinFunc("filesystem_usage", "host", collectFilesystemUsage) })
+	reg.Register("network_throughput", func() DynamicCollector { return NewNetworkCollector() })
 	reg.Register("load_average", func() DynamicCollector { return builtinFunc("load_average", "host", collectLoadAverage) })
 	reg.Register("ntp_offset_ms", func() DynamicCollector { return builtinFunc("ntp_offset_ms", "host", collectNTPOffset) })
 	reg.Register("ssh_probe", func() DynamicCollector { return builtinFunc("ssh_probe", "host", collectSSHProbe) })

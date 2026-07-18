@@ -41,14 +41,33 @@ type HAService struct {
 	repo      HARepository
 	machines  machinedomain.Repository
 	instances MySQLInstanceRepository
+	presets   MySQLAccountPresetRepository
 	vip       *VIPService
 	tasks     *TaskService
 }
 
-func NewHAService(repo HARepository, machines machinedomain.Repository, instances MySQLInstanceRepository) *HAService {
+func NewHAService(repo HARepository, machines machinedomain.Repository, instances MySQLInstanceRepository, presets ...MySQLAccountPresetRepository) *HAService {
 	s := &HAService{repo: repo, machines: machines, instances: instances}
+	if len(presets) > 0 {
+		s.presets = presets[0]
+	}
 	s.vip = NewVIPService(repo, machines, instances)
 	return s
+}
+
+func (s *HAService) architectureManagementAccount(ctx context.Context) (string, string) {
+	items := defaultMySQLAccountPresets()
+	if s.presets != nil {
+		if saved, err := s.presets.List(ctx); err == nil {
+			items = normalizeMySQLAccountPresets(saved)
+		}
+	}
+	for _, item := range items {
+		if item.Role == "mha" && item.Enabled && strings.TrimSpace(item.Username) != "" && item.Password != "" {
+			return strings.TrimSpace(item.Username), item.Password
+		}
+	}
+	return "mha", "3306niubi"
 }
 
 func (s *HAService) VIP() *VIPService {
@@ -76,10 +95,14 @@ func (s *HAService) SaveVIPConfig(ctx context.Context, clusterID string, cfg had
 		return hadomain.ClusterVIPConfig{}, errors.New("valid cluster and VIP address are required")
 	}
 	if parsedVIP.To4() == nil {
-		return hadomain.ClusterVIPConfig{}, errors.New("current ARP, BGP and Keepalived VIP drivers require an IPv4 address")
+		return hadomain.ClusterVIPConfig{}, errors.New("current automatic ARP and BGP VIP drivers require an IPv4 address")
 	}
 	if cfg.VIPPrefix <= 0 || cfg.VIPPrefix > 32 {
 		return hadomain.ClusterVIPConfig{}, errors.New("IPv4 VIP prefix must be between 1 and 32")
+	}
+	cfg, err := s.resolveAutomaticVIPMode(ctx, cfg.ClusterID, cfg)
+	if err != nil {
+		return hadomain.ClusterVIPConfig{}, err
 	}
 	switch cfg.VIPRouteMode {
 	case hadomain.VipRouteModeL2ARP:
@@ -99,10 +122,6 @@ func (s *HAService) SaveVIPConfig(ctx context.Context, clusterID string, cfg had
 		if cfg.BGPCommunity != "" && !regexp.MustCompile(`^[0-9]{1,10}:[0-9]{1,10}$`).MatchString(cfg.BGPCommunity) {
 			return hadomain.ClusterVIPConfig{}, errors.New("BGP community must use ASN:value format")
 		}
-	case hadomain.VipRouteModeKeepalived:
-		if strings.TrimSpace(cfg.DefaultInterface) == "" {
-			return hadomain.ClusterVIPConfig{}, errors.New("Keepalived mode requires an explicit network interface")
-		}
 	default:
 		return hadomain.ClusterVIPConfig{}, fmt.Errorf("unsupported VIP route mode %s", cfg.VIPRouteMode)
 	}
@@ -114,6 +133,54 @@ func (s *HAService) SaveVIPConfig(ctx context.Context, clusterID string, cfg had
 	}
 	cfg.Enabled, cfg.CheckAfterBind, cfg.ExternalCheckEnabled = true, true, true
 	return writer.UpsertVIPConfig(ctx, cfg)
+}
+
+// resolveAutomaticVIPMode hides route advertisement internals from callers.
+// L2 uses gratuitous ARP; an explicitly configured L3/BGP cluster reuses its
+// saved BGP policy. Other legacy modes are normalized away.
+func (s *HAService) resolveAutomaticVIPMode(ctx context.Context, clusterID string, cfg hadomain.ClusterVIPConfig) (hadomain.ClusterVIPConfig, error) {
+	policy, _ := s.repo.GetNetworkPolicy(ctx, clusterID)
+	wantsBGP := strings.EqualFold(policy.NetworkTopology, "L3") || policy.VIPRouteMode == hadomain.VipRouteModeBGP || cfg.VIPRouteMode == hadomain.VipRouteModeBGP
+	if wantsBGP {
+		if cfg.BGPLocalAS <= 0 || cfg.BGPPeerAS <= 0 || strings.TrimSpace(cfg.BGPPeerAddress) == "" {
+			if templates, err := s.repo.ListVIPConfigs(ctx, clusterID); err == nil {
+				for _, template := range templates {
+					if template.VIPRouteMode == hadomain.VipRouteModeBGP && template.BGPLocalAS > 0 && template.BGPPeerAS > 0 && strings.TrimSpace(template.BGPPeerAddress) != "" {
+						cfg.BGPLocalAS, cfg.BGPPeerAS, cfg.BGPPeerAddress = template.BGPLocalAS, template.BGPPeerAS, template.BGPPeerAddress
+						cfg.BGPRouterID, cfg.BGPCommunity = template.BGPRouterID, template.BGPCommunity
+						break
+					}
+				}
+			}
+		}
+		if cfg.BGPLocalAS <= 0 || cfg.BGPPeerAS <= 0 || strings.TrimSpace(cfg.BGPPeerAddress) == "" {
+			return cfg, errors.New("集群为三层网络，但没有可复用的 BGP 邻居策略；请先完善集群网络策略")
+		}
+		cfg.VIPRouteMode, cfg.BGPEnabled, cfg.ArpingEnabled = hadomain.VipRouteModeBGP, true, false
+		return cfg, nil
+	}
+	cfg.VIPRouteMode, cfg.ArpingEnabled, cfg.BGPEnabled = hadomain.VipRouteModeL2ARP, true, false
+	return cfg, nil
+}
+
+// ApplyVIPConfig saves the desired VIP and executes the complete remote bind
+// and verification flow over the existing Agent task channel. No SSH or MySQL
+// execution credential is accepted by this API.
+func (s *HAService) ApplyVIPConfig(ctx context.Context, clusterID, targetMachineID string, cfg hadomain.ClusterVIPConfig) (hadomain.VIPBindingState, error) {
+	saved, err := s.SaveVIPConfig(ctx, clusterID, cfg)
+	if err != nil {
+		return hadomain.VIPBindingState{}, err
+	}
+	return s.vip.Bind(ctx, strings.TrimSpace(clusterID), strings.TrimSpace(targetMachineID), saved)
+}
+
+// RemoveVIPConfig withdraws the live VIP from every cluster node, verifies it
+// is absent, and only then deletes Manager's configuration and binding state.
+func (s *HAService) RemoveVIPConfig(ctx context.Context, clusterID, vip string) error {
+	if err := s.vip.Remove(ctx, strings.TrimSpace(clusterID), strings.TrimSpace(vip)); err != nil {
+		return err
+	}
+	return s.DeleteVIPConfig(ctx, clusterID, vip)
 }
 
 func (s *HAService) DeleteVIPConfig(ctx context.Context, clusterID, vip string) error {
@@ -213,11 +280,10 @@ func NewVIPService(repo HARepository, machines machinedomain.Repository, instanc
 		instances: instances,
 		selector:  selector,
 		drivers: map[string]VipDriver{
-			hadomain.VipRouteModeL2ARP:      NewL2ARPVipDriver(nil),
-			hadomain.VipRouteModeManual:     NotImplementedVipDriver{Mode: hadomain.VipRouteModeManual, Message: "MANUAL VIP driver does not execute add/del; automatic failover is blocked"},
-			hadomain.VipRouteModeBGP:        ArchitectureManagedVIPDriver{Mode: hadomain.VipRouteModeBGP},
-			hadomain.VipRouteModeCloudAPI:   NotImplementedVipDriver{Mode: hadomain.VipRouteModeCloudAPI, Message: "CLOUD_API VIP driver is not implemented; automatic failover is blocked"},
-			hadomain.VipRouteModeKeepalived: ArchitectureManagedVIPDriver{Mode: hadomain.VipRouteModeKeepalived},
+			hadomain.VipRouteModeL2ARP:    NewL2ARPVipDriver(nil),
+			hadomain.VipRouteModeManual:   NotImplementedVipDriver{Mode: hadomain.VipRouteModeManual, Message: "MANUAL VIP driver does not execute add/del; automatic failover is blocked"},
+			hadomain.VipRouteModeBGP:      ArchitectureManagedVIPDriver{Mode: hadomain.VipRouteModeBGP},
+			hadomain.VipRouteModeCloudAPI: NotImplementedVipDriver{Mode: hadomain.VipRouteModeCloudAPI, Message: "CLOUD_API VIP driver is not implemented; automatic failover is blocked"},
 		},
 	}
 }
@@ -241,43 +307,77 @@ func (s *VIPService) Scan(ctx context.Context, clusterID string) ([]hadomain.VIP
 	if err != nil {
 		return nil, err
 	}
+	parent, err := s.tasks.CreateBatchTrackingTask(ctx, "vip_scan", "扫描集群 VIP 绑定状态", clusterID)
+	if err != nil {
+		return nil, err
+	}
+	created, createFailed := 0, 0
+	defer func() {
+		_ = s.tasks.FinalizeBatchTrackingTask(context.WithoutCancel(ctx), parent.Task.ID, created, createFailed)
+	}()
+	previousStates, _ := s.repo.GetVIPBindingStates(ctx, clusterID)
+	previousByVIP := make(map[string]hadomain.VIPBindingState, len(previousStates))
+	for _, state := range previousStates {
+		previousByVIP[state.VIPAddress] = state
+	}
 	var out []hadomain.VIPBindingState
 	for _, cfg := range configs {
 		var holders []string
+		holderInterfaces := make(map[string]string)
 		for _, machine := range machines {
 			if machine.Cluster != clusterID {
 				continue
 			}
-			command := "if ip -o addr show | awk '{print $4}' | cut -d/ -f1 | grep -Fxq " + shellQuote(cfg.VIPAddress) + "; then echo BOUND; else echo UNBOUND; fi"
-			detail, createErr := s.tasks.CreateExecTask(ctx, machine.IP, command)
+			command := vipScanCommand(cfg.VIPAddress)
+			detail, createErr := s.tasks.CreateExecTaskWithOptions(ctx, machine.IP, command, ExecTaskOptions{
+				ParentTaskID: parent.Task.ID, Operation: "vip_scan", DisplayName: "检测 VIP " + cfg.VIPAddress, StepName: "检查目标机器网卡地址",
+			})
 			if createErr != nil {
+				createFailed++
 				return nil, createErr
 			}
+			created++
 			completed, waitErr := s.tasks.WaitForTask(ctx, detail.Task.ID, 30*time.Second)
 			if waitErr != nil || completed.Task.Status != taskdomain.StatusSuccess {
 				return nil, fmt.Errorf("VIP scan failed on %s", machine.Name)
 			}
-			if len(completed.Steps) > 0 && strings.TrimSpace(completed.Steps[len(completed.Steps)-1].Message) == "BOUND" {
+			iface := vipScanInterface(completed)
+			if iface != "" {
 				holders = append(holders, machine.ID)
+				holderInterfaces[machine.ID] = iface
 			}
 		}
+		previous := previousByVIP[cfg.VIPAddress]
+		expectedHolder := previous.ExpectedHolderMachineID
+		checkedAt := time.Now().UTC()
 		status := hadomain.VipStatusUnbound
 		if len(holders) == 1 {
 			status = hadomain.VipStatusBound
+			if expectedHolder != "" && holders[0] != expectedHolder {
+				status = hadomain.VipStatusMismatch
+			}
 		}
 		if len(holders) > 1 {
 			status = hadomain.VipStatusConflict
 		}
 		state := hadomain.VIPBindingState{
-			ClusterID:       clusterID,
-			VIPConfigID:     cfg.ID,
-			VIPAddress:      cfg.VIPAddress,
-			VIPStatus:       status,
-			DetectedHolders: strings.Join(holders, ","),
-			LastCheckResult: fmt.Sprintf("live Agent scan found %d holder(s)", len(holders)),
+			TaskID:                  parent.Task.ID,
+			ClusterID:               clusterID,
+			VIPConfigID:             cfg.ID,
+			VIPAddress:              cfg.VIPAddress,
+			VIPStatus:               status,
+			DetectedHolders:         strings.Join(holders, ","),
+			ExpectedHolderMachineID: expectedHolder,
+			LastCheckResult:         fmt.Sprintf("live Agent scan found %d holder(s)", len(holders)),
+			CreatedAt:               checkedAt,
+			UpdatedAt:               checkedAt,
 		}
 		if len(holders) == 1 {
 			state.CurrentHolderMachineID = holders[0]
+			if state.ExpectedHolderMachineID == "" {
+				state.ExpectedHolderMachineID = holders[0]
+			}
+			state.CurrentInterface = holderInterfaces[holders[0]]
 		}
 		if err := s.repo.UpsertVIPBindingState(ctx, state); err != nil {
 			return nil, err
@@ -286,6 +386,244 @@ func (s *VIPService) Scan(ctx context.Context, clusterID string) ([]hadomain.VIP
 		out = append(out, state)
 	}
 	return out, nil
+}
+
+const vipScanMarker = "__GMHA_VIP_SCAN__"
+
+func vipScanCommand(vip string) string {
+	return "iface=$(ip -o -4 addr show | awk -v vip=" + shellQuote(vip) + " '$4 ~ (\"^\" vip \"/\") {print $2; exit}'); printf '" + vipScanMarker + "%s\\n' \"${iface:-UNBOUND}\""
+}
+
+func vipScanInterface(detail TaskDetail) string {
+	for index := len(detail.Steps) - 1; index >= 0; index-- {
+		message := detail.Steps[index].Message
+		if marker := strings.LastIndex(message, vipScanMarker); marker >= 0 {
+			value := strings.TrimSpace(strings.SplitN(message[marker+len(vipScanMarker):], "\n", 2)[0])
+			if value != "" && value != "UNBOUND" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
+func (s *VIPService) clusterMachines(ctx context.Context, clusterID string) ([]machinedomain.Machine, error) {
+	items, err := s.machines.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]machinedomain.Machine, 0, len(items))
+	for _, item := range items {
+		if item.Cluster == clusterID {
+			result = append(result, item)
+		}
+	}
+	if len(result) == 0 {
+		return nil, fmt.Errorf("集群 %s 中没有可执行 VIP 操作的机器", clusterID)
+	}
+	return result, nil
+}
+
+func (s *VIPService) runCommand(ctx context.Context, machine machinedomain.Machine, operation, display, step, command string) (string, error) {
+	if s.tasks == nil {
+		return "", errors.New("VIP 操作需要在线 Agent 任务通道")
+	}
+	detail, err := s.tasks.CreateExecTaskWithOptions(ctx, machine.IP, command, ExecTaskOptions{Operation: operation, DisplayName: display, StepName: step})
+	if err != nil {
+		return "", err
+	}
+	completed, err := s.tasks.WaitForTask(ctx, detail.Task.ID, 45*time.Second)
+	if err != nil {
+		return detail.Task.ID, err
+	}
+	if completed.Task.Status != taskdomain.StatusSuccess {
+		return detail.Task.ID, fmt.Errorf("%s 在 %s 执行失败: %s", display, machine.Name, emptyTaskError(completed))
+	}
+	return detail.Task.ID, nil
+}
+
+func (s *VIPService) Bind(ctx context.Context, clusterID, targetMachineID string, cfg hadomain.ClusterVIPConfig) (hadomain.VIPBindingState, error) {
+	var result hadomain.VIPBindingState
+	err := s.withVIPOperationLock(ctx, clusterID, "bind", func(operationCtx context.Context) error {
+		var bindErr error
+		result, bindErr = s.bindLocked(operationCtx, clusterID, targetMachineID, cfg)
+		return bindErr
+	})
+	return result, err
+}
+
+func (s *VIPService) withVIPOperationLock(ctx context.Context, clusterID, operation string, execute func(context.Context) error) error {
+	const lockTTL = 5 * time.Minute
+	lockID := "vip-" + operation + "-" + strings.TrimPrefix(newFailoverID(), "fo-")
+	if err := s.repo.AcquireFailoverLock(ctx, clusterID, lockID, "gmha-vip", lockTTL); err != nil {
+		return fmt.Errorf("集群正在执行其他高可用操作，VIP %s 已阻止: %w", operation, err)
+	}
+	executionCtx, cancel := context.WithCancel(ctx)
+	lockErrors := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-executionCtx.Done():
+				return
+			case <-ticker.C:
+				if err := s.repo.RenewFailoverLock(context.Background(), clusterID, lockID, lockTTL); err != nil {
+					lockErrors <- err
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	operationErr := execute(executionCtx)
+	cancel()
+	<-done
+	_ = s.repo.ReleaseFailoverLock(context.Background(), clusterID, lockID)
+	select {
+	case lockErr := <-lockErrors:
+		return fmt.Errorf("VIP 操作失去集群互斥锁，已终止: %w", lockErr)
+	default:
+		return operationErr
+	}
+}
+
+func (s *VIPService) bindLocked(ctx context.Context, clusterID, targetMachineID string, cfg hadomain.ClusterVIPConfig) (hadomain.VIPBindingState, error) {
+	machines, err := s.clusterMachines(ctx, clusterID)
+	if err != nil {
+		return hadomain.VIPBindingState{}, err
+	}
+	var target machinedomain.Machine
+	for _, machine := range machines {
+		if machine.ID == targetMachineID {
+			target = machine
+			break
+		}
+	}
+	if target.ID == "" {
+		return hadomain.VIPBindingState{}, errors.New("请选择当前集群中的 VIP 持有机器")
+	}
+	if cfg.VIPRouteMode == hadomain.VipRouteModeL2ARP {
+		iface, selectErr := s.selector.Select(ctx, SelectVIPInterfaceRequest{ClusterID: clusterID, MachineID: target.ID, DefaultInterface: cfg.DefaultInterface, VIPAddress: cfg.VIPAddress})
+		if selectErr != nil {
+			return hadomain.VIPBindingState{}, selectErr
+		}
+		cfg.DefaultInterface = iface
+	}
+	for _, machine := range machines {
+		command := l2VIPRemoveCommand(cfg)
+		if cfg.VIPRouteMode == hadomain.VipRouteModeBGP {
+			command = bgpVIPWithdrawCommand(cfg)
+		}
+		if _, err := s.runCommand(ctx, machine, "vip_withdraw", "撤销旧 VIP "+cfg.VIPAddress, "确保旧持有者已解除绑定", command); err != nil {
+			return hadomain.VIPBindingState{}, err
+		}
+	}
+	withdrawnStates, err := s.Scan(ctx, clusterID)
+	if err != nil {
+		return hadomain.VIPBindingState{}, fmt.Errorf("VIP %s 零持有者屏障检查失败: %w", cfg.VIPAddress, err)
+	}
+	for _, state := range withdrawnStates {
+		if state.VIPAddress == cfg.VIPAddress && state.VIPStatus != hadomain.VipStatusUnbound {
+			return state, fmt.Errorf("VIP %s 撤销后仍存在持有者 %s，已阻止重新绑定", cfg.VIPAddress, state.DetectedHolders)
+		}
+	}
+	bindCommand := l2VIPBindCommand(cfg)
+	if cfg.VIPRouteMode == hadomain.VipRouteModeBGP {
+		bindCommand = bgpVIPAnnounceCommand(cfg, target)
+	}
+	bindTaskID, err := s.runCommand(ctx, target, "vip_bind", "绑定 VIP "+cfg.VIPAddress, "绑定并自动宣告 VIP", bindCommand)
+	if err != nil {
+		_ = s.repo.UpsertVIPBindingState(context.WithoutCancel(ctx), hadomain.VIPBindingState{ClusterID: clusterID, VIPConfigID: cfg.ID, VIPAddress: cfg.VIPAddress, ExpectedHolderMachineID: target.ID, CurrentInterface: cfg.DefaultInterface, VIPStatus: hadomain.VipStatusFailed, LastError: err.Error()})
+		return hadomain.VIPBindingState{}, err
+	}
+	var verified hadomain.VIPBindingState
+	for round := 1; round <= 2; round++ {
+		states, scanErr := s.Scan(ctx, clusterID)
+		if scanErr != nil {
+			rollback := l2VIPRemoveCommand(cfg)
+			if cfg.VIPRouteMode == hadomain.VipRouteModeBGP {
+				rollback = bgpVIPWithdrawCommand(cfg)
+			}
+			_, _ = s.runCommand(context.WithoutCancel(ctx), target, "vip_rollback", "回滚 VIP "+cfg.VIPAddress, "全节点验证不可用，撤销新节点 VIP", rollback)
+			failed := hadomain.VIPBindingState{ClusterID: clusterID, VIPConfigID: cfg.ID, VIPAddress: cfg.VIPAddress, ExpectedHolderMachineID: target.ID, VIPStatus: hadomain.VipStatusFailed, LastError: "cluster-wide verification unavailable; new target binding was withdrawn"}
+			_ = s.repo.UpsertVIPBindingState(context.WithoutCancel(ctx), failed)
+			return failed, scanErr
+		}
+		verified = hadomain.VIPBindingState{ClusterID: clusterID, VIPConfigID: cfg.ID, VIPAddress: cfg.VIPAddress, ExpectedHolderMachineID: target.ID}
+		for _, state := range states {
+			if state.VIPAddress == cfg.VIPAddress {
+				verified = state
+				break
+			}
+		}
+		if verified.VIPAddress == "" || verified.VIPStatus != hadomain.VipStatusBound || verified.CurrentHolderMachineID != target.ID {
+			rollback := l2VIPRemoveCommand(cfg)
+			if cfg.VIPRouteMode == hadomain.VipRouteModeBGP {
+				rollback = bgpVIPWithdrawCommand(cfg)
+			}
+			_, _ = s.runCommand(context.WithoutCancel(ctx), target, "vip_rollback", "回滚 VIP "+cfg.VIPAddress, "唯一持有者验证失败，撤销新节点 VIP", rollback)
+			verified.VIPStatus = hadomain.VipStatusFailed
+			verified.LastError = fmt.Sprintf("第 %d 轮唯一持有者验证失败；新目标绑定已回滚", round)
+			_ = s.repo.UpsertVIPBindingState(context.WithoutCancel(ctx), verified)
+			return verified, fmt.Errorf("VIP %s 第 %d 轮单持有者复检失败，当前持有者 %s", cfg.VIPAddress, round, verified.DetectedHolders)
+		}
+	}
+	verified.TaskID = bindTaskID
+	verified.ExpectedHolderMachineID = target.ID
+	verified.LastCheckResult = "two consecutive cluster-wide scans verified one holder"
+	_ = s.repo.UpsertVIPBindingState(ctx, verified)
+	_ = s.repo.InsertVIPOperationLog(ctx, clusterID, "", cfg.VIPAddress, "ADD", target.ID, target.IP, verified.CurrentInterface, "Agent managed automatic advertisement with two-round verification", 0, "", "", "gmha-manager", "SUCCESS")
+	return verified, nil
+}
+
+func (s *VIPService) Remove(ctx context.Context, clusterID, vip string) error {
+	return s.withVIPOperationLock(ctx, clusterID, "delete", func(operationCtx context.Context) error {
+		return s.removeLocked(operationCtx, clusterID, vip)
+	})
+}
+
+func (s *VIPService) removeLocked(ctx context.Context, clusterID, vip string) error {
+	configs, err := s.repo.ListVIPConfigs(ctx, clusterID)
+	if err != nil {
+		return err
+	}
+	var cfg hadomain.ClusterVIPConfig
+	for _, item := range configs {
+		if item.VIPAddress == vip {
+			cfg = item
+			break
+		}
+	}
+	if cfg.ID == 0 {
+		return fmt.Errorf("VIP %s 未配置", vip)
+	}
+	machines, err := s.clusterMachines(ctx, clusterID)
+	if err != nil {
+		return err
+	}
+	for _, machine := range machines {
+		command := l2VIPRemoveCommand(cfg)
+		if cfg.VIPRouteMode == hadomain.VipRouteModeBGP {
+			command = bgpVIPWithdrawCommand(cfg)
+		}
+		if _, err := s.runCommand(ctx, machine, "vip_delete", "删除 VIP "+vip, "撤销 VIP 并验证不存在", command); err != nil {
+			return err
+		}
+	}
+	states, err := s.Scan(ctx, clusterID)
+	if err != nil {
+		return err
+	}
+	for _, state := range states {
+		if state.VIPAddress == vip && state.VIPStatus != hadomain.VipStatusUnbound {
+			return fmt.Errorf("VIP %s 删除复检失败，仍有持有者 %s", vip, state.DetectedHolders)
+		}
+	}
+	_ = s.repo.InsertVIPOperationLog(ctx, clusterID, "", vip, "DELETE", "", "", "", "Agent managed withdrawal", 0, "", "", "gmha-manager", "SUCCESS")
+	return nil
 }
 
 func (s *VIPService) Adopt(ctx context.Context, clusterID, vip string) (hadomain.VIPBindingState, error) {
@@ -330,7 +668,7 @@ func (s *VIPService) DriverFor(ctx context.Context, clusterID string, cfg hadoma
 		mode = network.VIPRouteMode
 	}
 	if strings.EqualFold(network.NetworkTopology, "L3") && mode == hadomain.VipRouteModeL2ARP {
-		return nil, errors.New("network_topology=L3 cannot use L2_ARP VIP drift; configure BGP/CLOUD_API/KEEPALIVED driver")
+		return nil, errors.New("network_topology=L3 cannot use L2_ARP VIP drift; configure the cluster BGP policy")
 	}
 	driver, ok := s.drivers[mode]
 	if !ok {

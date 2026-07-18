@@ -5,13 +5,12 @@ package ha
 import "time"
 
 const (
-	DefaultFailoverMode    = "safe"
-	DefaultSwitchStrategy  = "safe-wait-replay-auto"
-	VipRouteModeL2ARP      = "L2_ARP"
-	VipRouteModeManual     = "MANUAL"
-	VipRouteModeBGP        = "BGP"
-	VipRouteModeCloudAPI   = "CLOUD_API"
-	VipRouteModeKeepalived = "KEEPALIVED"
+	DefaultFailoverMode   = "safe"
+	DefaultSwitchStrategy = "safe-wait-replay-auto"
+	VipRouteModeL2ARP     = "L2_ARP"
+	VipRouteModeManual    = "MANUAL"
+	VipRouteModeBGP       = "BGP"
+	VipRouteModeCloudAPI  = "CLOUD_API"
 
 	VipStatusUnknown  = "UNKNOWN"
 	VipStatusUnbound  = "UNBOUND"
@@ -81,6 +80,7 @@ type ClusterVIPConfig struct {
 
 // VIPBindingState 记录 VIP 的绑定状态，包括期望持有者、实际持有者和检测结果。
 type VIPBindingState struct {
+	TaskID                   string    `json:"task_id,omitempty"`
 	ID                       int64     `json:"id"`
 	ClusterID                string    `json:"cluster_id"`
 	VIPConfigID              int64     `json:"vip_config_id"`

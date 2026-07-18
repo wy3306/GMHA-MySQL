@@ -58,7 +58,8 @@ func (r *Receiver) Run(ctx context.Context) error {
 }
 
 func (r *Receiver) runOnce(ctx context.Context, managerHTTPAddr string) error {
-	wsURL, err := buildTaskWSURL(managerHTTPAddr, r.agentID, r.machineID, r.dispatcher.Types())
+	capabilities := append(r.dispatcher.Types(), taskdomain.CapabilityMySQLDefaultsFile)
+	wsURL, err := buildTaskWSURL(managerHTTPAddr, r.agentID, r.machineID, capabilities)
 	if err != nil {
 		return err
 	}
@@ -74,7 +75,10 @@ func (r *Receiver) runOnce(ctx context.Context, managerHTTPAddr string) error {
 		if err := websocket.JSON.Receive(conn, &envelope); err != nil {
 			return err
 		}
-		go r.dispatcher.Dispatch(ctx, envelope, reporter)
+		// 任务中的本地资源下载必须跟随当前实际可用的 Manager 连接。
+		// Agent 可能配置了多个地址并从备用地址连接成功，不能继续固定使用首地址。
+		dispatchCtx := WithManagerHTTPAddr(ctx, managerHTTPAddr)
+		go r.dispatcher.Dispatch(dispatchCtx, envelope, reporter)
 	}
 }
 

@@ -472,8 +472,19 @@ func (r *HARepository) UpsertVIPConfig(ctx context.Context, cfg hadomain.Cluster
 }
 
 func (r *HARepository) DeleteVIPConfig(ctx context.Context, clusterID, vip string) error {
-	_, err := r.db.ExecContext(ctx, `delete from cluster_vip_config where cluster_id = ? and vip_address = ?`, strings.TrimSpace(clusterID), strings.TrimSpace(vip))
-	return err
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	clusterID, vip = strings.TrimSpace(clusterID), strings.TrimSpace(vip)
+	if _, err := tx.ExecContext(ctx, `delete from vip_binding_state where cluster_id = ? and vip_address = ?`, clusterID, vip); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `delete from cluster_vip_config where cluster_id = ? and vip_address = ?`, clusterID, vip); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func nullableHAInt(value int) any {
@@ -565,12 +576,16 @@ func (r *HARepository) AcquireFailoverLock(ctx context.Context, clusterID, failo
 	expiresAt := now.Add(ttl).Format(time.RFC3339)
 	result, err := r.db.ExecContext(ctx, `
 		insert into failover_lock (cluster_id, failover_id, lock_owner, locked_at, expires_at)
-		select ?, ?, ?, ?, ?
-		where not exists (
-			select 1 from failover_lock
-			where cluster_id = ? and (expires_at is null or expires_at = '' or expires_at > ?)
-		)
-	`, clusterID, failoverID, owner, now.Format(time.RFC3339), expiresAt, clusterID, now.Format(time.RFC3339))
+		values (?, ?, ?, ?, ?)
+		on conflict(cluster_id) do update set
+			failover_id=excluded.failover_id,
+			lock_owner=excluded.lock_owner,
+			locked_at=excluded.locked_at,
+			expires_at=excluded.expires_at
+		where failover_lock.expires_at is not null
+			and failover_lock.expires_at <> ''
+			and failover_lock.expires_at <= ?
+	`, clusterID, failoverID, owner, now.Format(time.RFC3339), expiresAt, now.Format(time.RFC3339))
 	if err != nil {
 		return err
 	}

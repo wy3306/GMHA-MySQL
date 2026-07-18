@@ -69,7 +69,7 @@ func TestSelectManagerHostCandidatesUsesConfiguredIPWhenTargetUnknown(t *testing
 }
 
 func TestVirtualInterfacesSortAfterPhysicalInterfaces(t *testing.T) {
-	for _, name := range []string{"docker0", "veth123", "vmnet8", "utun3", "virbr0", "tailscale0"} {
+	for _, name := range []string{"docker0", "veth123", "vmnet8", "vmenet0", "feth3041", "bridge100", "utun3", "virbr0", "tailscale0"} {
 		if !isVirtualInterface(name) {
 			t.Errorf("expected %q to be treated as virtual", name)
 		}

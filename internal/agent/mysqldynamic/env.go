@@ -110,7 +110,7 @@ func BuildCollectEnvs(configPath string) ([]*CollectEnv, error) {
 	}
 	instances := cfg.Instances
 	if len(instances) == 0 {
-		instances = []mysqlcheck.InstanceConfig{{Port: 3306, Database: "gmha"}}
+		return []*CollectEnv{}, nil
 	}
 	out := make([]*CollectEnv, 0, len(instances))
 	for _, instance := range instances {

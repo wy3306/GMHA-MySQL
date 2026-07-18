@@ -1,7 +1,7 @@
 {
   "name": "gmha-console",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.0.1",
   "scripts": {
     "dev": "vite",
     "dev:gmha": "vite --host 127.0.0.1 --port 5173",

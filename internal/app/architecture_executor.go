@@ -2,8 +2,6 @@ package app
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"sort"
@@ -14,6 +12,7 @@ import (
 	hadomain "gmha/internal/domain/ha"
 	machinedomain "gmha/internal/domain/machine"
 	taskdomain "gmha/internal/domain/task"
+	mysqlapp "gmha/internal/mysql"
 )
 
 type architectureRunRepository interface {
@@ -34,11 +33,13 @@ func (s *HAService) StartArchitectureAdjustment(ctx context.Context, clusterID s
 	if !ok {
 		return hadomain.ArchitectureRun{}, errors.New("architecture run repository is not configured")
 	}
-	if strings.TrimSpace(req.RootPassword) == "" {
-		return hadomain.ArchitectureRun{}, errors.New("root_password is required for online architecture adjustment")
+	hasReplicationUser := strings.TrimSpace(req.ReplicationUser) != ""
+	hasReplicationPassword := req.ReplicationPassword != ""
+	if hasReplicationUser != hasReplicationPassword {
+		return hadomain.ArchitectureRun{}, errors.New("replication_user and replication_password must be provided together")
 	}
-	if strings.TrimSpace(req.ReplicationUser) == "" || req.ReplicationPassword == "" {
-		return hadomain.ArchitectureRun{}, errors.New("replication credentials are required")
+	if !hasReplicationUser {
+		req.ReplicationUser, req.ReplicationPassword = s.architectureManagementAccount(ctx)
 	}
 	plan, err := s.PlanArchitectureAdjustment(ctx, clusterID, req)
 	if err != nil {
@@ -50,6 +51,7 @@ func (s *HAService) StartArchitectureAdjustment(ctx context.Context, clusterID s
 	now := time.Now().UTC()
 	safeRequest := req
 	safeRequest.RootPassword = ""
+	safeRequest.RootPasswords = nil
 	safeRequest.ReplicationPassword = ""
 	run := hadomain.ArchitectureRun{
 		RunID: "arch-run-" + strings.TrimPrefix(newFailoverID(), "fo-"), ClusterID: clusterID,
@@ -103,7 +105,18 @@ func (s *HAService) executeArchitectureAdjustment(ctx context.Context, runs arch
 		s.failArchitectureRun(ctx, runs, &run, "acquire_lock", err)
 		return
 	}
-	defer func() { _ = s.repo.ReleaseFailoverLock(context.Background(), run.ClusterID, run.RunID) }()
+	lockReleased := false
+	releaseLock := func() error {
+		if lockReleased {
+			return nil
+		}
+		if err := s.repo.ReleaseFailoverLock(context.Background(), run.ClusterID, run.RunID); err != nil {
+			return err
+		}
+		lockReleased = true
+		return nil
+	}
+	defer func() { _ = releaseLock() }()
 	executionCtx, cancelExecution := context.WithCancel(ctx)
 	defer cancelExecution()
 	lockErrors := make(chan error, 1)
@@ -141,12 +154,234 @@ func (s *HAService) executeArchitectureAdjustment(ctx context.Context, runs arch
 		s.failArchitectureRun(ctx, runs, &run, "preflight", err)
 		return
 	}
+	if req.VIPOnly {
+		businessFrozen := false
+		defer func() {
+			if businessFrozen {
+				_, _ = s.resumeArchitectureBusinessConnections(context.Background(), req, machines)
+			}
+		}()
+		if err := s.runArchitectureStep(ctx, runs, &run, "preflight", func() ([]string, error) {
+			if strings.TrimSpace(req.PreferredNewMasterMachineID) == "" {
+				return nil, errors.New("VIP target master is required")
+			}
+			if _, ok := machines[req.PreferredNewMasterMachineID]; !ok {
+				return nil, errors.New("VIP target master is not an available cluster machine")
+			}
+			return s.runOnArchitectureNodes(ctx, req.Nodes, machines, func(node hadomain.ArchitectureNodeRequest, _ machinedomain.Machine) string {
+				return architecturePreflightCommand(architectureRootPassword(req, node.MachineID), node.Port)
+			})
+		}); err != nil {
+			return
+		}
+		if !req.InitializeVIP {
+			if err := s.runArchitectureStep(ctx, runs, &run, "freeze_business_access", func() ([]string, error) {
+				return s.runOnArchitectureNodes(ctx, req.Nodes, machines, func(node hadomain.ArchitectureNodeRequest, _ machinedomain.Machine) string {
+					return mysqlArchitectureCommand(architectureRootPassword(req, node.MachineID), node.Port, "SET GLOBAL offline_mode=ON; SELECT IF(@@offline_mode=1,'BUSINESS_LOCKED','BUSINESS_OPEN');") + " | grep -Fxq BUSINESS_LOCKED"
+				})
+			}); err != nil {
+				return
+			}
+			businessFrozen = true
+			if err := s.runArchitectureStep(ctx, runs, &run, "drain_business_sessions", func() ([]string, error) {
+				return s.runOnArchitectureNodes(ctx, req.Nodes, machines, func(node hadomain.ArchitectureNodeRequest, _ machinedomain.Machine) string {
+					return killBusinessSessionsCommand(req, node.MachineID, node.Port)
+				})
+			}); err != nil {
+				return
+			}
+		}
+		if err := s.runArchitectureStep(ctx, runs, &run, "check_vip_conflict", func() ([]string, error) {
+			return s.checkArchitectureVIPConflict(ctx, run, req, machines)
+		}); err != nil {
+			return
+		}
+		if err := s.runArchitectureStep(ctx, runs, &run, "withdraw_vip", func() ([]string, error) {
+			return s.withdrawArchitectureVIP(ctx, run, machines)
+		}); err != nil {
+			return
+		}
+		if err := s.runArchitectureStep(ctx, runs, &run, "verify_zero_vip", func() ([]string, error) {
+			return s.verifyArchitectureVIPZero(ctx, run, machines)
+		}); err != nil {
+			return
+		}
+		if err := s.runArchitectureStep(ctx, runs, &run, "bind_vip", func() ([]string, error) {
+			return s.bindArchitectureVIP(ctx, run, machines)
+		}); err != nil {
+			return
+		}
+		if err := s.runArchitectureStep(ctx, runs, &run, "verify_single_vip", func() ([]string, error) {
+			return s.verifyArchitectureVIP(ctx, run, req, machines)
+		}); err != nil {
+			_, _ = s.withdrawArchitectureVIP(context.Background(), run, machines)
+			return
+		}
+		if !req.InitializeVIP {
+			if err := s.runArchitectureStep(ctx, runs, &run, "resume_business_connections", func() ([]string, error) {
+				return s.resumeArchitectureBusinessConnections(ctx, req, machines)
+			}); err != nil {
+				return
+			}
+			businessFrozen = false
+		}
+		select {
+		case lockErr := <-lockErrors:
+			s.failArchitectureRun(context.Background(), runs, &run, "renew_lock", lockErr)
+			return
+		default:
+		}
+		if err := releaseLock(); err != nil {
+			s.failArchitectureRun(ctx, runs, &run, "release_lock", err)
+			return
+		}
+		s.succeedArchitectureRun(ctx, runs, &run)
+		return
+	}
+	if strings.TrimSpace(req.RootPassword) != "" && len(req.RootPasswords) == 0 {
+		managementUser, managementPassword := s.architectureManagementAccount(ctx)
+		if err := s.runArchitectureStep(ctx, runs, &run, "repair_management_privileges", func() ([]string, error) {
+			return s.repairArchitectureManagementPrivileges(ctx, req, machines, managementUser, managementPassword)
+		}); err != nil {
+			return
+		}
+		// Root is a one-time bootstrap credential. Every architecture operation
+		// after this point must prove that the Agent-managed MHA account works.
+		req.RootPassword = ""
+	}
 	if err := s.runArchitectureStep(ctx, runs, &run, "preflight", func() ([]string, error) {
 		return s.runOnArchitectureNodes(ctx, req.Nodes, machines, func(node hadomain.ArchitectureNodeRequest, _ machinedomain.Machine) string {
-			return mysqlArchitectureCommand(req.RootPassword, node.Port, "SELECT @@hostname,@@port,@@server_id,@@read_only,@@super_read_only,@@global.gtid_mode; SELECT COUNT(*) FROM performance_schema.threads;")
+			return architecturePreflightCommand(architectureRootPassword(req, node.MachineID), node.Port)
 		})
 	}); err != nil {
 		return
+	}
+	if transition := architectureTransitionKind(req); transition != "" {
+		freezeNodes := make([]hadomain.ArchitectureNodeRequest, 0, len(req.Nodes))
+		for _, node := range req.Nodes {
+			if (transition == "dual_to_master_slave" && strings.EqualFold(node.Role, "S")) || (transition == "master_slave_to_dual" && node.MachineID == req.CurrentMasterMachineID) {
+				freezeNodes = append(freezeNodes, node)
+			}
+		}
+		if len(freezeNodes) == 0 {
+			s.failArchitectureRun(ctx, runs, &run, "freeze_business_access", errors.New("cannot identify the nodes affected by topology conversion"))
+			return
+		}
+		businessFrozen := false
+		defer func() {
+			if businessFrozen {
+				_, _ = s.resumeArchitectureBusinessConnections(context.Background(), req, machines)
+			}
+		}()
+		if err := s.runArchitectureStep(ctx, runs, &run, "freeze_business_access", func() ([]string, error) {
+			return s.runOnArchitectureNodes(ctx, freezeNodes, machines, func(node hadomain.ArchitectureNodeRequest, _ machinedomain.Machine) string {
+				return mysqlArchitectureCommand(architectureRootPassword(req, node.MachineID), node.Port, "SET GLOBAL offline_mode=ON; SELECT IF(@@offline_mode=1,'BUSINESS_LOCKED','BUSINESS_OPEN');") + " | grep -Fxq BUSINESS_LOCKED"
+			})
+		}); err != nil {
+			return
+		}
+		businessFrozen = true
+		if err := s.runArchitectureStep(ctx, runs, &run, "drain_business_sessions", func() ([]string, error) {
+			return s.runOnArchitectureNodes(ctx, freezeNodes, machines, func(node hadomain.ArchitectureNodeRequest, _ machinedomain.Machine) string {
+				return killBusinessSessionsCommand(req, node.MachineID, node.Port)
+			})
+		}); err != nil {
+			return
+		}
+		catchupNodes := make([]hadomain.ArchitectureNodeRequest, 0, len(req.Nodes))
+		for _, node := range req.Nodes {
+			if (transition == "dual_to_master_slave" && strings.EqualFold(node.Role, "S")) || (transition == "master_slave_to_dual" && strings.EqualFold(node.Role, "M") && node.MachineID != req.CurrentMasterMachineID) {
+				catchupNodes = append(catchupNodes, node)
+			}
+		}
+		if err := s.runArchitectureStep(ctx, runs, &run, "wait_replication_zero", func() ([]string, error) {
+			return s.runOnArchitectureNodes(ctx, catchupNodes, machines, func(node hadomain.ArchitectureNodeRequest, _ machinedomain.Machine) string {
+				return replicationCatchupCommand(architectureRootPassword(req, node.MachineID), node.Port)
+			})
+		}); err != nil {
+			return
+		}
+		if err := s.runArchitectureStep(ctx, runs, &run, "reconfigure_topology", func() ([]string, error) {
+			return s.configureArchitectureTopology(ctx, req, req.PreferredNewMasterMachineID, machines)
+		}); err != nil {
+			return
+		}
+		if err := s.runArchitectureStep(ctx, runs, &run, "verify_topology", func() ([]string, error) {
+			return s.runOnArchitectureNodes(ctx, req.Nodes, machines, func(node hadomain.ArchitectureNodeRequest, _ machinedomain.Machine) string {
+				return verifyArchitectureNodeCommand(req, node, req.PreferredNewMasterMachineID)
+			})
+		}); err != nil {
+			return
+		}
+		if err := s.runArchitectureStep(ctx, runs, &run, "pt_verify_replication", func() ([]string, error) {
+			return s.verifyArchitectureDataWithPT(ctx, req, req.PreferredNewMasterMachineID, machines)
+		}); err != nil {
+			return
+		}
+		if req.MoveVIP {
+			if err := s.runArchitectureStep(ctx, runs, &run, "check_vip_conflict", func() ([]string, error) { return s.checkArchitectureVIPConflict(ctx, run, req, machines) }); err != nil {
+				return
+			}
+			if err := s.runArchitectureStep(ctx, runs, &run, "move_vip", func() ([]string, error) { return s.moveArchitectureVIP(ctx, run, req, machines) }); err != nil {
+				return
+			}
+			if err := s.runArchitectureStep(ctx, runs, &run, "verify_single_vip", func() ([]string, error) { return s.verifyArchitectureVIP(ctx, run, req, machines) }); err != nil {
+				return
+			}
+		}
+		if err := s.runArchitectureStep(ctx, runs, &run, "resume_business_connections", func() ([]string, error) {
+			return s.resumeArchitectureBusinessConnections(ctx, req, machines)
+		}); err != nil {
+			return
+		}
+		businessFrozen = false
+		if err := releaseLock(); err != nil {
+			s.failArchitectureRun(ctx, runs, &run, "release_lock", err)
+			return
+		}
+		s.succeedArchitectureRun(ctx, runs, &run)
+		return
+	}
+	if req.Architecture == hadomain.ArchitectureStandalone {
+		if err := s.executeStandaloneArchitecture(ctx, runs, &run, req, machines); err != nil {
+			return
+		}
+		if err := s.runArchitectureStep(ctx, runs, &run, "resume_business_connections", func() ([]string, error) {
+			return s.resumeArchitectureBusinessConnections(ctx, req, machines)
+		}); err != nil {
+			return
+		}
+		select {
+		case lockErr := <-lockErrors:
+			s.failArchitectureRun(context.Background(), runs, &run, "renew_lock", lockErr)
+			return
+		default:
+		}
+		if err := releaseLock(); err != nil {
+			s.failArchitectureRun(ctx, runs, &run, "release_lock", err)
+			return
+		}
+		s.succeedArchitectureRun(ctx, runs, &run)
+		return
+	}
+	startingFromIndependent := req.CurrentMasterMachineID == "" && !req.InitializeVIP
+	if startingFromIndependent {
+		if err := s.runArchitectureStep(ctx, runs, &run, "freeze_old_master", func() ([]string, error) {
+			return s.runOnArchitectureNodes(ctx, req.Nodes, machines, func(node hadomain.ArchitectureNodeRequest, _ machinedomain.Machine) string {
+				return mysqlArchitectureCommand(architectureRootPassword(req, node.MachineID), node.Port, "SET GLOBAL offline_mode=ON; SET GLOBAL read_only=ON; SET GLOBAL super_read_only=ON; SELECT IF(@@offline_mode=1 AND @@read_only=1 AND @@super_read_only=1,'FROZEN','NOT_FROZEN');") + " | grep -Fxq FROZEN"
+			})
+		}); err != nil {
+			s.restoreIndependentWriters(context.Background(), req, machines)
+			return
+		}
+		if err := s.runArchitectureStep(ctx, runs, &run, "kill_business_sessions", func() ([]string, error) {
+			return s.runOnArchitectureNodes(ctx, req.Nodes, machines, func(node hadomain.ArchitectureNodeRequest, _ machinedomain.Machine) string {
+				return killBusinessSessionsCommand(req, node.MachineID, node.Port)
+			})
+		}); err != nil {
+			s.restoreIndependentWriters(context.Background(), req, machines)
+			return
+		}
 	}
 	var elected hadomain.CandidateScore
 	if err := s.runArchitectureStep(ctx, runs, &run, "elect_candidate", func() ([]string, error) {
@@ -154,11 +389,22 @@ func (s *HAService) executeArchitectureAdjustment(ctx context.Context, runs arch
 		elected = candidate
 		return taskIDs, electionErr
 	}); err != nil {
+		if startingFromIndependent {
+			s.restoreIndependentWriters(context.Background(), req, machines)
+		}
 		return
 	}
 	run.Plan.SelectedCandidate = elected
 	run.UpdatedAt = time.Now().UTC()
 	_ = runs.SaveArchitectureRun(ctx, run)
+	if startingFromIndependent {
+		if err := s.runArchitectureStep(ctx, runs, &run, "align_replica_gtid", func() ([]string, error) {
+			return s.alignIndependentReplicaGTID(ctx, req, elected, machines)
+		}); err != nil {
+			s.restoreIndependentWriters(context.Background(), req, machines)
+			return
+		}
+	}
 	if req.MoveVIP {
 		if err := s.runArchitectureStep(ctx, runs, &run, "check_vip_conflict", func() ([]string, error) {
 			return s.checkArchitectureVIPConflict(ctx, run, req, machines)
@@ -174,19 +420,19 @@ func (s *HAService) executeArchitectureAdjustment(ctx context.Context, runs arch
 			return
 		}
 		if err := s.runArchitectureStep(ctx, runs, &run, "freeze_old_master", func() ([]string, error) {
-			return s.runOneArchitectureCommand(ctx, machines[oldNode.MachineID], mysqlArchitectureCommand(req.RootPassword, oldNode.Port, "SET GLOBAL read_only=ON; SET GLOBAL super_read_only=ON; SELECT @@read_only,@@super_read_only;"))
+			return s.runOneArchitectureCommand(ctx, machines[oldNode.MachineID], mysqlArchitectureCommand(architectureRootPassword(req, oldNode.MachineID), oldNode.Port, "SET GLOBAL offline_mode=ON; SET GLOBAL read_only=ON; SET GLOBAL super_read_only=ON; SELECT @@offline_mode,@@read_only,@@super_read_only;"))
 		}); err != nil {
 			return
 		}
 		if err := s.runArchitectureStep(ctx, runs, &run, "kill_business_sessions", func() ([]string, error) {
-			return s.runOneArchitectureCommand(ctx, machines[oldNode.MachineID], killBusinessSessionsCommand(req, oldNode.Port))
+			return s.runOneArchitectureCommand(ctx, machines[oldNode.MachineID], killBusinessSessionsCommand(req, oldNode.MachineID, oldNode.Port))
 		}); err != nil {
 			return
 		}
 
 		candidateNode, _ := architectureNode(req.Nodes, run.Plan.SelectedCandidate.MachineID)
 		err = s.runArchitectureStep(ctx, runs, &run, "wait_replication_zero", func() ([]string, error) {
-			return s.runOneArchitectureCommand(ctx, machines[candidateNode.MachineID], replicationCatchupCommand(req.RootPassword, candidateNode.Port))
+			return s.runOneArchitectureCommand(ctx, machines[candidateNode.MachineID], replicationCatchupCommand(architectureRootPassword(req, candidateNode.MachineID), candidateNode.Port))
 		})
 		if err != nil {
 			run.Status = hadomain.ArchitectureRunWaitingForce
@@ -209,7 +455,7 @@ func (s *HAService) executeArchitectureAdjustment(ctx context.Context, runs arch
 			run.Error = ""
 		}
 		if err := s.runArchitectureStep(ctx, runs, &run, "fence_old_master", func() ([]string, error) {
-			return s.runOneArchitectureCommand(ctx, machines[oldNode.MachineID], mysqlArchitectureCommand(req.RootPassword, oldNode.Port, "SET GLOBAL read_only=ON; SET GLOBAL super_read_only=ON; SELECT IF(@@read_only=1 AND @@super_read_only=1,'FENCED','NOT_FENCED');"))
+			return s.runOneArchitectureCommand(ctx, machines[oldNode.MachineID], mysqlArchitectureCommand(architectureRootPassword(req, oldNode.MachineID), oldNode.Port, "SET GLOBAL offline_mode=ON; SET GLOBAL read_only=ON; SET GLOBAL super_read_only=ON; SELECT IF(@@offline_mode=1 AND @@read_only=1 AND @@super_read_only=1,'FENCED','NOT_FENCED');"))
 		}); err != nil {
 			return
 		}
@@ -217,8 +463,8 @@ func (s *HAService) executeArchitectureAdjustment(ctx context.Context, runs arch
 
 	if err := s.runArchitectureStep(ctx, runs, &run, "promote_new_master", func() ([]string, error) {
 		node, _ := architectureNode(req.Nodes, run.Plan.SelectedCandidate.MachineID)
-		client := mysqlArchitectureClient(req.RootPassword, node.Port)
-		command := client + " --execute='STOP REPLICA' >/dev/null 2>&1 || true; " + client + " --execute='RESET REPLICA ALL' >/dev/null 2>&1 || true; " + client + " --batch --raw --execute=" + shellQuote("SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF; SELECT @@read_only,@@super_read_only;")
+		client := mysqlArchitectureClient(architectureRootPassword(req, node.MachineID), node.Port)
+		command := client + " --execute='STOP REPLICA' >/dev/null 2>&1 || true; " + client + " --execute='RESET REPLICA ALL' >/dev/null 2>&1 || true; " + client + " --batch --raw --execute=" + shellQuote("SET GLOBAL offline_mode=ON; SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF; SELECT @@offline_mode,@@read_only,@@super_read_only;")
 		return s.runOneArchitectureCommand(ctx, machines[node.MachineID], command)
 	}); err != nil {
 		return
@@ -256,6 +502,11 @@ func (s *HAService) executeArchitectureAdjustment(ctx context.Context, runs arch
 			return
 		}
 	}
+	if err := s.runArchitectureStep(ctx, runs, &run, "pt_verify_replication", func() ([]string, error) {
+		return s.verifyArchitectureDataWithPT(ctx, req, run.Plan.SelectedCandidate.MachineID, machines)
+	}); err != nil {
+		return
+	}
 	if req.MoveVIP {
 		if err := s.runArchitectureStep(ctx, runs, &run, "move_vip", func() ([]string, error) {
 			return s.moveArchitectureVIP(ctx, run, req, machines)
@@ -268,6 +519,11 @@ func (s *HAService) executeArchitectureAdjustment(ctx context.Context, runs arch
 			return
 		}
 	}
+	if err := s.runArchitectureStep(ctx, runs, &run, "resume_business_connections", func() ([]string, error) {
+		return s.resumeArchitectureBusinessConnections(ctx, req, machines)
+	}); err != nil {
+		return
+	}
 
 	select {
 	case lockErr := <-lockErrors:
@@ -275,11 +531,68 @@ func (s *HAService) executeArchitectureAdjustment(ctx context.Context, runs arch
 		return
 	default:
 	}
-	now := time.Now().UTC()
-	run.Status, run.CurrentStep, run.Error = hadomain.ArchitectureRunSucceeded, "release_lock", ""
-	run.UpdatedAt, run.FinishedAt = now, &now
-	_ = runs.SaveArchitectureRun(ctx, run)
-	s.syncArchitectureTrackingTask(ctx, run)
+	if err := releaseLock(); err != nil {
+		s.failArchitectureRun(ctx, runs, &run, "release_lock", err)
+		return
+	}
+	s.succeedArchitectureRun(ctx, runs, &run)
+}
+
+func (s *HAService) executeStandaloneArchitecture(ctx context.Context, runs architectureRunRepository, run *hadomain.ArchitectureRun, req hadomain.ArchitectureAdjustmentRequest, machines map[string]machinedomain.Machine) error {
+	if err := s.runArchitectureStep(ctx, runs, run, "validate_independent_targets", func() ([]string, error) {
+		return s.validateLiveIndependentTargets(ctx, req, machines)
+	}); err != nil {
+		return err
+	}
+	if req.CurrentMasterMachineID != "" {
+		current, ok := architectureNode(req.Nodes, req.CurrentMasterMachineID)
+		if !ok {
+			err := errors.New("current master node is not in standalone target")
+			s.failArchitectureRun(ctx, runs, run, "freeze_old_master", err)
+			return err
+		}
+		if err := s.runArchitectureStep(ctx, runs, run, "freeze_old_master", func() ([]string, error) {
+			return s.runOneArchitectureCommand(ctx, machines[current.MachineID], mysqlArchitectureCommand(architectureRootPassword(req, current.MachineID), current.Port, "SET GLOBAL offline_mode=ON; SET GLOBAL read_only=ON; SET GLOBAL super_read_only=ON; SELECT IF(@@offline_mode=1 AND @@read_only=1 AND @@super_read_only=1,'FROZEN','NOT_FROZEN');")+" | grep -Fxq FROZEN")
+		}); err != nil {
+			return err
+		}
+		if err := s.runArchitectureStep(ctx, runs, run, "kill_business_sessions", func() ([]string, error) {
+			return s.runOneArchitectureCommand(ctx, machines[current.MachineID], killBusinessSessionsCommand(req, current.MachineID, current.Port))
+		}); err != nil {
+			return err
+		}
+		if err := s.runArchitectureStep(ctx, runs, run, "wait_replication_zero", func() ([]string, error) {
+			var ids []string
+			for _, node := range req.Nodes {
+				if node.MachineID == current.MachineID {
+					continue
+				}
+				created, waitErr := s.runOneArchitectureCommand(ctx, machines[node.MachineID], replicationCatchupCommand(architectureRootPassword(req, node.MachineID), node.Port))
+				ids = append(ids, created...)
+				if waitErr != nil {
+					return ids, fmt.Errorf("replica %s did not reach the split point: %w", node.MachineID, waitErr)
+				}
+			}
+			return ids, nil
+		}); err != nil {
+			return err
+		}
+		if err := s.runArchitectureStep(ctx, runs, run, "pt_verify_before_split", func() ([]string, error) {
+			return s.verifyArchitectureDataWithPT(ctx, req, current.MachineID, machines)
+		}); err != nil {
+			return err
+		}
+	}
+	if err := s.runArchitectureStep(ctx, runs, run, "detach_replication", func() ([]string, error) {
+		return s.configureStandaloneArchitecture(ctx, req, machines)
+	}); err != nil {
+		return err
+	}
+	return s.runArchitectureStep(ctx, runs, run, "verify_topology", func() ([]string, error) {
+		return s.runOnArchitectureNodes(ctx, req.Nodes, machines, func(node hadomain.ArchitectureNodeRequest, _ machinedomain.Machine) string {
+			return verifyIndependentNodeCommand(architectureRootPassword(req, node.MachineID), node.Port)
+		})
+	})
 }
 
 func (s *HAService) electLiveArchitectureCandidate(ctx context.Context, clusterID string, req hadomain.ArchitectureAdjustmentRequest, machines map[string]machinedomain.Machine) (hadomain.CandidateScore, []string, error) {
@@ -293,7 +606,7 @@ func (s *HAService) electLiveArchitectureCandidate(ctx context.Context, clusterI
 	var taskIDs []string
 	for _, node := range req.Nodes {
 		probeSQL := "SELECT CONCAT_WS('|',@@server_id,@@global.gtid_mode,@@global.gtid_executed,@@read_only,@@super_read_only);"
-		id, output, err := s.runOneArchitectureProbe(ctx, machines[node.MachineID], mysqlArchitectureCommand(req.RootPassword, node.Port, probeSQL))
+		id, output, err := s.runOneArchitectureProbe(ctx, machines[node.MachineID], mysqlArchitectureCommand(architectureRootPassword(req, node.MachineID), node.Port, probeSQL))
 		if id != "" {
 			taskIDs = append(taskIDs, id)
 		}
@@ -360,13 +673,95 @@ func (s *HAService) electLiveArchitectureCandidate(ctx context.Context, clusterI
 		if node.MachineID == req.CurrentMasterMachineID || node.MachineID == selected.MachineID || !strings.EqualFold(node.Role, "S") {
 			continue
 		}
-		if !gtidSetSubset(nodeGTIDSets[node.MachineID], selected.ExecutedGTIDSet) {
+		startingFromIndependent := req.CurrentMasterMachineID == "" && !req.InitializeVIP
+		if !startingFromIndependent && !gtidSetSubset(nodeGTIDSets[node.MachineID], selected.ExecutedGTIDSet) {
 			return hadomain.CandidateScore{}, taskIDs, fmt.Errorf("target replica %s has divergent GTID history; clone or rebuild it before assigning replication", node.MachineID)
 		}
 	}
 	selected.DataFreshnessScore = 100
 	selected.FinalScore = selected.HealthScore + selected.ElectionPriority
 	return selected, taskIDs, nil
+}
+
+func (s *HAService) alignIndependentReplicaGTID(ctx context.Context, req hadomain.ArchitectureAdjustmentRequest, selected hadomain.CandidateScore, machines map[string]machinedomain.Machine) ([]string, error) {
+	var taskIDs []string
+	for _, node := range req.Nodes {
+		if node.MachineID == selected.MachineID || !strings.EqualFold(node.Role, "S") {
+			continue
+		}
+		client := mysqlArchitectureClient(architectureRootPassword(req, node.MachineID), node.Port)
+		gtidProbe := mysqlArchitectureCommand(architectureRootPassword(req, node.MachineID), node.Port, "SELECT @@GLOBAL.gtid_executed;")
+		id, output, err := s.runOneArchitectureProbe(ctx, machines[node.MachineID], gtidProbe)
+		if id != "" {
+			taskIDs = append(taskIDs, id)
+		}
+		if err != nil {
+			return taskIDs, fmt.Errorf("read independent GTID state on %s: %w", node.MachineID, err)
+		}
+		if gtidSetSubset(strings.TrimSpace(output), selected.ExecutedGTIDSet) {
+			continue
+		}
+		businessObjectsSQL := "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema NOT IN ('mysql','sys','performance_schema','information_schema','gmha','percona')"
+		id, output, err = s.runOneArchitectureProbe(ctx, machines[node.MachineID], mysqlArchitectureCommand(architectureRootPassword(req, node.MachineID), node.Port, businessObjectsSQL))
+		if id != "" {
+			taskIDs = append(taskIDs, id)
+		}
+		if err != nil {
+			return taskIDs, fmt.Errorf("inspect business schemas on independent target %s: %w", node.MachineID, err)
+		}
+		businessObjects, parseErr := strconv.Atoi(strings.TrimSpace(output))
+		if parseErr != nil {
+			return taskIDs, fmt.Errorf("independent target %s returned invalid business-object count %q", node.MachineID, strings.TrimSpace(output))
+		}
+		if businessObjects != 0 {
+			return taskIDs, fmt.Errorf("target replica %s has divergent GTID history and %d business table/view(s); clone or explicitly reconcile it before assigning replication", node.MachineID, businessObjects)
+		}
+		reset := client + " --execute='STOP REPLICA' >/dev/null 2>&1 || true; " +
+			client + " --execute='RESET REPLICA ALL' >/dev/null 2>&1 || true; " +
+			"if ! " + client + " --execute='RESET BINARY LOGS AND GTIDS' >/dev/null 2>&1; then " + client + " --execute='RESET MASTER'; fi; "
+		if strings.TrimSpace(selected.ExecutedGTIDSet) != "" {
+			reset += client + " --batch --skip-column-names --execute=" + shellQuote("SET GLOBAL GTID_PURGED="+sqlLiteral(selected.ExecutedGTIDSet)+"; SELECT IF(GTID_SUBSET("+sqlLiteral(selected.ExecutedGTIDSet)+",@@GLOBAL.gtid_executed),'GTID_BASELINE_OK','GTID_BASELINE_BAD');") + " | grep -Fxq GTID_BASELINE_OK"
+		} else {
+			reset += "echo GTID_BASELINE_OK"
+		}
+		created, resetErr := s.runOneArchitectureCommand(ctx, machines[node.MachineID], reset)
+		taskIDs = append(taskIDs, created...)
+		if resetErr != nil {
+			return taskIDs, fmt.Errorf("align GTID baseline on empty target replica %s: %w", node.MachineID, resetErr)
+		}
+	}
+	return taskIDs, nil
+}
+
+func (s *HAService) validateLiveIndependentTargets(ctx context.Context, req hadomain.ArchitectureAdjustmentRequest, machines map[string]machinedomain.Machine) ([]string, error) {
+	serverIDs := make(map[int]string, len(req.Nodes))
+	var taskIDs []string
+	for _, node := range req.Nodes {
+		probeSQL := "SELECT CONCAT_WS('|',@@server_id,@@global.gtid_mode,@@read_only,@@super_read_only);"
+		id, output, err := s.runOneArchitectureProbe(ctx, machines[node.MachineID], mysqlArchitectureCommand(architectureRootPassword(req, node.MachineID), node.Port, probeSQL))
+		if id != "" {
+			taskIDs = append(taskIDs, id)
+		}
+		if err != nil {
+			return taskIDs, fmt.Errorf("independent target probe failed on %s: %w", node.MachineID, err)
+		}
+		fields := strings.Split(strings.TrimSpace(output), "|")
+		if len(fields) < 4 {
+			return taskIDs, fmt.Errorf("independent target %s returned malformed MySQL state", node.MachineID)
+		}
+		serverID, parseErr := strconv.Atoi(fields[0])
+		if parseErr != nil || serverID <= 0 {
+			return taskIDs, fmt.Errorf("independent target %s has invalid server_id", node.MachineID)
+		}
+		if other, duplicate := serverIDs[serverID]; duplicate {
+			return taskIDs, fmt.Errorf("duplicate server_id %d on %s and %s", serverID, other, node.MachineID)
+		}
+		serverIDs[serverID] = node.MachineID
+		if !strings.EqualFold(fields[1], "ON") {
+			return taskIDs, fmt.Errorf("independent target %s must have GTID mode enabled", node.MachineID)
+		}
+	}
+	return taskIDs, nil
 }
 
 type gtidInterval struct{ start, end uint64 }
@@ -459,24 +854,70 @@ func gtidTransactionCount(gtidSet string) uint64 {
 }
 
 func verifyArchitectureNodeCommand(req hadomain.ArchitectureAdjustmentRequest, node hadomain.ArchitectureNodeRequest, selectedPrimaryID string) string {
+	password := architectureRootPassword(req, node.MachineID)
 	isDualMaster := req.Architecture != hadomain.ArchitectureMasterSlave && strings.EqualFold(node.Role, "M")
 	if node.MachineID == selectedPrimaryID && !isDualMaster {
-		return mysqlArchitectureCommand(req.RootPassword, node.Port, "SELECT IF(@@read_only=0 AND @@super_read_only=0,'ROLE_OK','ROLE_BAD');") + " | grep -Fxq ROLE_OK"
+		return mysqlArchitectureCommand(password, node.Port, "SELECT IF(@@read_only=0 AND @@super_read_only=0,'ROLE_OK','ROLE_BAD');") + " | grep -Fxq ROLE_OK"
 	}
 	expectedReadOnly := "1"
 	if isDualMaster {
 		expectedReadOnly = "0"
 	}
 	if node.DelaySeconds > 0 && !isDualMaster {
-		return delayedReplicationHealthCommand(req.RootPassword, node.Port, node.DelaySeconds) + " && " + mysqlArchitectureCommand(req.RootPassword, node.Port, "SELECT IF(@@read_only=1,'ROLE_OK','ROLE_BAD');") + " | grep -Fxq ROLE_OK"
+		return delayedReplicationHealthCommand(password, node.Port, node.DelaySeconds) + " && " + mysqlArchitectureCommand(password, node.Port, "SELECT IF(@@read_only=1,'ROLE_OK','ROLE_BAD');") + " | grep -Fxq ROLE_OK"
 	}
-	return replicationCatchupCommand(req.RootPassword, node.Port) + " && " + mysqlArchitectureCommand(req.RootPassword, node.Port, "SELECT IF(@@read_only="+expectedReadOnly+",'ROLE_OK','ROLE_BAD');") + " | grep -Fxq ROLE_OK"
+	return replicationCatchupCommand(password, node.Port) + " && " + mysqlArchitectureCommand(password, node.Port, "SELECT IF(@@read_only="+expectedReadOnly+",'ROLE_OK','ROLE_BAD');") + " | grep -Fxq ROLE_OK"
+}
+
+func architectureRootPassword(req hadomain.ArchitectureAdjustmentRequest, machineID string) string {
+	if password := req.RootPasswords[machineID]; password != "" {
+		return password
+	}
+	return req.RootPassword
 }
 
 func resumeArchitectureRun(ctx context.Context, runs architectureRunRepository, run *hadomain.ArchitectureRun) {
 	run.Status, run.Error, run.FinishedAt = hadomain.ArchitectureRunRunning, "", nil
 	run.UpdatedAt = time.Now().UTC()
 	_ = runs.SaveArchitectureRun(ctx, *run)
+}
+
+// verifyArchitectureDataWithPT is a mandatory data-consistency gate whenever
+// replication is created or removed. A successful MySQL thread/GTID check is
+// not sufficient: pt-table-checksum must also prove that every participating
+// replica contains the same table data as the selected source.
+func (s *HAService) verifyArchitectureDataWithPT(ctx context.Context, req hadomain.ArchitectureAdjustmentRequest, primaryID string, machines map[string]machinedomain.Machine) ([]string, error) {
+	primary, ok := architectureNode(req.Nodes, primaryID)
+	if !ok {
+		return nil, errors.New("PT verification source node not found")
+	}
+	var ids []string
+	for _, node := range req.Nodes {
+		created, err := s.runOneArchitectureCommand(ctx, machines[node.MachineID], installCompatiblePTCommand(architectureRootPassword(req, node.MachineID), node.Port))
+		ids = append(ids, created...)
+		if err != nil {
+			return ids, fmt.Errorf("Percona Toolkit validation failed on %s: %w", node.MachineID, err)
+		}
+	}
+	checksumCommand := ptChecksumCommand(architectureRootPassword(req, primary.MachineID), primary.Port)
+	created, err := s.runOneArchitectureCommand(ctx, machines[primaryID], checksumCommand)
+	ids = append(ids, created...)
+	if err != nil {
+		return ids, fmt.Errorf("pt-table-checksum failed on source %s: %w", primaryID, err)
+	}
+	for _, node := range req.Nodes {
+		if node.MachineID == primaryID {
+			continue
+		}
+		password := architectureRootPassword(req, node.MachineID)
+		check := replicationCatchupCommand(password, node.Port) + " && " + ptChecksumVerificationCommand(password, node.Port)
+		created, err = s.runOneArchitectureCommand(ctx, machines[node.MachineID], check)
+		ids = append(ids, created...)
+		if err != nil {
+			return ids, fmt.Errorf("PT checksum reports data differences on %s: %w", node.MachineID, err)
+		}
+	}
+	return ids, nil
 }
 
 func (s *HAService) repairArchitectureReplication(ctx context.Context, req hadomain.ArchitectureAdjustmentRequest, primaryID string, machines map[string]machinedomain.Machine) ([]string, error) {
@@ -493,7 +934,7 @@ func (s *HAService) repairArchitectureReplication(ctx context.Context, req hadom
 	// Install and version-check the Toolkit on every participating node. The
 	// primary runs pt-table-checksum while replicas run restart/sync tools.
 	for _, node := range req.Nodes {
-		created, runErr := s.runOneArchitectureCommand(ctx, machines[node.MachineID], installCompatiblePTCommand(req.RootPassword, node.Port))
+		created, runErr := s.runOneArchitectureCommand(ctx, machines[node.MachineID], installCompatiblePTCommand(architectureRootPassword(req, node.MachineID), node.Port))
 		ids = append(ids, created...)
 		if runErr != nil {
 			return ids, runErr
@@ -505,15 +946,14 @@ func (s *HAService) repairArchitectureReplication(ctx context.Context, req hadom
 		if node.MachineID == primaryID && req.Architecture == hadomain.ArchitectureMasterSlave {
 			continue
 		}
-		options := fmt.Sprintf("--host=127.0.0.1 --port=%d --user=root --password=%s", node.Port, shellQuote(req.RootPassword))
+		options := ptArchitectureOptions(architectureRootPassword(req, node.MachineID), node.Port)
 		created, runErr := s.runOneArchitectureCommand(ctx, machines[node.MachineID], "pt-replica-restart "+options+" --max-sleep=5 --run-time=60s")
 		ids = append(ids, created...)
 		if runErr != nil {
 			return ids, fmt.Errorf("PT replica restart failed on %s: %w", machines[node.MachineID].Name, runErr)
 		}
 	}
-	checksumOptions := fmt.Sprintf("--host=127.0.0.1 --port=%d --user=root --password=%s", primary.Port, shellQuote(req.RootPassword))
-	checksumCommand := "pt-table-checksum " + checksumOptions + " --replicate=percona.checksums --create-replicate-table --no-check-replication-filters"
+	checksumCommand := ptChecksumCommand(architectureRootPassword(req, primary.MachineID), primary.Port)
 	created, err := s.runOneArchitectureCommand(ctx, machines[primaryID], checksumCommand)
 	ids = append(ids, created...)
 	if err != nil {
@@ -523,7 +963,7 @@ func (s *HAService) repairArchitectureReplication(ctx context.Context, req hadom
 		if node.MachineID == primaryID && req.Architecture == hadomain.ArchitectureMasterSlave {
 			continue
 		}
-		options := fmt.Sprintf("--host=127.0.0.1 --port=%d --user=root --password=%s", node.Port, shellQuote(req.RootPassword))
+		options := ptArchitectureOptions(architectureRootPassword(req, node.MachineID), node.Port)
 		syncCommand := "pt-table-sync " + options + " --execute --replicate=percona.checksums --sync-to-source --no-check-triggers"
 		created, err = s.runOneArchitectureCommand(ctx, machines[node.MachineID], syncCommand)
 		ids = append(ids, created...)
@@ -542,7 +982,7 @@ func (s *HAService) repairArchitectureReplication(ctx context.Context, req hadom
 		if node.MachineID == primaryID && req.Architecture == hadomain.ArchitectureMasterSlave {
 			continue
 		}
-		check := mysqlArchitectureCommand(req.RootPassword, node.Port, "SELECT IF(COUNT(*)=0,'PT_SYNC_OK','PT_SYNC_DIFF') FROM percona.checksums WHERE master_crc<>this_crc OR master_cnt<>this_cnt;") + " | grep -Fxq PT_SYNC_OK"
+		check := mysqlArchitectureCommand(architectureRootPassword(req, node.MachineID), node.Port, "SELECT IF(COUNT(*)=0,'PT_SYNC_OK','PT_SYNC_DIFF') FROM percona.checksums WHERE master_crc<>this_crc OR master_cnt<>this_cnt;") + " | grep -Fxq PT_SYNC_OK"
 		created, err = s.runOneArchitectureCommand(ctx, machines[node.MachineID], check)
 		ids = append(ids, created...)
 		if err != nil {
@@ -555,8 +995,33 @@ func (s *HAService) repairArchitectureReplication(ctx context.Context, req hadom
 func installCompatiblePTCommand(rootPassword string, port int) string {
 	client := mysqlArchitectureClient(rootPassword, port)
 	return "mysql_version=$(" + client + " --batch --skip-column-names --execute='SELECT VERSION()' | cut -d- -f1); case \"$mysql_version\" in 8.0.*|8.4.*) min_pt=3.7.1 ;; *) echo \"unsupported MySQL version for automatic PT repair: $mysql_version\" >&2; exit 76 ;; esac; " +
+		"if ! perl -MDBI -e 1 >/dev/null 2>&1 || ! perl -MDBD::mysql -e 1 >/dev/null 2>&1; then if command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y libdbi-perl libdbd-mysql-perl; elif command -v dnf >/dev/null 2>&1; then dnf install -y perl-DBI perl-DBD-MySQL; elif command -v yum >/dev/null 2>&1; then yum install -y perl-DBI perl-DBD-MySQL; else echo 'cannot install Perl DBI/DBD::mysql required by Percona Toolkit' >&2; exit 77; fi; fi; " +
 		"if ! command -v pt-table-sync >/dev/null 2>&1; then if command -v apt-get >/dev/null 2>&1; then curl -fsSL https://repo.percona.com/apt/percona-release_latest.generic_all.deb -o /tmp/percona-release.deb && dpkg -i /tmp/percona-release.deb && percona-release enable tools release && DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y percona-toolkit; elif command -v dnf >/dev/null 2>&1; then dnf install -y https://repo.percona.com/yum/percona-release-latest.noarch.rpm && percona-release enable tools release && dnf install -y percona-toolkit; elif command -v yum >/dev/null 2>&1; then yum install -y https://repo.percona.com/yum/percona-release-latest.noarch.rpm && percona-release enable tools release && yum install -y percona-toolkit; else exit 77; fi; fi; " +
-		"pt_version=$(pt-table-sync --version | awk '{print $NF}'); [ \"$(printf '%s\\n' \"$min_pt\" \"$pt_version\" | sort -V | head -n1)\" = \"$min_pt\" ] || { echo \"Percona Toolkit $pt_version is below required $min_pt\" >&2; exit 78; }; command -v pt-replica-restart >/dev/null; command -v pt-table-checksum >/dev/null"
+		"pt_version=$(pt-table-sync --version | awk '{print $NF}'); [ \"$(printf '%s\\n' \"$min_pt\" \"$pt_version\" | sort -V | head -n1)\" = \"$min_pt\" ] || { echo \"Percona Toolkit $pt_version is below required $min_pt\" >&2; exit 78; }; perl -MDBI -e 1; perl -MDBD::mysql -e 1; command -v pt-replica-restart >/dev/null; command -v pt-table-checksum >/dev/null"
+}
+
+func ptArchitectureOptions(password string, port int) string {
+	if password == "" {
+		return fmt.Sprintf("--defaults-file=__GMHA_MYSQL_DEFAULTS_FILE__ --host=127.0.0.1 --port=%d", port)
+	}
+	return fmt.Sprintf("--host=127.0.0.1 --port=%d --user=root --password=%s", port, shellQuote(password))
+}
+
+func ptChecksumCommand(password string, port int) string {
+	client := mysqlArchitectureClient(password, port) + " --batch --skip-column-names"
+	countSQL := "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema NOT IN ('mysql','sys','performance_schema','information_schema','gmha','percona') AND table_type='BASE TABLE'"
+	return "business_tables=$(" + client + " --execute=" + shellQuote(countSQL) + ") || exit 70; " +
+		"if [ \"$business_tables\" = 0 ]; then echo GMHA_PT_NO_BUSINESS_TABLES; exit 0; fi; " +
+		"pt-table-checksum " + ptArchitectureOptions(password, port) + " --replicate=percona.checksums --create-replicate-table --no-check-replication-filters --no-check-binlog-format --ignore-databases=mysql,sys,performance_schema,information_schema,gmha,percona"
+}
+
+func ptChecksumVerificationCommand(password string, port int) string {
+	client := mysqlArchitectureClient(password, port) + " --batch --skip-column-names"
+	countSQL := "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema NOT IN ('mysql','sys','performance_schema','information_schema','gmha','percona') AND table_type='BASE TABLE'"
+	checkSQL := "SELECT IF(COALESCE(SUM(master_crc<>this_crc OR master_cnt<>this_cnt),0)=0,'PT_VERIFY_OK','PT_VERIFY_DIFF') FROM percona.checksums WHERE db NOT IN ('mysql','sys','performance_schema','information_schema','gmha','percona');"
+	return "business_tables=$(" + client + " --execute=" + shellQuote(countSQL) + ") || exit 70; " +
+		"if [ \"$business_tables\" = 0 ]; then echo PT_VERIFY_OK; exit 0; fi; " +
+		mysqlArchitectureCommand(password, port, checkSQL) + " | grep -Fxq PT_VERIFY_OK"
 }
 
 func (s *HAService) checkArchitectureVIPConflict(ctx context.Context, run hadomain.ArchitectureRun, req hadomain.ArchitectureAdjustmentRequest, machines map[string]machinedomain.Machine) ([]string, error) {
@@ -564,27 +1029,149 @@ func (s *HAService) checkArchitectureVIPConflict(ctx context.Context, run hadoma
 	if err != nil {
 		return nil, err
 	}
+	machines, err = s.allClusterVIPMachines(ctx, run.ClusterID, machines)
+	if err != nil {
+		return nil, err
+	}
 	var ids []string
 	for _, vip := range configs {
-		holders := make([]string, 0, 1)
-		for _, machine := range sortedArchitectureMachines(machines) {
-			command := "if ip -o addr show | awk '{print $4}' | cut -d/ -f1 | grep -Fxq " + shellQuote(vip.VIPAddress) + "; then echo BOUND; else echo UNBOUND; fi"
-			id, output, probeErr := s.runOneArchitectureProbe(ctx, machine, command)
-			if id != "" {
-				ids = append(ids, id)
-			}
-			if probeErr != nil {
-				return ids, probeErr
-			}
-			if strings.TrimSpace(output) == "BOUND" {
-				holders = append(holders, machine.ID)
-			}
+		probeIDs, holders, probeErr := s.probeArchitectureVIPHolders(ctx, vip, machines)
+		ids = append(ids, probeIDs...)
+		if probeErr != nil {
+			return ids, probeErr
 		}
 		if len(holders) > 1 {
 			return ids, fmt.Errorf("split-brain detected: VIP %s is present on %d nodes (%s)", vip.VIPAddress, len(holders), strings.Join(holders, ","))
 		}
 		if len(holders) == 1 && req.CurrentMasterMachineID != "" && holders[0] != req.CurrentMasterMachineID {
 			return ids, fmt.Errorf("VIP %s is held by %s instead of declared current master %s", vip.VIPAddress, holders[0], req.CurrentMasterMachineID)
+		}
+	}
+	return ids, nil
+}
+
+func (s *HAService) allClusterVIPMachines(ctx context.Context, clusterID string, selected map[string]machinedomain.Machine) (map[string]machinedomain.Machine, error) {
+	items, err := s.machines.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]machinedomain.Machine, len(items)+len(selected))
+	for id, machine := range selected {
+		result[id] = machine
+	}
+	for _, machine := range items {
+		if machine.Cluster == clusterID {
+			result[machine.ID] = machine
+		}
+	}
+	if len(result) == 0 {
+		return nil, fmt.Errorf("cluster %s has no machines available for VIP split-brain checks", clusterID)
+	}
+	return result, nil
+}
+
+func (s *HAService) probeArchitectureVIPHolders(ctx context.Context, vip hadomain.ClusterVIPConfig, machines map[string]machinedomain.Machine) ([]string, []string, error) {
+	var taskIDs, holders []string
+	for _, machine := range sortedArchitectureMachines(machines) {
+		command := "if ip -o -4 addr show | awk '{print $4}' | cut -d/ -f1 | grep -Fxq " + shellQuote(vip.VIPAddress) + "; then echo BOUND; else echo UNBOUND; fi"
+		id, output, err := s.runOneArchitectureProbe(ctx, machine, command)
+		if id != "" {
+			taskIDs = append(taskIDs, id)
+		}
+		if err != nil {
+			return taskIDs, holders, fmt.Errorf("cannot prove VIP %s state on %s: %w", vip.VIPAddress, machine.Name, err)
+		}
+		if strings.TrimSpace(output) == "BOUND" {
+			holders = append(holders, machine.ID)
+		}
+	}
+	return taskIDs, holders, nil
+}
+
+func (s *HAService) withdrawArchitectureVIP(ctx context.Context, run hadomain.ArchitectureRun, machines map[string]machinedomain.Machine) ([]string, error) {
+	configs, err := s.repo.ListVIPConfigs(ctx, run.ClusterID)
+	if err != nil {
+		return nil, err
+	}
+	machines, err = s.allClusterVIPMachines(ctx, run.ClusterID, machines)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for _, vip := range configs {
+		mode := vip.VIPRouteMode
+		if mode == "" {
+			mode = run.Plan.VIPRouteMode
+		}
+		for _, machine := range sortedArchitectureMachines(machines) {
+			command := l2VIPRemoveCommand(vip)
+			if mode == hadomain.VipRouteModeBGP {
+				command = bgpVIPWithdrawCommand(vip)
+			} else if mode != hadomain.VipRouteModeL2ARP {
+				return ids, fmt.Errorf("unsupported VIP route mode %s", mode)
+			}
+			created, runErr := s.runOneArchitectureCommand(ctx, machine, command)
+			ids = append(ids, created...)
+			if runErr != nil {
+				return ids, fmt.Errorf("withdraw VIP %s on %s: %w", vip.VIPAddress, machine.Name, runErr)
+			}
+		}
+	}
+	return ids, nil
+}
+
+func (s *HAService) verifyArchitectureVIPZero(ctx context.Context, run hadomain.ArchitectureRun, machines map[string]machinedomain.Machine) ([]string, error) {
+	configs, err := s.repo.ListVIPConfigs(ctx, run.ClusterID)
+	if err != nil {
+		return nil, err
+	}
+	machines, err = s.allClusterVIPMachines(ctx, run.ClusterID, machines)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for _, vip := range configs {
+		probeIDs, holders, probeErr := s.probeArchitectureVIPHolders(ctx, vip, machines)
+		ids = append(ids, probeIDs...)
+		if probeErr != nil {
+			return ids, probeErr
+		}
+		if len(holders) != 0 {
+			return ids, fmt.Errorf("VIP %s zero-holder barrier failed; holders=%s", vip.VIPAddress, strings.Join(holders, ","))
+		}
+	}
+	return ids, nil
+}
+
+func (s *HAService) bindArchitectureVIP(ctx context.Context, run hadomain.ArchitectureRun, machines map[string]machinedomain.Machine) ([]string, error) {
+	configs, err := s.repo.ListVIPConfigs(ctx, run.ClusterID)
+	if err != nil {
+		return nil, err
+	}
+	machines, err = s.allClusterVIPMachines(ctx, run.ClusterID, machines)
+	if err != nil {
+		return nil, err
+	}
+	target, ok := machines[run.Plan.SelectedCandidate.MachineID]
+	if !ok {
+		return nil, errors.New("selected VIP target machine is unavailable")
+	}
+	var ids []string
+	for _, vip := range configs {
+		mode := vip.VIPRouteMode
+		if mode == "" {
+			mode = run.Plan.VIPRouteMode
+		}
+		command := l2VIPBindCommand(vip)
+		if mode == hadomain.VipRouteModeBGP {
+			command = bgpVIPAnnounceCommand(vip, target)
+		} else if mode != hadomain.VipRouteModeL2ARP {
+			return ids, fmt.Errorf("unsupported VIP route mode %s", mode)
+		}
+		created, bindErr := s.runOneArchitectureCommand(ctx, target, command)
+		ids = append(ids, created...)
+		if bindErr != nil {
+			return ids, fmt.Errorf("bind VIP %s on %s: %w", vip.VIPAddress, target.Name, bindErr)
 		}
 	}
 	return ids, nil
@@ -597,6 +1184,10 @@ func (s *HAService) moveArchitectureVIP(ctx context.Context, run hadomain.Archit
 	}
 	if len(configs) == 0 {
 		return nil, errors.New("no enabled VIP configuration found")
+	}
+	machines, err = s.allClusterVIPMachines(ctx, run.ClusterID, machines)
+	if err != nil {
+		return nil, err
 	}
 	target := machines[run.Plan.SelectedCandidate.MachineID]
 	var ids []string
@@ -614,11 +1205,6 @@ func (s *HAService) moveArchitectureVIP(ctx context.Context, run hadomain.Archit
 					return ids, fmt.Errorf("cannot prove VIP %s absent on %s: %w", vip.VIPAddress, machine.Name, runErr)
 				}
 			}
-			created, runErr := s.runOneArchitectureCommand(ctx, target, l2VIPBindCommand(vip))
-			ids = append(ids, created...)
-			if runErr != nil {
-				return ids, runErr
-			}
 		case hadomain.VipRouteModeBGP:
 			for _, machine := range sortedArchitectureMachines(machines) {
 				created, runErr := s.runOneArchitectureCommand(ctx, machine, bgpVIPWithdrawCommand(vip))
@@ -627,19 +1213,50 @@ func (s *HAService) moveArchitectureVIP(ctx context.Context, run hadomain.Archit
 					return ids, fmt.Errorf("BGP withdrawal failed on %s: %w", machine.Name, runErr)
 				}
 			}
-			created, runErr := s.runOneArchitectureCommand(ctx, target, bgpVIPAnnounceCommand(vip, target))
-			ids = append(ids, created...)
-			if runErr != nil {
-				return ids, runErr
-			}
-		case hadomain.VipRouteModeKeepalived:
-			created, runErr := s.moveKeepalivedVIP(ctx, vip, req, run.Plan.SelectedCandidate.MachineID, machines)
-			ids = append(ids, created...)
-			if runErr != nil {
-				return ids, runErr
-			}
 		default:
 			return ids, fmt.Errorf("unsupported VIP route mode %s", mode)
+		}
+		barrierIDs, holders, barrierErr := s.probeArchitectureVIPHolders(ctx, vip, machines)
+		ids = append(ids, barrierIDs...)
+		if barrierErr != nil {
+			return ids, barrierErr
+		}
+		if len(holders) != 0 {
+			return ids, fmt.Errorf("VIP %s zero-holder barrier failed after withdrawal; holders=%s", vip.VIPAddress, strings.Join(holders, ","))
+		}
+		bindCommand := l2VIPBindCommand(vip)
+		if mode == hadomain.VipRouteModeBGP {
+			bindCommand = bgpVIPAnnounceCommand(vip, target)
+		}
+		created, bindErr := s.runOneArchitectureCommand(ctx, target, bindCommand)
+		ids = append(ids, created...)
+		if bindErr != nil {
+			return ids, bindErr
+		}
+		var verifiedHolders []string
+		var verifyErr error
+		for round := 1; round <= 2; round++ {
+			var verifyIDs []string
+			verifyIDs, verifiedHolders, verifyErr = s.probeArchitectureVIPHolders(ctx, vip, machines)
+			ids = append(ids, verifyIDs...)
+			if verifyErr != nil || len(verifiedHolders) != 1 || verifiedHolders[0] != target.ID {
+				break
+			}
+		}
+		if verifyErr != nil || len(verifiedHolders) != 1 || verifiedHolders[0] != target.ID {
+			// Compensate on the new target. Leaving no VIP is safer than leaving two
+			// possible holders when the cluster-wide proof is inconclusive.
+			rollback := l2VIPRemoveCommand(vip)
+			if mode == hadomain.VipRouteModeBGP {
+				rollback = bgpVIPWithdrawCommand(vip)
+			}
+			rolledBack, _ := s.runOneArchitectureCommand(context.WithoutCancel(ctx), target, rollback)
+			ids = append(ids, rolledBack...)
+			_ = s.repo.UpsertVIPBindingState(context.WithoutCancel(ctx), hadomain.VIPBindingState{ClusterID: run.ClusterID, VIPConfigID: vip.ID, VIPAddress: vip.VIPAddress, ExpectedHolderMachineID: target.ID, VIPStatus: hadomain.VipStatusFailed, DetectedHolders: strings.Join(verifiedHolders, ","), LastError: "cluster-wide single-holder proof failed; new target was withdrawn"})
+			if verifyErr != nil {
+				return ids, verifyErr
+			}
+			return ids, fmt.Errorf("VIP %s single-holder proof failed; holders=%s; target binding rolled back", vip.VIPAddress, strings.Join(verifiedHolders, ","))
 		}
 		_ = s.repo.UpsertVIPBindingState(ctx, hadomain.VIPBindingState{ClusterID: run.ClusterID, VIPConfigID: vip.ID, VIPAddress: vip.VIPAddress, ExpectedHolderInstanceID: run.Plan.SelectedCandidate.InstanceID, ExpectedHolderMachineID: target.ID, CurrentHolderInstanceID: run.Plan.SelectedCandidate.InstanceID, CurrentHolderMachineID: target.ID, CurrentInterface: vip.DefaultInterface, VIPStatus: hadomain.VipStatusBound, DetectedHolders: target.ID, LastCheckResult: "single holder verified by ordered remove-before-bind"})
 	}
@@ -673,82 +1290,12 @@ func bgpVIPAnnounceCommand(vip hadomain.ClusterVIPConfig, target machinedomain.M
 	return "command -v vtysh >/dev/null 2>&1 || exit 73; ip addr add " + shellQuote(prefix) + " dev lo; ip link set lo up; " + vty.String() + "; vtysh -c " + shellQuote("show bgp ipv4 unicast neighbors "+vip.BGPPeerAddress) + " | grep -Fq 'BGP state = Established'; vtysh -c " + shellQuote("show bgp ipv4 unicast neighbors "+vip.BGPPeerAddress+" advertised-routes") + " | grep -Fq " + shellQuote(prefix)
 }
 
-func (s *HAService) moveKeepalivedVIP(ctx context.Context, vip hadomain.ClusterVIPConfig, req hadomain.ArchitectureAdjustmentRequest, targetID string, machines map[string]machinedomain.Machine) ([]string, error) {
-	masters := make([]hadomain.ArchitectureNodeRequest, 0, 2)
-	for _, node := range req.Nodes {
-		if strings.EqualFold(node.Role, "M") {
-			masters = append(masters, node)
-		}
-	}
-	if len(masters) != 2 {
-		return nil, errors.New("Keepalived requires exactly two target master nodes")
-	}
-	var ids []string
-	// Stop all possible holders and prove the address absent before installing a new VRRP state.
-	for _, machine := range sortedArchitectureMachines(machines) {
-		command := "systemctl stop keepalived 2>/dev/null || true; " + l2VIPRemoveCommand(vip)
-		created, err := s.runOneArchitectureCommand(ctx, machine, command)
-		ids = append(ids, created...)
-		if err != nil {
-			return ids, err
-		}
-	}
-	for _, node := range masters {
-		peer := masters[0]
-		if peer.MachineID == node.MachineID {
-			peer = masters[1]
-		}
-		priority := 80
-		if node.MachineID == targetID {
-			priority = 150
-		}
-		command := keepalivedInstallCommand(vip, node, machines[node.MachineID], machines[peer.MachineID], req.RootPassword, priority)
-		created, err := s.runOneArchitectureCommand(ctx, machines[node.MachineID], command)
-		ids = append(ids, created...)
-		if err != nil {
-			return ids, err
-		}
-	}
-	// Start the promoted node first; a lower-priority peer therefore cannot acquire the VIP during rollout.
-	created, err := s.runOneArchitectureCommand(ctx, machines[targetID], "systemctl enable keepalived; systemctl restart keepalived; sleep 3")
-	ids = append(ids, created...)
-	if err != nil {
-		return ids, err
-	}
-	for _, node := range masters {
-		if node.MachineID == targetID {
-			continue
-		}
-		created, err = s.runOneArchitectureCommand(ctx, machines[node.MachineID], "systemctl enable keepalived; systemctl restart keepalived; sleep 2")
-		ids = append(ids, created...)
-		if err != nil {
-			return ids, err
-		}
-	}
-	return ids, nil
-}
-
-func keepalivedInstallCommand(vip hadomain.ClusterVIPConfig, node hadomain.ArchitectureNodeRequest, machine, peer machinedomain.Machine, rootPassword string, priority int) string {
-	iface := strings.TrimSpace(vip.DefaultInterface)
-	if iface == "" {
-		iface = "eth0"
-	}
-	vrid := int(sha256.Sum256([]byte(vip.ClusterID + "|" + vip.VIPAddress))[0])%250 + 1
-	auth := fmt.Sprintf("gm%06d", vrid)
-	clientPassword := strings.ReplaceAll(strings.ReplaceAll(rootPassword, "\\", "\\\\"), "\"", "\\\"")
-	client := "[client]\nuser=root\npassword=\"" + clientPassword + "\"\n"
-	checkPath := fmt.Sprintf("/usr/local/libexec/gmha-keepalived-%d", node.Port)
-	check := fmt.Sprintf("#!/bin/sh\nvalue=$(mysql --defaults-extra-file=/etc/gmha/keepalived-mysql.cnf --protocol=tcp --host=127.0.0.1 --port=%d --batch --skip-column-names --execute='SELECT @@read_only' 2>/dev/null) || exit 1\n[ \"$value\" = 0 ]\n", node.Port)
-	config := fmt.Sprintf("global_defs {\n  enable_script_security\n  script_user root\n}\nvrrp_script chk_gmha_mysql {\n  script \"%s\"\n  interval 2\n  timeout 2\n  fall 2\n  rise 2\n}\nvrrp_instance GMHA_%d {\n  state BACKUP\n  interface %s\n  virtual_router_id %d\n  priority %d\n  advert_int 1\n  authentication { auth_type PASS auth_pass %s }\n  unicast_src_ip %s\n  unicast_peer { %s }\n  virtual_ipaddress { %s/%d dev %s }\n  track_script { chk_gmha_mysql }\n  garp_master_delay 1\n  garp_master_repeat 5\n}\n", checkPath, vrid, iface, vrid, priority, auth, machine.IP, peer.IP, vip.VIPAddress, vip.VIPPrefix, iface)
-	write := func(path, content string, mode int) string {
-		return fmt.Sprintf("printf %%s %s | base64 -d > %s; chmod %o %s", shellQuote(base64.StdEncoding.EncodeToString([]byte(content))), shellQuote(path), mode, shellQuote(path))
-	}
-	install := "command -v keepalived >/dev/null 2>&1 || { if command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y keepalived; elif command -v dnf >/dev/null 2>&1; then dnf install -y keepalived; elif command -v yum >/dev/null 2>&1; then yum install -y keepalived; else exit 74; fi; }"
-	return install + "; install -d -m 0700 /etc/gmha; install -d -m 0755 /usr/local/libexec; " + write("/etc/gmha/keepalived-mysql.cnf", client, 600) + "; " + write(checkPath, check, 700) + "; " + write("/etc/keepalived/keepalived.conf", config, 600) + "; keepalived -t -f /etc/keepalived/keepalived.conf"
-}
-
 func (s *HAService) verifyArchitectureVIP(ctx context.Context, run hadomain.ArchitectureRun, req hadomain.ArchitectureAdjustmentRequest, machines map[string]machinedomain.Machine) ([]string, error) {
 	configs, err := s.repo.ListVIPConfigs(ctx, run.ClusterID)
+	if err != nil {
+		return nil, err
+	}
+	machines, err = s.allClusterVIPMachines(ctx, run.ClusterID, machines)
 	if err != nil {
 		return nil, err
 	}
@@ -768,6 +1315,8 @@ func (s *HAService) verifyArchitectureVIP(ctx context.Context, run hadomain.Arch
 				return ids, fmt.Errorf("VIP %s single-holder verification failed on %s", vip.VIPAddress, machine.Name)
 			}
 		}
+		target := machines[run.Plan.SelectedCandidate.MachineID]
+		_ = s.repo.UpsertVIPBindingState(ctx, hadomain.VIPBindingState{ClusterID: run.ClusterID, VIPConfigID: vip.ID, VIPAddress: vip.VIPAddress, ExpectedHolderInstanceID: run.Plan.SelectedCandidate.InstanceID, ExpectedHolderMachineID: target.ID, CurrentHolderInstanceID: run.Plan.SelectedCandidate.InstanceID, CurrentHolderMachineID: target.ID, CurrentInterface: vip.DefaultInterface, VIPStatus: hadomain.VipStatusBound, DetectedHolders: target.ID, LastCheckResult: "single holder verified after VIP workflow"})
 	}
 	return ids, nil
 }
@@ -780,8 +1329,9 @@ func l2VIPInterface(vip hadomain.ClusterVIPConfig) string {
 }
 
 func l2VIPRemoveCommand(vip hadomain.ClusterVIPConfig) string {
-	iface := l2VIPInterface(vip)
-	return fmt.Sprintf("iface=%s; [ -n \"$iface\" ] || exit 71; ip addr del %s/%d dev \"$iface\" 2>/dev/null || true; ! ip -o addr show | awk '{print $4}' | cut -d/ -f1 | grep -Fxq %s", iface, shellQuote(vip.VIPAddress), vip.VIPPrefix, shellQuote(vip.VIPAddress))
+	// Discover the live holder interface instead of trusting the saved interface.
+	// This also removes stale bindings left on a renamed or previously selected NIC.
+	return fmt.Sprintf("ip -o -4 addr show | awk -v vip=%s '$4 ~ (\"^\" vip \"/\") {print $2, $4}' | while read -r iface cidr; do ip addr del \"$cidr\" dev \"$iface\" || exit 1; done; ! ip -o -4 addr show | awk '{print $4}' | cut -d/ -f1 | grep -Fxq %s", shellQuote(vip.VIPAddress), shellQuote(vip.VIPAddress))
 }
 
 func l2VIPBindCommand(vip hadomain.ClusterVIPConfig) string {
@@ -841,6 +1391,11 @@ func (s *HAService) runArchitectureStep(ctx context.Context, runs architectureRu
 	_ = runs.SaveArchitectureRun(ctx, *run)
 	s.syncArchitectureTrackingTask(ctx, *run)
 	taskIDs, err := execute()
+	if len(taskIDs) > 0 {
+		if attachErr := s.tasks.AttachChildTasks(ctx, run.RunID, taskIDs); attachErr != nil && err == nil {
+			err = attachErr
+		}
+	}
 	finished := time.Now().UTC()
 	index := len(run.StepResults) - 1
 	run.StepResults[index].TaskIDs = taskIDs
@@ -886,7 +1441,11 @@ func (s *HAService) runOneArchitectureProbe(ctx context.Context, machine machine
 		output = completed.Steps[len(completed.Steps)-1].Message
 	}
 	if completed.Task.Status != taskdomain.StatusSuccess {
-		return detail.Task.ID, output, fmt.Errorf("agent task %s failed", detail.Task.ID)
+		message := strings.TrimSpace(output)
+		if message == "" {
+			return detail.Task.ID, output, fmt.Errorf("agent task %s failed", detail.Task.ID)
+		}
+		return detail.Task.ID, output, fmt.Errorf("agent task %s failed: %s", detail.Task.ID, message)
 	}
 	return detail.Task.ID, output, nil
 }
@@ -903,6 +1462,73 @@ func (s *HAService) runOnArchitectureNodes(ctx context.Context, nodes []hadomain
 	return ids, nil
 }
 
+func (s *HAService) repairArchitectureManagementPrivileges(ctx context.Context, req hadomain.ArchitectureAdjustmentRequest, machines map[string]machinedomain.Machine, username, password string) ([]string, error) {
+	username = strings.TrimSpace(username)
+	if username == "" || password == "" {
+		return nil, errors.New("MHA management account is not configured")
+	}
+	account := sqlLiteral(username) + "@'%'"
+	privileges := strings.Join([]string{
+		"SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "CREATE USER", "ALTER", "DROP", "SHOW VIEW", "TRIGGER", "EVENT",
+		"PROCESS", "RELOAD", "LOCK TABLES", "REPLICATION CLIENT", "REPLICATION SLAVE", "CONNECTION_ADMIN",
+		"SYSTEM_VARIABLES_ADMIN", "REPLICATION_SLAVE_ADMIN", "BACKUP_ADMIN", "CLONE_ADMIN",
+	}, ", ")
+	sql := fmt.Sprintf("CREATE USER IF NOT EXISTS %s IDENTIFIED BY %s; GRANT %s ON *.* TO %s;", account, sqlLiteral(password), privileges, account)
+	instances, err := s.instances.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list MySQL instances for MHA privilege repair: %w", err)
+	}
+	byMachine := make(map[string][]mysqlapp.Instance)
+	for _, instance := range instances {
+		byMachine[instance.MachineID] = append(byMachine[instance.MachineID], instance)
+	}
+	return s.runOnArchitectureNodes(ctx, req.Nodes, machines, func(node hadomain.ArchitectureNodeRequest, _ machinedomain.Machine) string {
+		instance, found := architectureInstanceForNode(node, byMachine[node.MachineID])
+		if found && strings.TrimSpace(instance.SocketPath) != "" {
+			return mysqlArchitectureRootSocketClient(req.RootPassword, instance.SocketPath) + " --batch --raw --execute=" + shellQuote(sql)
+		}
+		return mysqlArchitectureCommand(req.RootPassword, node.Port, sql)
+	})
+}
+
+func (s *HAService) configureStandaloneArchitecture(ctx context.Context, req hadomain.ArchitectureAdjustmentRequest, machines map[string]machinedomain.Machine) ([]string, error) {
+	var ids []string
+	for _, node := range req.Nodes {
+		command := standaloneDetachCommand(architectureRootPassword(req, node.MachineID), node.Port)
+		created, err := s.runOneArchitectureCommand(ctx, machines[node.MachineID], command)
+		ids = append(ids, created...)
+		if err != nil {
+			return ids, fmt.Errorf("detach replication on %s: %w", node.MachineID, err)
+		}
+	}
+	return ids, nil
+}
+
+func (s *HAService) restoreIndependentWriters(ctx context.Context, req hadomain.ArchitectureAdjustmentRequest, machines map[string]machinedomain.Machine) {
+	_, _ = s.runOnArchitectureNodes(ctx, req.Nodes, machines, func(node hadomain.ArchitectureNodeRequest, _ machinedomain.Machine) string {
+		return mysqlArchitectureCommand(architectureRootPassword(req, node.MachineID), node.Port, "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF; SET GLOBAL offline_mode=OFF;")
+	})
+}
+
+func (s *HAService) resumeArchitectureBusinessConnections(ctx context.Context, req hadomain.ArchitectureAdjustmentRequest, machines map[string]machinedomain.Machine) ([]string, error) {
+	return s.runOnArchitectureNodes(ctx, req.Nodes, machines, func(node hadomain.ArchitectureNodeRequest, _ machinedomain.Machine) string {
+		return mysqlArchitectureCommand(architectureRootPassword(req, node.MachineID), node.Port, "SET GLOBAL offline_mode=OFF; SELECT IF(@@offline_mode=0,'ONLINE','OFFLINE');") + " | grep -Fxq ONLINE"
+	})
+}
+
+func standaloneDetachCommand(password string, port int) string {
+	client := mysqlArchitectureClient(password, port)
+	return client + " --batch --raw --execute=" + shellQuote("SET GLOBAL offline_mode=ON;") + "; " +
+		client + " --execute='STOP REPLICA' >/dev/null 2>&1 || true; " +
+		client + " --execute='RESET REPLICA ALL' >/dev/null 2>&1 || true; " +
+		client + " --batch --raw --execute=" + shellQuote("SET PERSIST auto_increment_increment=1; SET PERSIST auto_increment_offset=1; SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;")
+}
+
+func verifyIndependentNodeCommand(password string, port int) string {
+	sql := "SELECT IF(@@read_only=0 AND @@super_read_only=0 AND @@auto_increment_increment=1 AND @@auto_increment_offset=1 AND NOT EXISTS(SELECT 1 FROM performance_schema.replication_connection_configuration),'INDEPENDENT_OK','INDEPENDENT_BAD');"
+	return mysqlArchitectureCommand(password, port, sql) + " | grep -Fxq INDEPENDENT_OK"
+}
+
 func (s *HAService) configureArchitectureTopology(ctx context.Context, req hadomain.ArchitectureAdjustmentRequest, primaryID string, machines map[string]machinedomain.Machine) ([]string, error) {
 	primary, ok := architectureNode(req.Nodes, primaryID)
 	if !ok {
@@ -910,11 +1536,16 @@ func (s *HAService) configureArchitectureTopology(ctx context.Context, req hadom
 	}
 	var ids []string
 	masters := make([]hadomain.ArchitectureNodeRequest, 0, 2)
+	managementUser, _ := s.architectureManagementAccount(ctx)
+	reuseManagementAccount := strings.EqualFold(strings.TrimSpace(req.ReplicationUser), strings.TrimSpace(managementUser))
 	for _, node := range req.Nodes {
 		if strings.EqualFold(node.Role, "M") {
 			masters = append(masters, node)
+			if reuseManagementAccount {
+				continue
+			}
 			accountSQL := fmt.Sprintf("CREATE USER IF NOT EXISTS %s@'%%' IDENTIFIED BY %s; ALTER USER %s@'%%' IDENTIFIED BY %s; GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO %s@'%%';", sqlIdentifier(req.ReplicationUser), sqlLiteral(req.ReplicationPassword), sqlIdentifier(req.ReplicationUser), sqlLiteral(req.ReplicationPassword), sqlIdentifier(req.ReplicationUser))
-			created, err := s.runOneArchitectureCommand(ctx, machines[node.MachineID], mysqlArchitectureCommand(req.RootPassword, node.Port, accountSQL))
+			created, err := s.runOneArchitectureCommand(ctx, machines[node.MachineID], mysqlArchitectureCommand(architectureRootPassword(req, node.MachineID), node.Port, accountSQL))
 			ids = append(ids, created...)
 			if err != nil {
 				return ids, err
@@ -946,9 +1577,9 @@ func (s *HAService) configureArchitectureTopology(ctx context.Context, req hadom
 			}
 		}
 		sourceMachine := machines[source.MachineID]
-		client := mysqlArchitectureClient(req.RootPassword, node.Port)
+		client := mysqlArchitectureClient(architectureRootPassword(req, node.MachineID), node.Port)
 		reset := client + " --execute='STOP REPLICA' >/dev/null 2>&1 || true; " + client + " --execute='RESET REPLICA ALL' >/dev/null 2>&1 || true; "
-		sql := fmt.Sprintf("CHANGE REPLICATION SOURCE TO SOURCE_HOST=%s,SOURCE_PORT=%d,SOURCE_USER=%s,SOURCE_PASSWORD=%s,SOURCE_AUTO_POSITION=1,SOURCE_DELAY=%d; START REPLICA;", sqlLiteral(sourceMachine.IP), source.Port, sqlLiteral(req.ReplicationUser), sqlLiteral(req.ReplicationPassword), node.DelaySeconds)
+		sql := fmt.Sprintf("SET GLOBAL offline_mode=ON; CHANGE REPLICATION SOURCE TO SOURCE_HOST=%s,SOURCE_PORT=%d,SOURCE_USER=%s,SOURCE_PASSWORD=%s,SOURCE_AUTO_POSITION=1,SOURCE_DELAY=%d,GET_SOURCE_PUBLIC_KEY=1; START REPLICA;", sqlLiteral(sourceMachine.IP), source.Port, sqlLiteral(req.ReplicationUser), sqlLiteral(req.ReplicationPassword), node.DelaySeconds)
 		if isMaster {
 			offset := 1
 			for index, master := range masters {
@@ -971,18 +1602,34 @@ func (s *HAService) configureArchitectureTopology(ctx context.Context, req hadom
 }
 
 func mysqlArchitectureCommand(password string, port int, sql string) string {
-	return mysqlArchitectureClient(password, port) + " --batch --raw --execute=" + shellQuote(sql)
+	return mysqlArchitectureClient(password, port) + " --batch --raw --skip-column-names --execute=" + shellQuote(sql)
+}
+
+func architecturePreflightCommand(password string, port int) string {
+	client := mysqlArchitectureClient(password, port)
+	probe := client + " --batch --raw --execute=" + shellQuote("SELECT @@hostname,@@port,@@server_id,@@read_only,@@super_read_only,@@offline_mode,@@global.gtid_mode; SELECT COUNT(*) FROM performance_schema.threads;")
+	grants := client + " --batch --skip-column-names --execute=" + shellQuote("SHOW GRANTS FOR CURRENT_USER")
+	return probe + " || exit 70; grant_output=$(" + grants + ") || exit 70; " +
+		"printf '%s\\n' \"$grant_output\" | grep -Eiq 'GRANT (ALL PRIVILEGES|.*SUPER)|SYSTEM_VARIABLES_ADMIN' || { echo 'MySQL management account requires SUPER or SYSTEM_VARIABLES_ADMIN for architecture changes' >&2; exit 77; }; " +
+		"printf '%s\\n' \"$grant_output\" | grep -Eiq 'GRANT ALL PRIVILEGES|REPLICATION (SLAVE|REPLICA)' || { echo 'MySQL management account requires REPLICATION SLAVE for architecture changes' >&2; exit 77; }"
 }
 
 func mysqlArchitectureClient(password string, port int) string {
 	if port <= 0 {
 		port = 3306
 	}
+	if password == "" {
+		return fmt.Sprintf("mysql --defaults-extra-file=__GMHA_MYSQL_DEFAULTS_FILE__ --protocol=tcp --host=127.0.0.1 --port=%d --connect-timeout=5", port)
+	}
 	return fmt.Sprintf("MYSQL_PWD=%s mysql --protocol=tcp --host=127.0.0.1 --port=%d --user=root --connect-timeout=5", shellQuote(password), port)
 }
 
-func killBusinessSessionsCommand(req hadomain.ArchitectureAdjustmentRequest, port int) string {
-	users := append([]string{"root", "mysql.sys", "mysql.session", "mysql.infoschema", req.ReplicationUser}, req.ManagementUsers...)
+func mysqlArchitectureRootSocketClient(password, socket string) string {
+	return fmt.Sprintf("MYSQL_PWD=%s mysql --protocol=socket --socket=%s --user=root --connect-timeout=5", shellQuote(password), shellQuote(socket))
+}
+
+func killBusinessSessionsCommand(req hadomain.ArchitectureAdjustmentRequest, machineID string, port int) string {
+	users := append([]string{"root", "mysql.sys", "mysql.session", "mysql.infoschema", "event_scheduler", "system user", req.ReplicationUser}, req.ManagementUsers...)
 	seen, literals := map[string]bool{}, make([]string, 0, len(users))
 	for _, user := range users {
 		if user = strings.TrimSpace(user); user != "" && !seen[user] {
@@ -990,19 +1637,30 @@ func killBusinessSessionsCommand(req hadomain.ArchitectureAdjustmentRequest, por
 			literals = append(literals, sqlLiteral(user))
 		}
 	}
-	query := "SELECT CONCAT('KILL CONNECTION ',ID,';') FROM information_schema.PROCESSLIST WHERE ID<>CONNECTION_ID() AND USER NOT IN (" + strings.Join(literals, ",") + ")"
-	client := fmt.Sprintf("MYSQL_PWD=%s mysql --protocol=tcp --host=127.0.0.1 --port=%d --user=root --connect-timeout=5", shellQuote(req.RootPassword), port)
-	return client + " --batch --skip-column-names --execute=" + shellQuote(query) + " | " + client
+	filter := "ID<>CONNECTION_ID() AND USER IS NOT NULL AND COMMAND<>'Daemon' AND USER NOT IN (" + strings.Join(literals, ",") + ")"
+	killQuery := "SELECT CONCAT('KILL CONNECTION ',ID,';') FROM information_schema.PROCESSLIST WHERE " + filter
+	verifyQuery := "SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE " + filter
+	client := mysqlArchitectureClient(architectureRootPassword(req, machineID), port)
+	list := client + " --batch --skip-column-names --execute=" + shellQuote(killQuery)
+	apply := client + " --batch --skip-column-names"
+	verify := client + " --batch --skip-column-names --execute=" + shellQuote(verifyQuery)
+	return "kill_errors=$(mktemp); trap 'rm -f \"$kill_errors\"' EXIT; " +
+		"kill_sql=$(" + list + ") || exit 70; " +
+		"if [ -n \"$kill_sql\" ]; then printf '%s\\n' \"$kill_sql\" | " + apply + " >/dev/null 2>\"$kill_errors\" || true; fi; " +
+		"remaining=$(" + verify + ") || exit 70; " +
+		"if [ \"$remaining\" != 0 ]; then cat \"$kill_errors\" >&2; echo \"$remaining business session(s) remain after offline fencing\" >&2; exit 79; fi; " +
+		"echo GMHA_BUSINESS_SESSIONS_CLEARED"
 }
 
 func replicationCatchupCommand(password string, port int) string {
-	client := fmt.Sprintf("MYSQL_PWD=%s mysql --protocol=tcp --host=127.0.0.1 --port=%d --user=root --connect-timeout=5 --batch --skip-column-names", shellQuote(password), port)
+	client := mysqlArchitectureClient(password, port)
+	scalarClient := client + " --batch --skip-column-names"
 	gtidSQL := "SELECT IF(GTID_SUBSET(COALESCE((SELECT RECEIVED_TRANSACTION_SET FROM performance_schema.replication_connection_status LIMIT 1),''),@@GLOBAL.gtid_executed),'YES','NO')"
-	return "i=0; while [ $i -lt 60 ]; do status=$(" + client + " -e 'SHOW REPLICA STATUS\\G' 2>/dev/null) || exit 70; lag=$(printf '%s\\n' \"$status\" | awk -F': ' '/Seconds_Behind_(Source|Master)/ {print $2; exit}'); io=$(printf '%s\\n' \"$status\" | awk -F': ' '/Replica_IO_Running|Slave_IO_Running/ {print $2; exit}'); sql=$(printf '%s\\n' \"$status\" | awk -F': ' '/Replica_SQL_Running|Slave_SQL_Running/ {print $2; exit}'); gtid=$(" + client + " -e " + shellQuote(gtidSQL) + " 2>/dev/null) || exit 70; if [ \"$lag\" = 0 ] && [ \"$io\" = Yes ] && [ \"$sql\" = Yes ] && [ \"$gtid\" = YES ]; then echo GMHA_REPLICATION_CAUGHT_UP; exit 0; fi; i=$((i+1)); sleep 1; done; echo GMHA_REPLICATION_TIMEOUT >&2; exit 75"
+	return "i=0; while [ $i -lt 60 ]; do status=$(" + client + " -e 'SHOW REPLICA STATUS\\G' 2>/dev/null) || exit 70; lag=$(printf '%s\\n' \"$status\" | awk -F': ' '/Seconds_Behind_(Source|Master)/ {print $2; exit}'); io=$(printf '%s\\n' \"$status\" | awk -F': ' '/Replica_IO_Running|Slave_IO_Running/ {print $2; exit}'); sql=$(printf '%s\\n' \"$status\" | awk -F': ' '/Replica_SQL_Running|Slave_SQL_Running/ {print $2; exit}'); gtid=$(" + scalarClient + " -e " + shellQuote(gtidSQL) + " 2>/dev/null) || exit 70; if [ \"$lag\" = 0 ] && [ \"$io\" = Yes ] && [ \"$sql\" = Yes ] && [ \"$gtid\" = YES ]; then echo GMHA_REPLICATION_CAUGHT_UP; exit 0; fi; i=$((i+1)); sleep 1; done; echo GMHA_REPLICATION_TIMEOUT >&2; exit 75"
 }
 
 func delayedReplicationHealthCommand(password string, port, expectedDelay int) string {
-	client := fmt.Sprintf("MYSQL_PWD=%s mysql --protocol=tcp --host=127.0.0.1 --port=%d --user=root --connect-timeout=5 --batch --skip-column-names", shellQuote(password), port)
+	client := mysqlArchitectureClient(password, port)
 	return "status=$(" + client + " -e 'SHOW REPLICA STATUS\\G' 2>/dev/null) || exit 70; configured=$(printf '%s\\n' \"$status\" | awk -F': ' '/SQL_Delay/ {print $2; exit}'); io=$(printf '%s\\n' \"$status\" | awk -F': ' '/Replica_IO_Running|Slave_IO_Running/ {print $2; exit}'); sql=$(printf '%s\\n' \"$status\" | awk -F': ' '/Replica_SQL_Running|Slave_SQL_Running/ {print $2; exit}'); [ \"$configured\" = " + fmt.Sprint(expectedDelay) + " ] && [ \"$io\" = Yes ] && [ \"$sql\" = Yes ]"
 }
 
@@ -1050,6 +1708,14 @@ func waitArchitectureForce(ctx context.Context, runs architectureRunRepository, 
 	}
 }
 
+func (s *HAService) succeedArchitectureRun(ctx context.Context, runs architectureRunRepository, run *hadomain.ArchitectureRun) {
+	now := time.Now().UTC()
+	run.Status, run.CurrentStep, run.Error = hadomain.ArchitectureRunSucceeded, "release_lock", ""
+	run.UpdatedAt, run.FinishedAt = now, &now
+	s.syncArchitectureTrackingTask(ctx, *run)
+	_ = runs.SaveArchitectureRun(ctx, *run)
+}
+
 func (s *HAService) failArchitectureRun(ctx context.Context, runs architectureRunRepository, run *hadomain.ArchitectureRun, step string, err error) {
 	now := time.Now().UTC()
 	run.Status, run.CurrentStep, run.Error = hadomain.ArchitectureRunFailed, step, err.Error()
@@ -1057,8 +1723,8 @@ func (s *HAService) failArchitectureRun(ctx context.Context, runs architectureRu
 	if ctx.Err() != nil {
 		ctx = context.Background()
 	}
-	_ = runs.SaveArchitectureRun(ctx, *run)
 	s.syncArchitectureTrackingTask(ctx, *run)
+	_ = runs.SaveArchitectureRun(ctx, *run)
 }
 
 func (s *HAService) syncArchitectureTrackingTask(ctx context.Context, run hadomain.ArchitectureRun) {

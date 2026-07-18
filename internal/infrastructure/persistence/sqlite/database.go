@@ -43,6 +43,10 @@ func (d *DB) QueryContext(ctx context.Context, query string, args ...any) (*sql.
 	return d.db.QueryContext(ctx, d.sql(query), args...)
 }
 
+func (d *DB) Query(query string, args ...any) (*sql.Rows, error) {
+	return d.db.Query(d.sql(query), args...)
+}
+
 func (d *DB) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
 	return d.db.QueryRowContext(ctx, d.sql(query), args...)
 }
@@ -63,6 +67,9 @@ type Tx struct {
 
 func (t *Tx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	return t.tx.ExecContext(ctx, t.db.sql(query), args...)
+}
+func (t *Tx) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	return t.tx.QueryRowContext(ctx, t.db.sql(query), args...)
 }
 func (t *Tx) Commit() error   { return t.tx.Commit() }
 func (t *Tx) Rollback() error { return t.tx.Rollback() }

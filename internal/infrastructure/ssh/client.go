@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	machinedomain "gmha/internal/domain/machine"
@@ -17,14 +18,25 @@ import (
 )
 
 // Client 是 SSH 客户端，提供连接测试、命令执行和文件上传功能。
-type Client struct{}
-
-func NewClient() *Client {
-	return &Client{}
+type Client struct {
+	managerPrivateKeyPaths []string
 }
 
-func (c *Client) CheckTrustConnection(ctx context.Context, endpoint machinedomain.Endpoint, user string) (bool, error) {
-	signers, err := loadLocalSigners()
+// NewClient creates an SSH client. When a Manager public key path is supplied,
+// the matching private key is also considered during trust checks.
+func NewClient(managerPublicKeyPaths ...string) *Client {
+	privatePaths := make([]string, 0, len(managerPublicKeyPaths))
+	for _, path := range managerPublicKeyPaths {
+		path = strings.TrimSpace(path)
+		if path != "" {
+			privatePaths = append(privatePaths, strings.TrimSuffix(path, ".pub"))
+		}
+	}
+	return &Client{managerPrivateKeyPaths: privatePaths}
+}
+
+func (c *Client) CheckTrustConnection(ctx context.Context, endpoint machinedomain.Endpoint, auth machinedomain.SSHAuth) (bool, error) {
+	signers, err := c.trustSigners(auth)
 	if err != nil {
 		return false, err
 	}
@@ -32,12 +44,29 @@ func (c *Client) CheckTrustConnection(ctx context.Context, endpoint machinedomai
 		return false, nil
 	}
 
-	client, err := dialWithAuthMethods(ctx, endpoint, user, []gossh.AuthMethod{gossh.PublicKeys(signers...)}, 10*time.Second)
+	client, err := dialWithAuthMethods(ctx, endpoint, auth.User, []gossh.AuthMethod{gossh.PublicKeys(signers...)}, 10*time.Second)
 	if err != nil {
 		return false, nil
 	}
 	defer client.Close()
 	return true, nil
+}
+
+func (c *Client) trustSigners(auth machinedomain.SSHAuth) ([]gossh.Signer, error) {
+	signers := make([]gossh.Signer, 0, 3)
+	if strings.TrimSpace(auth.PrivateKey) != "" {
+		signer, err := parsePrivateKey([]byte(auth.PrivateKey), auth.Passphrase)
+		if err != nil {
+			return nil, fmt.Errorf("parse SSH private key: %w", err)
+		}
+		signers = append(signers, signer)
+	}
+	localSigners, err := loadLocalSigners(c.managerPrivateKeyPaths...)
+	if err != nil {
+		return nil, err
+	}
+	signers = append(signers, localSigners...)
+	return signers, nil
 }
 
 func (c *Client) TestConnection(ctx context.Context, endpoint machinedomain.Endpoint, auth machinedomain.SSHAuth) error {
@@ -128,11 +157,7 @@ func dial(ctx context.Context, endpoint machinedomain.Endpoint, auth machinedoma
 	}
 	if auth.PrivateKey != "" {
 		var signer gossh.Signer
-		if auth.Passphrase != "" {
-			signer, err = gossh.ParsePrivateKeyWithPassphrase([]byte(auth.PrivateKey), []byte(auth.Passphrase))
-		} else {
-			signer, err = gossh.ParsePrivateKey([]byte(auth.PrivateKey))
-		}
+		signer, err = parsePrivateKey([]byte(auth.PrivateKey), auth.Passphrase)
 		if err != nil {
 			return nil, fmt.Errorf("parse SSH private key: %w", err)
 		}
@@ -177,17 +202,37 @@ func dialWithAuthMethods(ctx context.Context, endpoint machinedomain.Endpoint, u
 	}
 }
 
-func loadLocalSigners() ([]gossh.Signer, error) {
+func parsePrivateKey(data []byte, passphrase string) (gossh.Signer, error) {
+	if passphrase != "" {
+		return gossh.ParsePrivateKeyWithPassphrase(data, []byte(passphrase))
+	}
+	return gossh.ParsePrivateKey(data)
+}
+
+func loadLocalSigners(extraPaths ...string) ([]gossh.Signer, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, err
 	}
-	candidates := []string{
+	candidates := append([]string{}, extraPaths...)
+	candidates = append(candidates,
 		filepath.Join(home, ".ssh", "id_ed25519"),
 		filepath.Join(home, ".ssh", "id_rsa"),
-	}
+	)
 	var signers []gossh.Signer
+	seen := make(map[string]struct{}, len(candidates))
 	for _, candidate := range candidates {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if strings.HasPrefix(candidate, "~") {
+			candidate = filepath.Join(home, strings.TrimPrefix(candidate, "~/"))
+		}
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		seen[candidate] = struct{}{}
 		data, err := os.ReadFile(candidate)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {

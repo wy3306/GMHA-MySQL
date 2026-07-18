@@ -245,8 +245,9 @@ func isLocalIPv4(ip net.IP, locals []managerLocalAddr) bool {
 func isVirtualInterface(name string) bool {
 	name = strings.ToLower(strings.TrimSpace(name))
 	virtualPrefixes := []string{
-		"br-", "cni", "docker", "dummy", "flannel", "ham", "podman", "tap", "tailscale",
-		"tun", "utun", "vboxnet", "veth", "virbr", "vmnet", "wg", "zt",
+		"awdl", "br-", "bridge", "cni", "docker", "dummy", "feth", "flannel", "ham", "llw",
+		"podman", "tap", "tailscale", "tun", "utun", "vboxnet", "veth", "virbr", "vmenet",
+		"vmnet", "wg", "zt",
 	}
 	for _, prefix := range virtualPrefixes {
 		if strings.HasPrefix(name, prefix) {

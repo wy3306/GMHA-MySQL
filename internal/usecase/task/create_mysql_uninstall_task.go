@@ -21,8 +21,9 @@ type MySQLInstanceRepository interface {
 
 // CreateMySQLUninstallTaskRequest 是创建 MySQL 卸载任务的请求参数。
 type CreateMySQLUninstallTaskRequest struct {
-	Machine string
-	Port    int
+	ParentTaskID string
+	Machine      string
+	Port         int
 }
 
 // CreateMySQLUninstallTaskResult 是创建 MySQL 卸载任务的结果。
@@ -87,6 +88,7 @@ func (u *CreateMySQLUninstallTaskUsecase) Execute(ctx context.Context, req Creat
 	taskID := fmt.Sprintf("task-%d", now.UnixNano())
 	task := taskdomain.Task{
 		ID:              taskID,
+		ParentTaskID:    strings.TrimSpace(req.ParentTaskID),
 		Type:            taskdomain.TypeMySQLUninstall,
 		MachineID:       machine.ID,
 		AgentID:         agent.ID,

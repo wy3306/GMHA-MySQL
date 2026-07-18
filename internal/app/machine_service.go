@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	agenthandler "gmha/internal/agent/handler"
@@ -20,6 +21,7 @@ import (
 	machinedomain "gmha/internal/domain/machine"
 	taskdomain "gmha/internal/domain/task"
 	mysqlapp "gmha/internal/mysql"
+	agentusecase "gmha/internal/usecase/agent"
 	machineusecase "gmha/internal/usecase/machine"
 	taskusecase "gmha/internal/usecase/task"
 )
@@ -81,20 +83,55 @@ type ClusterCleanupResult struct {
 
 // DeleteMachineOptions 控制删除机器前是否同步清理目标机上的运行资源。
 type DeleteMachineOptions struct {
-	DeleteMySQL bool `json:"delete_mysql"`
-	DeleteAgent bool `json:"delete_agent"`
-	DetachOnly  bool `json:"detach_only"`
+	DeleteMySQL  bool   `json:"delete_mysql"`
+	DeleteAgent  bool   `json:"delete_agent"`
+	DetachOnly   bool   `json:"detach_only"`
+	ParentTaskID string `json:"-"`
 }
 
 // DeleteMachineResult 描述机器删除过程中完成的远端与本地清理操作。
 type DeleteMachineResult struct {
-	MachineID          string   `json:"machine_id"`
-	MySQLPorts         []int    `json:"mysql_ports,omitempty"`
-	MySQLUninstallTask []string `json:"mysql_uninstall_tasks,omitempty"`
-	AgentUninstalled   bool     `json:"agent_uninstalled"`
-	LocalCleaned       bool     `json:"local_cleaned"`
-	DetachedOnly       bool     `json:"detached_only"`
-	MySQLSSHPorts      []int    `json:"mysql_ssh_ports,omitempty"`
+	MachineID           string   `json:"machine_id"`
+	MySQLPorts          []int    `json:"mysql_ports,omitempty"`
+	MySQLUninstallTask  []string `json:"mysql_uninstall_tasks,omitempty"`
+	AgentUninstalled    bool     `json:"agent_uninstalled"`
+	AgentVerified       bool     `json:"agent_verified"`
+	MySQLVerified       bool     `json:"mysql_verified"`
+	LocalCleaned        bool     `json:"local_cleaned"`
+	DetachedOnly        bool     `json:"detached_only"`
+	MySQLSSHPorts       []int    `json:"mysql_ssh_ports,omitempty"`
+	MySQLResidues       []string `json:"mysql_residues,omitempty"`
+	MySQLCleanupChannel string   `json:"mysql_cleanup_channel,omitempty"`
+	MySQLCleanupTaskID  string   `json:"mysql_cleanup_task_id,omitempty"`
+	RelatedTaskIDs      []string `json:"task_ids,omitempty"`
+}
+
+type DeleteMachinesItem struct {
+	MachineID string              `json:"machine_id"`
+	Result    DeleteMachineResult `json:"result"`
+	Error     string              `json:"error,omitempty"`
+}
+
+type DeleteMachinesResult struct {
+	TaskID    string               `json:"task_id"`
+	Requested int                  `json:"requested"`
+	Succeeded int                  `json:"succeeded"`
+	Failed    int                  `json:"failed"`
+	Items     []DeleteMachinesItem `json:"items"`
+}
+
+// DeleteMachinePrecheck 是删除弹窗使用的只读实机检查结果。平台登记记录与
+// 目标机真实状态分别返回，避免把“未登记”错误解释成“没有安装”。
+type DeleteMachinePrecheck struct {
+	MachineID            string   `json:"machine_id"`
+	RegisteredMySQLPorts []int    `json:"registered_mysql_ports"`
+	RemoteChecked        bool     `json:"remote_checked"`
+	SSHReachable         bool     `json:"ssh_reachable"`
+	MySQLDetected        bool     `json:"mysql_detected"`
+	MySQLResidues        []string `json:"mysql_residues,omitempty"`
+	ProbeChannel         string   `json:"probe_channel,omitempty"`
+	ProbeTaskID          string   `json:"probe_task_id,omitempty"`
+	Warning              string   `json:"warning,omitempty"`
 }
 
 // SSHCredentialView 是 SSH 凭据的展示视图。
@@ -109,15 +146,43 @@ type SSHCredentialView struct {
 
 // OnboardPrecheckReport 是写入 Manager 前对目标机器执行的非破坏性检查报告。
 type OnboardPrecheckReport struct {
-	SSHReachable  bool   `json:"ssh_reachable"`
-	RemoteCommand bool   `json:"remote_command"`
-	Identity      string `json:"identity"`
-	OS            string `json:"os"`
-	SystemdReady  bool   `json:"systemd_ready"`
-	Disk          string `json:"disk"`
-	AgentDetected bool   `json:"agent_detected"`
-	MySQLDetected bool   `json:"mysql_detected"`
-	Warning       string `json:"warning,omitempty"`
+	SSHReachable  bool     `json:"ssh_reachable"`
+	RemoteCommand bool     `json:"remote_command"`
+	Identity      string   `json:"identity"`
+	OS            string   `json:"os"`
+	SystemdReady  bool     `json:"systemd_ready"`
+	Disk          string   `json:"disk"`
+	AgentDetected bool     `json:"agent_detected"`
+	MySQLDetected bool     `json:"mysql_detected"`
+	MySQLResidues []string `json:"mysql_residues,omitempty"`
+	Warning       string   `json:"warning,omitempty"`
+}
+
+const mysqlResidueMarker = "__GMHA_MYSQL_RESIDUE__"
+
+func mysqlResidueDetectionCommand() string {
+	return `found=0; configs="/etc/my.cnf /etc/mysql/my.cnf"; emit(){ echo '` + mysqlResidueMarker + `'"$1"; found=1; }; for unit in $(systemctl list-unit-files --type=service --no-legend 'mysql*.service' 'mysqld*.service' 'mariadb*.service' 2>/dev/null | awk '{print $1}'); do emit systemd:$unit; fragment=$(systemctl show -p FragmentPath --value "$unit" 2>/dev/null || true); [ -n "$fragment" ] && emit path:$fragment; exec_line=$(systemctl show -p ExecStart --value "$unit" 2>/dev/null || true); cfg=$(printf '%s' "$exec_line" | sed -n 's/.*--defaults-file=\([^ ;}]*\).*/\1/p'); [ -n "$cfg" ] && configs="$configs $cfg"; done; for pid in $(pgrep -x mysqld 2>/dev/null || true); do cmd=$(tr '\000' ' ' < /proc/$pid/cmdline 2>/dev/null || true); emit process:mysqld:$pid:$cmd; cfg=$(printf '%s' "$cmd" | sed -n 's/.*--defaults-file=\([^ ]*\).*/\1/p'); [ -n "$cfg" ] && configs="$configs $cfg"; done; for cfg in $configs; do if [ -f "$cfg" ]; then emit config:$cfg; awk -F= '/^[[:space:]]*(basedir|datadir|log-bin|innodb_log_group_home_dir|innodb_undo_directory|tmpdir)[[:space:]]*=/{key=$1; value=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", key); gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); if(value!="") print "` + mysqlResidueMarker + `config-path:" key ":" value}' "$cfg" 2>/dev/null || true; found=1; fi; done; for path in /etc/systemd/system/mysql*.service /etc/systemd/system/mysqld*.service /usr/lib/systemd/system/mysql*.service /usr/lib/systemd/system/mysqld*.service /lib/systemd/system/mysql*.service /lib/systemd/system/mysqld*.service /etc/my.cnf /etc/mysql /usr/local/mysql /data/3306; do if [ -e "$path" ] || [ -L "$path" ]; then emit path:$path; fi; done; if command -v mysqld >/dev/null 2>&1; then emit binary:$(command -v mysqld); fi; [ "$found" = 1 ] && echo MYSQL_PRESENT || echo MYSQL_ABSENT`
+}
+
+func parseMySQLResidues(output string) []string {
+	var residues []string
+	seen := make(map[string]struct{})
+	for _, line := range strings.Split(output, "\n") {
+		if index := strings.Index(line, mysqlResidueMarker); index >= 0 {
+			if value := strings.TrimSpace(line[index+len(mysqlResidueMarker):]); value != "" {
+				if _, exists := seen[value]; exists {
+					continue
+				}
+				seen[value] = struct{}{}
+				residues = append(residues, value)
+			}
+		}
+	}
+	return residues
+}
+
+func mysqlResidueCleanupCommand() string {
+	return `set -eu; stamp=$(date +%Y%m%d%H%M%S); backup=/var/lib/gmha-cleanup-backup/mysql-$stamp; paths=/tmp/gmha-mysql-cleanup-paths-$stamp; : > "$paths"; mkdir -p "$backup"; configs="/etc/my.cnf /etc/mysql/my.cnf"; for pid in $(pgrep -x mysqld 2>/dev/null || true); do cmd=$(tr '\000' ' ' < /proc/$pid/cmdline 2>/dev/null || true); cfg=$(printf '%s' "$cmd" | sed -n 's/.*--defaults-file=\([^ ]*\).*/\1/p'); [ -n "$cfg" ] && configs="$configs $cfg"; done; for unit in $(systemctl list-unit-files --type=service --no-legend 'mysql*.service' 'mysqld*.service' 'mariadb*.service' 2>/dev/null | awk '{print $1}'); do exec_line=$(systemctl show -p ExecStart --value "$unit" 2>/dev/null || true); cfg=$(printf '%s' "$exec_line" | sed -n 's/.*--defaults-file=\([^ ;}]*\).*/\1/p'); [ -n "$cfg" ] && configs="$configs $cfg"; systemctl disable --now "$unit" 2>/dev/null || true; done; for service in mysql mysqld mariadb; do systemctl disable --now "$service" 2>/dev/null || true; done; for cfg in $configs; do if [ -f "$cfg" ]; then printf '%s\n' "$cfg" "$(dirname "$cfg")" >> "$paths"; awk -F= '/^[[:space:]]*(basedir|datadir|log-bin|innodb_log_group_home_dir|innodb_undo_directory|tmpdir)[[:space:]]*=/{value=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); if(substr(value,1,1)=="/") print value}' "$cfg" >> "$paths" 2>/dev/null || true; fi; done; pgrep -x mysqld >/dev/null 2>&1 && pkill -TERM -x mysqld 2>/dev/null || true; sleep 1; pgrep -x mysqld >/dev/null 2>&1 && pkill -KILL -x mysqld 2>/dev/null || true; for path in /etc/systemd/system/mysql*.service /etc/systemd/system/mysqld*.service /usr/lib/systemd/system/mysql*.service /usr/lib/systemd/system/mysqld*.service /lib/systemd/system/mysql*.service /lib/systemd/system/mysqld*.service /etc/my.cnf /etc/mysql /usr/local/mysql /data/3306 $(sort -u "$paths"); do case "$path" in /|/etc|/usr|/usr/local|/var|/var/lib|/data|/tmp|/home|/opt|/srv|'') continue;; esac; if [ -e "$path" ] || [ -L "$path" ]; then name=$(echo "$path" | sed 's#^/##;s#/#__#g'); target="$backup/$name"; [ -e "$target" ] && target="$target-$(date +%s%N)"; mv "$path" "$target"; fi; done; rm -f "$paths"; systemctl daemon-reload; systemctl reset-failed 2>/dev/null || true`
 }
 
 // ClusterView 是集群的展示视图，包含集群名称、描述和所属机器列表。
@@ -186,7 +251,17 @@ func (s *MachineService) Onboard(ctx context.Context, req machineusecase.Onboard
 		return machineusecase.OnboardMachineResponse{}, err
 	}
 	if err := s.adoptPreservedComponents(ctx, req, resp.ID); err != nil {
-		return resp, fmt.Errorf("machine registered but preserved components could not be adopted: %w", err)
+		if req.PreserveAgent && s.agentSvc != nil {
+			_, repairErr := s.agentSvc.RetryInstallByIP(ctx, agentusecase.InstallAgentRequest{
+				IP: req.IP, SSHUser: req.SSHUser, SSHPassword: req.SSHPassword,
+				SSHPrivateKey: req.SSHPrivateKey, SSHPassphrase: req.SSHPassphrase,
+			})
+			if repairErr == nil {
+				return resp, nil
+			}
+			return resp, fmt.Errorf("机器已登记；保留 Agent 接管失败，自动使用当前 Agent 修复也失败: 接管错误=%v；修复错误=%w", err, repairErr)
+		}
+		return resp, fmt.Errorf("机器已登记，但保留组件接管失败: %w", err)
 	}
 	return resp, nil
 }
@@ -246,7 +321,14 @@ func (s *MachineService) adoptPreservedComponents(ctx context.Context, req machi
 		if s.agentSvc == nil || s.agentSvc.repo == nil {
 			return errors.New("agent service not configured")
 		}
-		if _, err := s.agentSvc.repo.Save(ctx, agentdomain.Agent{ID: "agent-" + machineID, MachineID: machineID, InstallDir: installDir, State: agentdomain.StateInstalling}); err != nil {
+		agentVersion := ""
+		if outputSupported {
+			output, versionErr := runner.RunOutput(ctx, endpoint, auth, shellQuote(strings.TrimSuffix(installDir, "/")+"/agentd")+" --version")
+			if versionErr == nil {
+				agentVersion, _ = detectAgentVersionOutput(output)
+			}
+		}
+		if _, err := s.agentSvc.repo.Save(ctx, agentdomain.Agent{ID: "agent-" + machineID, MachineID: machineID, InstallDir: installDir, Version: agentVersion, State: agentdomain.StateInstalling}); err != nil {
 			return err
 		}
 		serviceRunner, ok := s.sshClient.(interface {
@@ -272,7 +354,8 @@ func (s *MachineService) adoptPreservedComponents(ctx context.Context, req machi
 			replacement := key + ": " + value
 			command += "; if grep -q " + shellQuote("^"+key+":") + " \"$config\"; then sed -i " + shellQuote("s|^"+key+":.*$|"+replacement+"|") + " \"$config\"; else printf '%s\\n' " + shellQuote(replacement) + " >> \"$config\"; fi"
 		}
-		command += "; systemctl daemon-reload; systemctl restart gmha-agent || systemctl start gmha-agent"
+		unit := preservedAgentSystemdUnit(installDir)
+		command += "; unit=/etc/systemd/system/gmha-agent.service; if test -f \"$unit\"; then cp -f \"$unit\" \"$unit.bak\"; fi; printf '%s' " + shellQuote(unit) + " > \"$unit\"; chmod 0644 \"$unit\"; systemctl daemon-reload; systemctl reset-failed gmha-agent 2>/dev/null || true; systemctl enable gmha-agent; systemctl restart gmha-agent"
 		startedAt := time.Now().UTC()
 		restartErr := serviceRunner.Run(ctx, endpoint, auth, command)
 		if err := s.confirmPreservedAgentOnline(ctx, runner, endpoint, auth, machineID, startedAt, restartErr); err != nil {
@@ -285,6 +368,28 @@ func (s *MachineService) adoptPreservedComponents(ctx context.Context, req machi
 	return nil
 }
 
+func preservedAgentSystemdUnit(installDir string) string {
+	dir := strings.TrimSuffix(installDir, "/")
+	return fmt.Sprintf(`[Unit]
+Description=GMHA Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%s
+ExecStart=%s/agentd --config %s/agent.yaml
+Restart=always
+RestartSec=5s
+TimeoutStopSec=15s
+KillMode=mixed
+SendSIGKILL=yes
+
+[Install]
+WantedBy=multi-user.target
+`, dir, dir, dir)
+}
+
 func (s *MachineService) confirmPreservedAgentOnline(ctx context.Context, runner interface {
 	RunOutput(context.Context, machinedomain.Endpoint, machinedomain.SSHAuth, string) ([]byte, error)
 }, endpoint machinedomain.Endpoint, auth machinedomain.SSHAuth, machineID string, startedAt time.Time, restartErr error) error {
@@ -293,7 +398,7 @@ func (s *MachineService) confirmPreservedAgentOnline(ctx context.Context, runner
 			return nil
 		}
 	}
-	output, statusErr := runner.RunOutput(ctx, endpoint, auth, `state=$(systemctl is-active gmha-agent 2>/dev/null || true); result=$(systemctl show gmha-agent -p Result --value 2>/dev/null || true); code=$(systemctl show gmha-agent -p ExecMainStatus --value 2>/dev/null || true); printf 'state=%s result=%s exit=%s' "$state" "$result" "$code"`)
+	output, statusErr := runner.RunOutput(ctx, endpoint, auth, `state=$(systemctl is-active gmha-agent 2>/dev/null || true); result=$(systemctl show gmha-agent -p Result --value 2>/dev/null || true); code=$(systemctl show gmha-agent -p ExecMainStatus --value 2>/dev/null || true); logs=$(journalctl -u gmha-agent -n 8 --no-pager -o cat 2>/dev/null | tail -c 800 | tr '\n' ';' || true); printf 'state=%s result=%s exit=%s journal=%s' "$state" "$result" "$code" "$logs"`)
 	status := strings.TrimSpace(string(output))
 	if statusErr == nil && strings.Contains(status, "state=active") {
 		return nil
@@ -302,9 +407,9 @@ func (s *MachineService) confirmPreservedAgentOnline(ctx context.Context, runner
 		status = "service status unavailable"
 	}
 	if restartErr != nil {
-		return fmt.Errorf("preserved Agent did not become online (%s; restart command: %v)", status, restartErr)
+		return fmt.Errorf("保留的 Agent 重启后未上线（%s；重启命令错误：%v）", status, restartErr)
 	}
-	return fmt.Errorf("preserved Agent did not become online (%s)", status)
+	return fmt.Errorf("保留的 Agent 重启后未上线（%s）", status)
 }
 
 func parsePreservedMySQLConfig(output []byte) (mysqlcheck.Config, string, error) {
@@ -355,7 +460,8 @@ func (s *MachineService) PrecheckOnboard(ctx context.Context, req machineusecase
 		report.Warning = "当前 SSH 客户端不支持远程预检查"
 		return report, nil
 	}
-	output, err := runner.RunOutput(ctx, endpoint, auth, `id; uname -srm; test -d /etc/systemd/system && test -w /etc/systemd/system && echo SYSTEMD_READY || echo SYSTEMD_NOT_WRITABLE; df -h / | tail -1; if systemctl cat gmha-agent >/dev/null 2>&1 || test -f /etc/systemd/system/gmha-agent.service || test -d /opt/gmha || test -d /home/gmha/agent || test -d /root/gmha/agent || find /home -maxdepth 3 -type d -path '*/gmha/agent' -print -quit 2>/dev/null | grep -q .; then echo GMHA_AGENT_PRESENT; else echo GMHA_AGENT_ABSENT; fi; if command -v mysqld >/dev/null 2>&1 || systemctl cat mysql >/dev/null 2>&1 || systemctl cat mysqld >/dev/null 2>&1; then echo MYSQL_PRESENT; else echo MYSQL_ABSENT; fi`)
+	command := `id; uname -srm; test -d /etc/systemd/system && test -w /etc/systemd/system && echo SYSTEMD_READY || echo SYSTEMD_NOT_WRITABLE; df -h / | tail -1; if systemctl cat gmha-agent >/dev/null 2>&1 || test -f /etc/systemd/system/gmha-agent.service || test -d /opt/gmha || test -d /home/gmha/agent || test -d /root/gmha/agent || find /home -maxdepth 3 -type d -path '*/gmha/agent' -print -quit 2>/dev/null | grep -q .; then echo GMHA_AGENT_PRESENT; else echo GMHA_AGENT_ABSENT; fi; ` + mysqlResidueDetectionCommand()
+	output, err := runner.RunOutput(ctx, endpoint, auth, command)
 	if err != nil {
 		report.Warning = fmt.Sprintf("SSH 已认证，但远程命令不可执行: %v", err)
 		return report, nil
@@ -381,14 +487,15 @@ func (s *MachineService) PrecheckOnboard(ctx context.Context, req machineusecase
 		}
 	}
 	report.AgentDetected = strings.Contains(text, "GMHA_AGENT_PRESENT")
-	report.MySQLDetected = strings.Contains(text, "MYSQL_PRESENT")
+	report.MySQLResidues = parseMySQLResidues(text)
+	report.MySQLDetected = strings.Contains(text, "MYSQL_PRESENT") || len(report.MySQLResidues) > 0
 	if !report.SystemdReady {
 		report.Warning = "当前 SSH 用户无法写入 systemd 服务目录，Agent 安装需要 root 或具备 sudo 权限的用户"
 	}
 	return report, nil
 }
 
-// CleanupOnboardTarget 清理旧 Agent 和停止旧 MySQL 服务；不删除 MySQL 数据目录。
+// CleanupOnboardTarget 清理旧 Agent，并把 MySQL 残留归档后移出安装路径。
 func (s *MachineService) CleanupOnboardTarget(ctx context.Context, req machineusecase.OnboardMachineRequest, confirmPhrase string) error {
 	if strings.TrimSpace(confirmPhrase) != "CLEAN "+strings.TrimSpace(req.IP) {
 		return errors.New("invalid cleanup confirmation phrase")
@@ -410,7 +517,7 @@ func (s *MachineService) CleanupOnboardTarget(ctx context.Context, req machineus
 		return errors.New("SSH client does not support remote cleanup")
 	}
 	auth := machinedomain.SSHAuth{User: req.SSHUser, Password: req.SSHPassword, PrivateKey: req.SSHPrivateKey, Passphrase: req.SSHPassphrase}
-	cmd := `set -eu; systemctl disable --now gmha-agent 2>/dev/null || true; rm -f /etc/systemd/system/gmha-agent.service; rm -rf /opt/gmha /home/*/agent; systemctl daemon-reload; systemctl disable --now mysql 2>/dev/null || true; systemctl disable --now mysqld 2>/dev/null || true`
+	cmd := `set -eu; systemctl disable --now gmha-agent 2>/dev/null || true; rm -f /etc/systemd/system/gmha-agent.service; rm -rf /opt/gmha /home/*/agent; ` + mysqlResidueCleanupCommand()
 	return runner.Run(ctx, machinedomain.Endpoint{IP: req.IP, SSHPort: req.SSHPort}, auth, cmd)
 }
 
@@ -516,7 +623,25 @@ func (s *MachineService) DeleteSSHCredential(ctx context.Context, selector strin
 
 // ListMachines 返回所有机器列表。
 func (s *MachineService) ListMachines(ctx context.Context) ([]machinedomain.Machine, error) {
-	return s.machineRepo.List(ctx)
+	items, err := s.machineRepo.List(ctx)
+	if err != nil || s.agentSvc == nil || s.agentSvc.heartbeat == nil {
+		return items, err
+	}
+	heartbeats := make(map[string]HeartbeatView)
+	for _, heartbeat := range s.agentSvc.heartbeat.Snapshot() {
+		heartbeats[heartbeat.MachineID] = heartbeat
+	}
+	for index := range items {
+		heartbeat, ok := heartbeats[items[index].ID]
+		if !ok {
+			continue
+		}
+		if status, lastError, authoritative := machineStatusFromHeartbeat(heartbeat.CurrentState, heartbeat.LastErrorSummary); authoritative {
+			items[index].Status = status
+			items[index].LastError = lastError
+		}
+	}
+	return items, nil
 }
 
 // GetMachine 返回单台机器的基础信息，用于 Web 详情视图。
@@ -563,7 +688,7 @@ func (s *MachineService) CheckSSHTrust(ctx context.Context, ip string, sshPort i
 	return s.sshClient.CheckTrustConnection(ctx, machinedomain.Endpoint{
 		IP:      ip,
 		SSHPort: sshPort,
-	}, sshUser)
+	}, machinedomain.SSHAuth{User: sshUser})
 }
 
 // UpdateMachine 更新机器的基本信息（名称、IP、SSH 端口、SSH 用户）。
@@ -596,6 +721,219 @@ func (s *MachineService) DeleteMachine(ctx context.Context, machineID string) er
 	return err
 }
 
+// DeleteMachinesWithOptions 把一次批量删除建模为一个业务父任务。每台机器
+// 各自作为子任务，机器内部产生的 Agent 探测、卸载和清理任务继续挂在其下。
+func (s *MachineService) DeleteMachinesWithOptions(ctx context.Context, machineIDs []string, opts DeleteMachineOptions, concurrency int) (DeleteMachinesResult, error) {
+	if s.taskSvc == nil {
+		return DeleteMachinesResult{}, errors.New("task service not configured")
+	}
+	seen := make(map[string]struct{}, len(machineIDs))
+	ids := make([]string, 0, len(machineIDs))
+	for _, value := range machineIDs {
+		id := strings.TrimSpace(value)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return DeleteMachinesResult{}, errors.New("machine_ids is required")
+	}
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+	if concurrency > 10 {
+		concurrency = 10
+	}
+
+	parent, err := s.taskSvc.CreateBatchTrackingTask(ctx, "machine_batch_delete", "批量删除机器", fmt.Sprintf("%d 台机器", len(ids)))
+	if err != nil {
+		return DeleteMachinesResult{}, err
+	}
+	result := DeleteMachinesResult{TaskID: parent.Task.ID, Requested: len(ids), Items: make([]DeleteMachinesItem, len(ids))}
+	childIDs := make([]string, len(ids))
+	for i, id := range ids {
+		target := id
+		if machine, ok, lookupErr := s.machineRepo.GetByID(ctx, id); lookupErr == nil && ok && strings.TrimSpace(machine.Name) != "" {
+			target = machine.Name
+		}
+		child, createErr := s.taskSvc.CreateBatchTrackingTask(ctx, "machine_delete", "删除机器 "+target, id)
+		if createErr != nil {
+			_ = s.taskSvc.FinalizeBatchTrackingTask(context.WithoutCancel(ctx), parent.Task.ID, i, 1)
+			return result, createErr
+		}
+		childIDs[i] = child.Task.ID
+		result.Items[i].MachineID = id
+	}
+	if err := s.taskSvc.AttachChildTasks(ctx, parent.Task.ID, childIDs); err != nil {
+		_ = s.taskSvc.FinalizeBatchTrackingTask(context.WithoutCancel(ctx), parent.Task.ID, 0, len(ids))
+		return result, err
+	}
+
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	worker := func() {
+		defer wg.Done()
+		for index := range jobs {
+			childOpts := opts
+			childOpts.ParentTaskID = childIDs[index]
+			itemResult, deleteErr := s.DeleteMachineWithOptions(ctx, ids[index], childOpts)
+			failed := 0
+			if deleteErr != nil {
+				failed = 1
+				result.Items[index].Error = deleteErr.Error()
+			}
+			result.Items[index].Result = itemResult
+			if finalizeErr := s.taskSvc.FinalizeBatchTrackingTask(context.WithoutCancel(ctx), childIDs[index], len(itemResult.RelatedTaskIDs), failed); finalizeErr != nil && result.Items[index].Error == "" {
+				result.Items[index].Error = finalizeErr.Error()
+				failed = 1
+			}
+			mu.Lock()
+			if failed > 0 {
+				result.Failed++
+			} else {
+				result.Succeeded++
+			}
+			mu.Unlock()
+		}
+	}
+	workers := concurrency
+	if workers > len(ids) {
+		workers = len(ids)
+	}
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go worker()
+	}
+	for i := range ids {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	if err := s.taskSvc.FinalizeBatchTrackingTask(context.WithoutCancel(ctx), parent.Task.ID, len(childIDs), 0); err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
+// PrecheckDeleteMachine 同时读取 Manager 登记记录和目标机真实状态，不修改远端。
+func (s *MachineService) PrecheckDeleteMachine(ctx context.Context, machineID string) (DeleteMachinePrecheck, error) {
+	return s.precheckDeleteMachine(ctx, machineID, "")
+}
+
+func (s *MachineService) precheckDeleteMachine(ctx context.Context, machineID, parentTaskID string) (DeleteMachinePrecheck, error) {
+	machine, ok, err := s.machineRepo.GetByID(ctx, strings.TrimSpace(machineID))
+	if err != nil {
+		return DeleteMachinePrecheck{}, err
+	}
+	if !ok {
+		return DeleteMachinePrecheck{}, errors.New("machine not found")
+	}
+	report := DeleteMachinePrecheck{MachineID: machine.ID}
+	instancesByMachineID, err := s.mysqlInstancesByMachineID(ctx)
+	if err != nil {
+		return report, err
+	}
+	for _, instance := range instancesByMachineID[machine.ID] {
+		report.RegisteredMySQLPorts = append(report.RegisteredMySQLPorts, instance.Port)
+	}
+	if s.canUseAgentTask(ctx, machine.ID) {
+		output, taskID, probeErr := s.probeMySQLViaAgent(ctx, machine, parentTaskID)
+		if probeErr == nil {
+			report.RemoteChecked = true
+			report.ProbeChannel = "agent"
+			report.ProbeTaskID = taskID
+			report.MySQLResidues = parseMySQLResidues(output)
+			report.MySQLDetected = strings.Contains(output, "MYSQL_PRESENT") || len(report.MySQLResidues) > 0
+			auth, authErr := s.machineSSHAuth(ctx, machine)
+			if authErr != nil {
+				report.Warning = fmt.Sprintf("Agent 通道正常，但无法加载 SSH 凭证：%v。卸载 Agent 必须使用 SSH", authErr)
+			} else if sshErr := s.sshClient.TestConnection(ctx, machinedomain.Endpoint{IP: machine.IP, SSHPort: machine.SSHPort}, auth); sshErr != nil {
+				report.Warning = deleteSSHPrecheckError(machine, sshErr).Error()
+			} else {
+				report.SSHReachable = true
+			}
+			return report, nil
+		}
+		report.Warning = fmt.Sprintf("Agent 实机探测失败，正在尝试 SSH：%v", probeErr)
+	}
+	runner, ok := s.sshClient.(interface {
+		RunOutput(context.Context, machinedomain.Endpoint, machinedomain.SSHAuth, string) ([]byte, error)
+	})
+	if !ok {
+		report.Warning = "当前 SSH 客户端不支持远程探测；未登记不代表目标机没有 MySQL"
+		return report, nil
+	}
+	auth, err := s.machineSSHAuth(ctx, machine)
+	if err != nil {
+		report.Warning = fmt.Sprintf("无法加载 SSH 凭证：%v；未登记不代表目标机没有 MySQL", err)
+		return report, nil
+	}
+	output, err := runner.RunOutput(ctx, machinedomain.Endpoint{IP: machine.IP, SSHPort: machine.SSHPort}, auth, mysqlResidueDetectionCommand())
+	if err != nil {
+		report.Warning = fmt.Sprintf("目标机实机探测失败：%v；无法据此判定 MySQL 不存在", err)
+		return report, nil
+	}
+	report.SSHReachable = true
+	report.RemoteChecked = true
+	report.ProbeChannel = "ssh"
+	text := string(output)
+	report.MySQLResidues = parseMySQLResidues(text)
+	report.MySQLDetected = strings.Contains(text, "MYSQL_PRESENT") || len(report.MySQLResidues) > 0
+	return report, nil
+}
+
+func (s *MachineService) probeMySQLViaAgent(ctx context.Context, machine machinedomain.Machine, parentTaskID string) (string, string, error) {
+	if s.taskSvc == nil {
+		return "", "", errors.New("task service not configured")
+	}
+	detail, err := s.taskSvc.CreateExecTaskWithOptions(ctx, machine.IP, mysqlResidueDetectionCommand(), ExecTaskOptions{ParentTaskID: parentTaskID, Operation: "machine_delete_precheck", DisplayName: "删除机器前实机探测", StepName: "检查 MySQL 服务、进程、配置与路径"})
+	if err != nil {
+		return "", "", err
+	}
+	finished, err := s.taskSvc.WaitForTask(ctx, detail.Task.ID, 30*time.Second)
+	if err != nil {
+		return "", detail.Task.ID, err
+	}
+	_ = s.taskSvc.RedactExecTaskCommand(context.Background(), detail.Task.ID)
+	var output strings.Builder
+	for _, event := range finished.Events {
+		if strings.Contains(event.Content, mysqlResidueMarker) || strings.Contains(event.Content, "MYSQL_PRESENT") || strings.Contains(event.Content, "MYSQL_ABSENT") {
+			output.WriteString(event.Content)
+			output.WriteByte('\n')
+		}
+	}
+	if finished.Task.Status != taskdomain.StatusSuccess {
+		return output.String(), detail.Task.ID, fmt.Errorf("Agent probe task failed: %s", emptyTaskError(finished))
+	}
+	if strings.TrimSpace(output.String()) == "" {
+		return "", detail.Task.ID, errors.New("Agent probe returned no MySQL inspection output")
+	}
+	return output.String(), detail.Task.ID, nil
+}
+
+func (s *MachineService) machineSSHAuth(ctx context.Context, machine machinedomain.Machine) (machinedomain.SSHAuth, error) {
+	auth := machinedomain.SSHAuth{User: machine.SSHUser}
+	if strings.TrimSpace(machine.CredentialID) != "" && s.credRepo != nil {
+		credential, found, err := s.resolveCredential(ctx, machine.CredentialID)
+		if err != nil {
+			return auth, err
+		}
+		if found {
+			auth = machinedomain.SSHAuth{User: credential.SSHUser, Password: credential.SSHPassword, PrivateKey: credential.PrivateKey, Passphrase: credential.Passphrase}
+		}
+	}
+	if strings.TrimSpace(auth.User) == "" {
+		auth.User = "root"
+	}
+	return auth, nil
+}
+
 // DeleteMachineWithOptions 按用户选择先卸载 MySQL、再卸载 Agent，最后删除 Manager 本地记录。
 // MySQL 必须先于 Agent 清理，因为卸载任务需要在线 Agent 执行 systemd 与数据目录清理。
 func (s *MachineService) DeleteMachineWithOptions(ctx context.Context, machineID string, opts DeleteMachineOptions) (DeleteMachineResult, error) {
@@ -624,7 +962,27 @@ func (s *MachineService) DeleteMachineWithOptions(ctx context.Context, machineID
 		result.DetachedOnly = true
 		return result, nil
 	}
+	var deleteSSHAuth machinedomain.SSHAuth
+	if opts.DeleteAgent || opts.DeleteMySQL {
+		if s.sshClient == nil {
+			return result, errors.New("卸载前检查失败：Manager 未配置 SSH 客户端")
+		}
+		deleteSSHAuth, err = s.machineSSHAuth(ctx, machine)
+		if err != nil {
+			return result, fmt.Errorf("卸载前检查失败：无法加载目标机 SSH 凭证: %w", err)
+		}
+		endpoint := machinedomain.Endpoint{IP: machine.IP, SSHPort: machine.SSHPort}
+		if err := s.sshClient.TestConnection(ctx, endpoint, deleteSSHAuth); err != nil {
+			return result, deleteSSHPrecheckError(machine, err)
+		}
+	}
 	if opts.DeleteMySQL {
+		if precheck, precheckErr := s.precheckDeleteMachine(ctx, machineID, opts.ParentTaskID); precheckErr == nil {
+			result.MySQLResidues = append(result.MySQLResidues, precheck.MySQLResidues...)
+			if precheck.ProbeTaskID != "" {
+				result.RelatedTaskIDs = append(result.RelatedTaskIDs, precheck.ProbeTaskID)
+			}
+		}
 		instancesByMachineID, err := s.mysqlInstancesByMachineID(ctx)
 		if err != nil {
 			return result, err
@@ -632,11 +990,12 @@ func (s *MachineService) DeleteMachineWithOptions(ctx context.Context, machineID
 		for _, instance := range instancesByMachineID[machineID] {
 			result.MySQLPorts = append(result.MySQLPorts, instance.Port)
 			if s.canUseAgentTask(ctx, machineID) {
-				detail, err := s.taskSvc.CreateMySQLUninstallTask(ctx, taskusecase.CreateMySQLUninstallTaskRequest{Machine: machine.IP, Port: instance.Port})
+				detail, err := s.taskSvc.CreateMySQLUninstallTask(ctx, taskusecase.CreateMySQLUninstallTaskRequest{ParentTaskID: opts.ParentTaskID, Machine: machine.IP, Port: instance.Port})
 				if err != nil {
 					return result, fmt.Errorf("mysql %d uninstall task create failed: %w", instance.Port, err)
 				}
 				result.MySQLUninstallTask = append(result.MySQLUninstallTask, detail.Task.ID)
+				result.RelatedTaskIDs = append(result.RelatedTaskIDs, detail.Task.ID)
 				finished, err := s.taskSvc.WaitForTask(ctx, detail.Task.ID, 2*time.Minute)
 				if err != nil {
 					return result, fmt.Errorf("mysql %d uninstall wait failed: %w", instance.Port, err)
@@ -651,18 +1010,47 @@ func (s *MachineService) DeleteMachineWithOptions(ctx context.Context, machineID
 			}
 			result.MySQLSSHPorts = append(result.MySQLSSHPorts, instance.Port)
 		}
+		channel, taskID, err := s.cleanupMySQLResidues(ctx, machine, opts.ParentTaskID)
+		if err != nil {
+			return result, fmt.Errorf("MySQL residual cleanup failed: %w", err)
+		}
+		result.MySQLCleanupChannel = channel
+		result.MySQLCleanupTaskID = taskID
+		if taskID != "" {
+			result.RelatedTaskIDs = append(result.RelatedTaskIDs, taskID)
+		}
+		if residues, verifyErr := s.verifyMySQLRemovedViaSSH(ctx, machine); verifyErr != nil {
+			result.MySQLResidues = residues
+			return result, fmt.Errorf("MySQL cleanup verification failed: %w", verifyErr)
+		}
+		result.MySQLResidues = nil
+		result.MySQLVerified = true
 	}
 	if opts.DeleteAgent && s.agentSvc != nil {
-		if _, err := s.agentSvc.UninstallByIP(ctx, machine.IP); err != nil {
+		if _, err := s.agentSvc.UninstallByIPWithAuth(ctx, machine.IP, deleteSSHAuth); err != nil {
 			return result, fmt.Errorf("agent uninstall failed: %w", err)
 		}
 		result.AgentUninstalled = true
+		result.AgentVerified = true
 	}
 	if err := s.cleanupMachineLocalData(ctx, machineID, true); err != nil {
 		return result, err
 	}
 	result.LocalCleaned = true
 	return result, nil
+}
+
+func deleteSSHPrecheckError(machine machinedomain.Machine, err error) error {
+	detail := err.Error()
+	hint := "请检查目标机 SSH 服务、端口、防火墙、安全组以及 Manager 到目标网段的路由"
+	if strings.Contains(strings.ToLower(detail), "no route to host") {
+		hint = "Manager 无法路由到目标主机；请检查目标机是否开机、网段路由、防火墙或安全组"
+	} else if strings.Contains(strings.ToLower(detail), "connection refused") {
+		hint = "目标端口拒绝连接；请确认 sshd 已启动且 SSH 端口配置正确"
+	} else if strings.Contains(strings.ToLower(detail), "permission denied") || strings.Contains(strings.ToLower(detail), "unable to authenticate") {
+		hint = "SSH 认证失败；请在机器与凭证页面更新该机器关联的 SSH 凭证"
+	}
+	return fmt.Errorf("卸载前检查失败：目标机 %s:%d 的 SSH 通道不可用。%s。原始错误：%s", machine.IP, machine.SSHPort, hint, detail)
 }
 
 // AssignMachineCluster 将机器分配到指定集群，分配后自动安装 Agent 并采集静态信息。
@@ -814,6 +1202,11 @@ func (s *MachineService) CleanupCluster(ctx context.Context, name string) (Clust
 				item.Error = appendCleanupError(item.Error, fmt.Sprintf("MySQL %d 卸载失败: %s", instance.Port, emptyTaskError(finished)))
 			}
 		}
+		if item.Error == "" {
+			if _, _, err := s.cleanupMySQLResidues(ctx, machine, ""); err != nil {
+				item.Error = appendCleanupError(item.Error, fmt.Sprintf("MySQL 残留清理失败: %v", err))
+			}
+		}
 		if item.Error == "" && s.agentSvc != nil {
 			if _, err := s.agentSvc.UninstallByIP(ctx, machine.IP); err != nil {
 				item.Error = appendCleanupError(item.Error, fmt.Sprintf("Agent 卸载失败: %v", err))
@@ -948,6 +1341,82 @@ func (s *MachineService) uninstallMySQLViaSSH(ctx context.Context, machine machi
 	return nil
 }
 
+func (s *MachineService) cleanupMySQLResiduesViaSSH(ctx context.Context, machine machinedomain.Machine) error {
+	runner, ok := s.sshClient.(interface {
+		Run(context.Context, machinedomain.Endpoint, machinedomain.SSHAuth, string) error
+	})
+	if !ok {
+		return errors.New("SSH client does not support remote commands")
+	}
+	auth := machinedomain.SSHAuth{User: machine.SSHUser}
+	if strings.TrimSpace(machine.CredentialID) != "" && s.credRepo != nil {
+		credential, found, err := s.resolveCredential(ctx, machine.CredentialID)
+		if err != nil {
+			return err
+		}
+		if found {
+			auth = machinedomain.SSHAuth{User: credential.SSHUser, Password: credential.SSHPassword, PrivateKey: credential.PrivateKey, Passphrase: credential.Passphrase}
+		}
+	}
+	if strings.TrimSpace(auth.User) == "" {
+		auth.User = "root"
+	}
+	return runner.Run(ctx, machinedomain.Endpoint{IP: machine.IP, SSHPort: machine.SSHPort}, auth, mysqlResidueCleanupCommand())
+}
+
+func (s *MachineService) cleanupMySQLResidues(ctx context.Context, machine machinedomain.Machine, parentTaskID string) (string, string, error) {
+	if s.canUseAgentTask(ctx, machine.ID) {
+		detail, err := s.taskSvc.CreateExecTaskWithOptions(ctx, machine.IP, mysqlResidueCleanupCommand(), ExecTaskOptions{ParentTaskID: parentTaskID, Operation: "machine_delete_mysql_cleanup", DisplayName: "删除机器前清理 MySQL", StepName: "停止 MySQL 并清理 systemd、配置和数据路径"})
+		if err == nil {
+			finished, waitErr := s.taskSvc.WaitForTask(ctx, detail.Task.ID, 2*time.Minute)
+			_ = s.taskSvc.RedactExecTaskCommand(context.Background(), detail.Task.ID)
+			if waitErr == nil && finished.Task.Status == taskdomain.StatusSuccess {
+				return "agent", detail.Task.ID, nil
+			}
+			if waitErr != nil {
+				return "agent", detail.Task.ID, waitErr
+			}
+			return "agent", detail.Task.ID, fmt.Errorf("Agent cleanup task failed: %s", emptyTaskError(finished))
+		}
+	}
+	if err := s.cleanupMySQLResiduesViaSSH(ctx, machine); err != nil {
+		return "ssh", "", err
+	}
+	return "ssh", "", nil
+}
+
+// verifyMySQLRemovedViaSSH performs a fresh inspection after cleanup. Platform
+// records must not be deleted while a service, process, configuration, binary,
+// or data path is still present on the target machine.
+func (s *MachineService) verifyMySQLRemovedViaSSH(ctx context.Context, machine machinedomain.Machine) ([]string, error) {
+	runner, ok := s.sshClient.(interface {
+		RunOutput(context.Context, machinedomain.Endpoint, machinedomain.SSHAuth, string) ([]byte, error)
+	})
+	if !ok {
+		return nil, errors.New("SSH client does not support post-cleanup inspection")
+	}
+	auth, err := s.machineSSHAuth(ctx, machine)
+	if err != nil {
+		return nil, fmt.Errorf("load SSH credential: %w", err)
+	}
+	output, err := runner.RunOutput(ctx, machinedomain.Endpoint{IP: machine.IP, SSHPort: machine.SSHPort}, auth, mysqlResidueDetectionCommand())
+	if err != nil {
+		return nil, fmt.Errorf("inspect target after cleanup: %w", err)
+	}
+	residues := parseMySQLResidues(string(output))
+	if strings.Contains(string(output), "MYSQL_PRESENT") || len(residues) > 0 {
+		detail := strings.Join(residues, "、")
+		if detail == "" {
+			detail = "检测命令仍报告 MYSQL_PRESENT"
+		}
+		return residues, fmt.Errorf("目标机仍存在 MySQL 残留：%s", detail)
+	}
+	if !strings.Contains(string(output), "MYSQL_ABSENT") {
+		return nil, errors.New("复检没有返回明确的 MYSQL_ABSENT 结果")
+	}
+	return nil, nil
+}
+
 func (s *MachineService) cleanupMachineLocalData(ctx context.Context, machineID string, deleteMachine bool) error {
 	if s.agentSvc != nil {
 		if s.agentSvc.heartbeat != nil {
@@ -1065,6 +1534,18 @@ func (s *MachineService) GetStaticInfo(ctx context.Context, machineSelector stri
 	}
 	if !ok {
 		return collectdomain.StaticInfo{}, errors.New("static info not found")
+	}
+	// Older static snapshots do not contain architecture. Merge the machine
+	// inventory snapshot so install compatibility can be checked before submit.
+	if s.infoRepo != nil {
+		if inventory, found, inventoryErr := s.infoRepo.Get(ctx, machine.ID); inventoryErr == nil && found {
+			if item.Host.Arch == "" {
+				item.Host.Arch = inventory.Arch
+			}
+			if item.Host.GlibcVersion == "" {
+				item.Host.GlibcVersion = inventory.GlibcVersion
+			}
+		}
 	}
 	return item, nil
 }

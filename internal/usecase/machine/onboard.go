@@ -10,7 +10,7 @@ import (
 
 // SSHClient 定义了 SSH 连接检查接口，用于验证 SSH 信任关系和密码连接。
 type SSHClient interface {
-	CheckTrustConnection(ctx context.Context, endpoint machinedomain.Endpoint, user string) (bool, error)
+	CheckTrustConnection(ctx context.Context, endpoint machinedomain.Endpoint, auth machinedomain.SSHAuth) (bool, error)
 	TestConnection(ctx context.Context, endpoint machinedomain.Endpoint, auth machinedomain.SSHAuth) error
 }
 
@@ -94,7 +94,8 @@ func (u *OnboardUsecase) Execute(ctx context.Context, req OnboardMachineRequest)
 
 	endpoint := machinedomain.Endpoint{IP: req.IP, SSHPort: req.SSHPort}
 	password := strings.TrimSpace(req.SSHPassword)
-	trustReady, err := u.sshClient.CheckTrustConnection(ctx, endpoint, req.SSHUser)
+	auth := machinedomain.SSHAuth{User: req.SSHUser, Password: password, PrivateKey: req.SSHPrivateKey, Passphrase: req.SSHPassphrase}
+	trustReady, err := u.sshClient.CheckTrustConnection(ctx, endpoint, auth)
 	if err != nil {
 		return OnboardMachineResponse{}, err
 	}
@@ -132,7 +133,6 @@ func (u *OnboardUsecase) Execute(ctx context.Context, req OnboardMachineRequest)
 		if password == "" && strings.TrimSpace(req.SSHPrivateKey) == "" {
 			return OnboardMachineResponse{}, errors.New("ssh trust is not ready, please provide ssh_password or ssh_private_key")
 		}
-		auth := machinedomain.SSHAuth{User: req.SSHUser, Password: password, PrivateKey: req.SSHPrivateKey, Passphrase: req.SSHPassphrase}
 		if err := u.sshClient.TestConnection(ctx, endpoint, auth); err != nil {
 			_ = u.machineRepo.UpdateStatus(ctx, saved.ID, machinedomain.StatusSSHFailed, err.Error())
 			return OnboardMachineResponse{}, err
@@ -146,7 +146,7 @@ func (u *OnboardUsecase) Execute(ctx context.Context, req OnboardMachineRequest)
 			_ = u.machineRepo.UpdateStatus(ctx, saved.ID, machinedomain.StatusSSHFailed, err.Error())
 			return OnboardMachineResponse{}, err
 		}
-		trustReady, err = u.sshClient.CheckTrustConnection(ctx, endpoint, req.SSHUser)
+		trustReady, err = u.sshClient.CheckTrustConnection(ctx, endpoint, auth)
 		if err != nil {
 			_ = u.machineRepo.UpdateStatus(ctx, saved.ID, machinedomain.StatusSSHFailed, err.Error())
 			return OnboardMachineResponse{}, err

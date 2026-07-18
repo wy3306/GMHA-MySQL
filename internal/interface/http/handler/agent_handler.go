@@ -55,6 +55,7 @@ func (h *AgentHandler) HandleAgents(w http.ResponseWriter, r *http.Request) {
 		}
 		keyword := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("keyword")))
 		status := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("status")))
+		version := strings.TrimSpace(r.URL.Query().Get("version"))
 		filtered := make([]app.AgentView, 0, len(items))
 		for _, item := range items {
 			text := strings.ToLower(strings.Join([]string{item.Name, item.IP, item.Cluster, item.InstallState, item.HeartbeatState, item.OverallHealth, item.RecoveryState}, " "))
@@ -74,6 +75,9 @@ func (h *AgentHandler) HandleAgents(w http.ResponseWriter, r *http.Request) {
 				} else if state != status {
 					continue
 				}
+			}
+			if version != "" && version != "all" && !strings.EqualFold(strings.TrimPrefix(item.Version, "V"), strings.TrimPrefix(version, "V")) {
+				continue
 			}
 			filtered = append(filtered, item)
 		}
@@ -185,6 +189,26 @@ func (h *AgentHandler) HandleUpgrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// HandleDetectVersion detects the version of an installed Agent over SSH and
+// updates the Agent record even when the Agent heartbeat is unavailable.
+func (h *AgentHandler) HandleDetectVersion(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var req upgradeAgentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	view, err := h.service.DetectVersionByIP(r.Context(), req.IP)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
 }
 
 // HandleRepairMySQLConfig 调用 CLI 同一内核能力，修复 Agent 的 MySQL 采集配置。

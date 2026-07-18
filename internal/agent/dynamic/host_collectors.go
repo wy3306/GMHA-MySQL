@@ -327,6 +327,95 @@ func collectInodeUsage(ctx context.Context, spec dyndomain.CollectTaskSpec) (any
 	return out, dyndomain.ValueTypeArray, nil
 }
 
+func collectFilesystemUsage(ctx context.Context, spec dyndomain.CollectTaskSpec) (any, string, error) {
+	_ = ctx
+	_ = spec
+	mounts, err := mountPoints()
+	if err != nil {
+		return nil, dyndomain.ValueTypeArray, err
+	}
+	out := make([]map[string]any, 0, len(mounts))
+	seen := make(map[string]bool)
+	for _, mount := range mounts {
+		if seen[mount] {
+			continue
+		}
+		seen[mount] = true
+		var st syscall.Statfs_t
+		if err := syscall.Statfs(mount, &st); err != nil || st.Blocks == 0 {
+			continue
+		}
+		total := st.Blocks * uint64(st.Bsize)
+		available := st.Bavail * uint64(st.Bsize)
+		used := total - available
+		out = append(out, map[string]any{
+			"mount": mount, "total_bytes": total, "used_bytes": used,
+			"available_bytes": available, "used_percent": round2(100 * float64(used) / float64(total)),
+		})
+	}
+	return out, dyndomain.ValueTypeArray, nil
+}
+
+// NetworkCollector calculates per-interface receive/transmit bandwidth from
+// /proc/net/dev counters. Loopback is excluded from the cluster bandwidth sum.
+type NetworkCollector struct {
+	mu   sync.Mutex
+	prev map[string]networkStat
+	at   time.Time
+}
+
+type networkStat struct{ rx, tx uint64 }
+
+func NewNetworkCollector() *NetworkCollector { return &NetworkCollector{} }
+func (c *NetworkCollector) Name() string     { return "network_throughput" }
+
+func (c *NetworkCollector) Collect(ctx context.Context, spec dyndomain.CollectTaskSpec) dyndomain.MetricResult {
+	_ = ctx
+	started := time.Now()
+	cur, err := readNetworkStats()
+	if err != nil {
+		return metricError(spec, err, time.Since(started).Milliseconds())
+	}
+	now := time.Now()
+	c.mu.Lock()
+	prev, prevAt := c.prev, c.at
+	c.prev, c.at = cur, now
+	c.mu.Unlock()
+	out := map[string]any{}
+	seconds := now.Sub(prevAt).Seconds()
+	if prev != nil && seconds > 0 {
+		for name, item := range cur {
+			old, ok := prev[name]
+			if !ok || item.rx < old.rx || item.tx < old.tx {
+				continue
+			}
+			out[name] = map[string]any{"receive_bytes_sec": round2(float64(item.rx-old.rx) / seconds), "transmit_bytes_sec": round2(float64(item.tx-old.tx) / seconds)}
+		}
+	}
+	return metricOK(spec, "host", dyndomain.ValueTypeMap, out, started)
+}
+
+func readNetworkStats() (map[string]networkStat, error) {
+	data, err := os.ReadFile("/proc/net/dev")
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]networkStat{}
+	for _, line := range strings.Split(string(data), "\n") {
+		name, values, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		name = strings.TrimSpace(name)
+		fields := strings.Fields(values)
+		if name == "" || name == "lo" || len(fields) < 9 {
+			continue
+		}
+		out[name] = networkStat{rx: parseUint(fields[0]), tx: parseUint(fields[8])}
+	}
+	return out, nil
+}
+
 func mountPoints() ([]string, error) {
 	data, err := os.ReadFile("/proc/mounts")
 	if err != nil {

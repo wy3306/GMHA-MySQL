@@ -91,6 +91,9 @@ func (c *MySQLCommand) Run(args []string) error {
 		pluginDir := fs.String("plugin-dir", "", "插件目录，默认 /usr/local/mysql/lib/plugin")
 		rootPassword := fs.String("root-password", "", "root 密码")
 		profile := fs.String("profile", "prod", "参数 profile")
+		installPTTools := fs.Bool("install-pt-tools", false, "安装 Percona Toolkit 及依赖")
+		installXtraBackup := fs.Bool("install-xtrabackup", false, "安装与 MySQL 版本匹配的 Percona XtraBackup")
+		memoryAllocator := fs.String("memory-allocator", "system", "内存分配器：system 或 tcmalloc")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -101,25 +104,28 @@ func (c *MySQLCommand) Run(args []string) error {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 		result, err := c.core.TaskService.CreateClusterMySQLInstallTasks(ctx, app.ClusterMySQLInstallRequest{
-			Cluster:          *cluster,
-			Port:             *port,
-			ServerIDStart:    *serverIDStart,
-			MySQLUser:        *mysqlUser,
-			InstanceDir:      *instanceDir,
-			DataDir:          *dataDir,
-			BinlogDir:        *binlogDir,
-			RedoDir:          *redoDir,
-			UndoDir:          *undoDir,
-			TmpDir:           *tmpDir,
-			BaseDir:          *baseDir,
-			MyCnfPath:        *myCnfPath,
-			SocketPath:       *socketPath,
-			ErrorLog:         *errorLog,
-			PIDFile:          *pidFile,
-			CharacterSetsDir: *characterSetsDir,
-			PluginDir:        *pluginDir,
-			RootPassword:     *rootPassword,
-			Profile:          *profile,
+			Cluster:           *cluster,
+			Port:              *port,
+			ServerIDStart:     *serverIDStart,
+			MySQLUser:         *mysqlUser,
+			InstanceDir:       *instanceDir,
+			DataDir:           *dataDir,
+			BinlogDir:         *binlogDir,
+			RedoDir:           *redoDir,
+			UndoDir:           *undoDir,
+			TmpDir:            *tmpDir,
+			BaseDir:           *baseDir,
+			MyCnfPath:         *myCnfPath,
+			SocketPath:        *socketPath,
+			ErrorLog:          *errorLog,
+			PIDFile:           *pidFile,
+			CharacterSetsDir:  *characterSetsDir,
+			PluginDir:         *pluginDir,
+			RootPassword:      *rootPassword,
+			Profile:           *profile,
+			InstallPTTools:    *installPTTools,
+			InstallXtraBackup: *installXtraBackup,
+			MemoryAllocator:   *memoryAllocator,
 		})
 		if err != nil {
 			return err
@@ -146,6 +152,9 @@ func (c *MySQLCommand) Run(args []string) error {
 		pluginDir := fs.String("plugin-dir", "", "插件目录，默认 /usr/local/mysql/lib/plugin")
 		rootPassword := fs.String("root-password", "", "root 密码")
 		profile := fs.String("profile", "default", "参数 profile")
+		installPTTools := fs.Bool("install-pt-tools", false, "安装 Percona Toolkit 及依赖")
+		installXtraBackup := fs.Bool("install-xtrabackup", false, "安装与 MySQL 版本匹配的 Percona XtraBackup")
+		memoryAllocator := fs.String("memory-allocator", "system", "内存分配器：system 或 tcmalloc")
 		monitorEnabled := fs.Bool("monitor-enabled", true, "是否初始化 monitor 账号")
 		monitorUser := fs.String("monitor-user", "", "monitor 用户名，默认 monitor")
 		monitorPassword := fs.String("monitor-password", "", "monitor 密码，默认 3306niubi")
@@ -165,25 +174,28 @@ func (c *MySQLCommand) Run(args []string) error {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 		item, err := c.core.TaskService.CreateMySQLInstallTask(ctx, taskusecase.CreateMySQLInstallTaskRequest{
-			Machine:          *machine,
-			Port:             *port,
-			ServerID:         *serverID,
-			MySQLUser:        *mysqlUser,
-			InstanceDir:      *instanceDir,
-			DataDir:          *dataDir,
-			BinlogDir:        *binlogDir,
-			RedoDir:          *redoDir,
-			UndoDir:          *undoDir,
-			TmpDir:           *tmpDir,
-			BaseDir:          *baseDir,
-			MyCnfPath:        *myCnfPath,
-			SocketPath:       *socketPath,
-			ErrorLog:         *errorLog,
-			PIDFile:          *pidFile,
-			CharacterSetsDir: *characterSetsDir,
-			PluginDir:        *pluginDir,
-			RootPassword:     *rootPassword,
-			Profile:          *profile,
+			Machine:           *machine,
+			Port:              *port,
+			ServerID:          *serverID,
+			MySQLUser:         *mysqlUser,
+			InstanceDir:       *instanceDir,
+			DataDir:           *dataDir,
+			BinlogDir:         *binlogDir,
+			RedoDir:           *redoDir,
+			UndoDir:           *undoDir,
+			TmpDir:            *tmpDir,
+			BaseDir:           *baseDir,
+			MyCnfPath:         *myCnfPath,
+			SocketPath:        *socketPath,
+			ErrorLog:          *errorLog,
+			PIDFile:           *pidFile,
+			CharacterSetsDir:  *characterSetsDir,
+			PluginDir:         *pluginDir,
+			RootPassword:      *rootPassword,
+			Profile:           *profile,
+			InstallPTTools:    *installPTTools,
+			InstallXtraBackup: *installXtraBackup,
+			MemoryAllocator:   *memoryAllocator,
 			Accounts: []taskdomain.MySQLAccountSpec{
 				{Role: "monitor", Username: *monitorUser, Password: *monitorPassword, Host: *monitorHost, Enabled: *monitorEnabled},
 				{Role: "mha", Username: *mhaUser, Password: *mhaPassword, Host: *mhaHost, Enabled: *mhaEnabled},

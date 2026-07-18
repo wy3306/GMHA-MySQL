@@ -107,6 +107,27 @@ type StateEvent struct {
 	CreatedAt    time.Time
 }
 
+// MetricSnapshot 保存一次 Agent 心跳携带的动态指标。最新状态用于状态机，
+// 快照则用于集群概览的近期趋势；二者分开可避免趋势查询拖慢心跳状态读取。
+type MetricSnapshot struct {
+	ID          int64
+	AgentID     string
+	MachineID   string
+	ClusterID   string
+	Metrics     []dynamicdomain.MetricResult
+	CollectedAt time.Time
+}
+
+// MetricSnapshotWriter / MetricSnapshotReader 是可选仓储能力。使用小接口可让
+// 内存测试仓储和旧的外部实现继续只实现核心 Repository。
+type MetricSnapshotWriter interface {
+	AppendMetricSnapshot(ctx context.Context, item MetricSnapshot) error
+}
+
+type MetricSnapshotReader interface {
+	ListMetricSnapshots(ctx context.Context, clusterID string, since time.Time, limit int) ([]MetricSnapshot, error)
+}
+
 // Repository 定义了心跳领域的仓储接口，用于持久化心跳状态和事件。
 type Repository interface {
 	UpsertLatestStatus(ctx context.Context, item LatestStatus) error

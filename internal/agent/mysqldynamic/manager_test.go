@@ -69,3 +69,30 @@ func TestRegistryAndHotUpdate(t *testing.T) {
 		t.Fatalf("expected disabled collector to stop")
 	}
 }
+
+func TestEmptyInstanceListClearsCachedMySQLMetrics(t *testing.T) {
+	var count atomic.Int64
+	hasInstance := true
+	reg := NewCollectorRegistry()
+	reg.Register("a", func() MySQLDynamicCollector { return fakeMySQLCollector{name: "a", count: &count} })
+	mgr := NewMultiInstanceMySQLDynamicCollectManager("agent-1", reg, func() ([]*CollectEnv, error) {
+		if !hasInstance {
+			return []*CollectEnv{}, nil
+		}
+		return []*CollectEnv{{Instance: "port:3306", Connect: MySQLConnectInfo{Port: 3306}}}, nil
+	})
+	spec := dyndomain.CollectTaskSpec{Name: "a", Enabled: true, Type: dyndomain.TaskTypeBuiltin, Category: "custom"}
+	collector, err := reg.Create("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.collectAndStore(context.Background(), spec, collector)
+	if _, ok := mgr.GetLastMetricResult("a"); !ok {
+		t.Fatal("expected cached instance metric")
+	}
+	hasInstance = false
+	mgr.collectAndStore(context.Background(), spec, collector)
+	if _, ok := mgr.GetLastMetricResult("a"); ok {
+		t.Fatal("metric from removed mysql instance must not remain in heartbeat batch")
+	}
+}

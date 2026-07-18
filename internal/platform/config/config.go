@@ -8,6 +8,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"gmha/internal/buildinfo"
 )
 
 // ManagerConfig 是管理端（Manager）的配置结构体，包含监听地址、数据库路径、Agent 部署参数等。
@@ -64,7 +66,7 @@ func LoadAgentConfig(path string) (AgentConfig, error) {
 	defer file.Close()
 
 	cfg := AgentConfig{
-		Version:           "0.1.0",
+		Version:           buildinfo.CurrentVersion(),
 		HeartbeatInterval: 15 * time.Second,
 	}
 

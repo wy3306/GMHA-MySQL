@@ -22,7 +22,7 @@ import (
 
 const defaultPackageRoot = "software"
 
-var packageCategories = []string{"mysql", "percona-toolkit", "keepalived", "mysql-router", "xtrabackup", "binlog2sql", "mycat", "proxysql", "sysbench", "other"}
+var packageCategories = []string{"gmha-manager", "gmha-agent", "mysql", "percona-toolkit", "mysql-router", "xtrabackup", "binlog2sql", "mycat", "proxysql", "sysbench", "other"}
 
 const packageIndexName = ".gmha-package-index.json"
 
@@ -388,6 +388,60 @@ func (s *PackageService) ResolvePerconaToolkitPackage(arch string) (string, erro
 	return "", fmt.Errorf("no local Percona Toolkit package matches architecture %s", arch)
 }
 
+// ResolveXtraBackupPackage selects a Manager-hosted XtraBackup binary archive
+// whose release series matches the MySQL server and whose architecture/glibc
+// requirements are compatible with the target host.
+func (s *PackageService) ResolveXtraBackupPackage(mysqlVersion, arch, glibcVersion string) (string, error) {
+	items, err := s.List("xtrabackup", "")
+	if err != nil {
+		return "", err
+	}
+	seriesParts := strings.Split(strings.TrimSpace(mysqlVersion), ".")
+	if len(seriesParts) < 2 {
+		return "", fmt.Errorf("cannot determine XtraBackup series for MySQL %s", mysqlVersion)
+	}
+	series := seriesParts[0] + "." + seriesParts[1]
+	arch = normalizePackageArch(arch)
+	targetGlibc := parsePackageGlibc(glibcVersion)
+	candidates := make([]PackageItem, 0)
+	for _, item := range items {
+		if normalizePackageArch(item.Arch) != arch || !strings.HasPrefix(item.Version, series+".") {
+			continue
+		}
+		if item.Format != "tar.gz" && item.Format != "tgz" {
+			continue
+		}
+		requiredGlibc := parsePackageGlibc(item.Name)
+		if targetGlibc > 0 && requiredGlibc > targetGlibc {
+			continue
+		}
+		candidates = append(candidates, item)
+	}
+	if len(candidates) == 0 {
+		return "", fmt.Errorf("no local XtraBackup %s package matches architecture %s and glibc %s", series, arch, glibcVersion)
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].Version == candidates[j].Version {
+			return parsePackageGlibc(candidates[i].Name) > parsePackageGlibc(candidates[j].Name)
+		}
+		return candidates[i].Version > candidates[j].Version
+	})
+	return candidates[0].Name, nil
+}
+
+func parsePackageGlibc(value string) int {
+	if index := strings.LastIndex(strings.ToLower(value), "glibc"); index >= 0 {
+		value = value[index+len("glibc"):]
+	}
+	match := regexp.MustCompile(`^\s*([0-9]+)\.([0-9]+)`).FindStringSubmatch(value)
+	if len(match) != 3 {
+		return 0
+	}
+	var major, minor int
+	_, _ = fmt.Sscanf(match[1]+"."+match[2], "%d.%d", &major, &minor)
+	return major*1000 + minor
+}
+
 func normalizePackageArch(arch string) string {
 	switch strings.ToLower(strings.TrimSpace(arch)) {
 	case "amd64", "x64", "x86_64":
@@ -401,7 +455,21 @@ func normalizePackageArch(arch string) string {
 
 // SaveUpload 将上传内容流式写入分类目录，不允许路径穿越或覆盖已有文件。
 func (s *PackageService) SaveUpload(category, arch, name string, content io.Reader) (PackageItem, error) {
-	return s.save(category, name, content, packageMetadata{Arch: arch, Version: detectPackageVersion(name)})
+	return s.SaveUploadWithMetadata(category, arch, name, "", "", content)
+}
+
+// SaveUploadWithMetadata 保存手工上传的软件包，并优先使用用户确认的版本和说明。
+// Manager 与 Agent 升级必须具备明确版本，避免文件成功入库后无法做升级/降级判断。
+func (s *PackageService) SaveUploadWithMetadata(category, arch, name, version, description string, content io.Reader) (PackageItem, error) {
+	category = strings.TrimSpace(category)
+	version = strings.TrimSpace(version)
+	if version == "" {
+		version = detectPackageVersion(name)
+	}
+	if (category == "gmha-manager" || category == "gmha-agent") && version == "" {
+		return PackageItem{}, errors.New("Manager/Agent package version is required; enter Vx.y.z or include it in the file name")
+	}
+	return s.save(category, name, content, packageMetadata{Arch: arch, Version: version, Description: strings.TrimSpace(description)})
 }
 
 // FetchFromURL 下载 HTTP(S) 安装包到分类目录，适用于官方或第三方发布地址。

@@ -25,8 +25,15 @@ func TestRegistryAndHotUpdate(t *testing.T) {
 	if _, ok := mgr.runners["a"]; !ok {
 		t.Fatal("collector a not started")
 	}
+	time.Sleep(20 * time.Millisecond)
+	if _, ok := mgr.GetLastMetricResult("a"); !ok {
+		t.Fatal("collector a did not publish a result")
+	}
 	mgr.UpdateCollectConfig(ctx, dyndomain.DynamicCollectConfig{Enabled: true, Version: "v2", Tasks: []dyndomain.CollectTaskSpec{{Name: "a", Enabled: false, Type: dyndomain.TaskTypeBuiltin, IntervalSeconds: 1}}})
 	if _, ok := mgr.runners["a"]; ok {
 		t.Fatal("collector a should be stopped after disabling")
+	}
+	if _, ok := mgr.GetLastMetricResult("a"); ok {
+		t.Fatal("disabled collector result must not remain in heartbeat batch")
 	}
 }

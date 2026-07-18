@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	dyndomain "gmha/internal/domain/dynamic"
@@ -67,6 +68,10 @@ func (c *BuiltinCollector) collect(ctx context.Context, env *CollectEnv, spec dy
 		return collectVariableBool(ctx, env, "super_read_only")
 	case "mysql_threads_running":
 		return collectStatus(ctx, env, "Threads_running")
+	case "mysql_tps":
+		// TPS includes both committed and rolled-back transactions. The Manager
+		// derives the per-second rate from this monotonic cumulative counter.
+		return collectStatusSum(ctx, env, "Com_commit", "Com_rollback")
 	case "mysql_replication_basic_status", "mysql_replication_thread_status":
 		return collectReplicationBasic(ctx, env)
 	case "mysql_replica_io_thread":
@@ -103,6 +108,16 @@ func (c *BuiltinCollector) collect(ctx context.Context, env *CollectEnv, spec dy
 		return collectRatio(ctx, env, statusValue("Opened_tables"), statusSum("Open_tables", "Opened_tables"))
 	case "mysql_thread_cache_hit_ratio":
 		return collectThreadCacheHitRatio(ctx, env)
+	case "mysql_data_disk_usage":
+		return collectPathDiskUsage(env.Static.DataDir)
+	case "mysql_binlog_disk_usage":
+		return collectPathDiskUsage(env.Static.BinlogDir)
+	case "mysql_redo_disk_usage":
+		return collectPathDiskUsage(env.Static.RedoDir)
+	case "mysql_tmp_disk_usage":
+		return collectPathDiskUsage(env.Static.TmpDir)
+	case "mysql_undo_disk_usage":
+		return collectPathDiskUsage(env.Static.UndoDir)
 	}
 	if statusName := strings.TrimSpace(spec.Params["status"]); statusName != "" {
 		if noDBCredential(env) {
@@ -129,6 +144,43 @@ func (c *BuiltinCollector) collect(ctx context.Context, env *CollectEnv, spec dy
 		return collectReplicaField(ctx, env, spec, replicaField, spec.Params["slave_field"])
 	}
 	return skippedValue("collector not implemented yet"), nil
+}
+
+func collectStatusSum(ctx context.Context, env *CollectEnv, names ...string) (float64, error) {
+	var total float64
+	for _, name := range names {
+		value, err := collectStatus(ctx, env, name)
+		if err != nil {
+			return 0, err
+		}
+		number, ok := toFloat(value)
+		if !ok {
+			return 0, nil
+		}
+		total += number
+	}
+	return total, nil
+}
+
+func collectPathDiskUsage(path string) (map[string]any, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return map[string]any{"path": "", "available": false}, nil
+	}
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(path, &stat); err != nil {
+		return nil, err
+	}
+	total := stat.Blocks * uint64(stat.Bsize)
+	available := stat.Bavail * uint64(stat.Bsize)
+	if total == 0 {
+		return map[string]any{"path": path, "available": false}, nil
+	}
+	used := total - available
+	return map[string]any{
+		"path": path, "available": true, "total_bytes": total, "used_bytes": used,
+		"available_bytes": available, "used_percent": float64(used) * 100 / float64(total),
+	}, nil
 }
 
 func collectConnectivity(ctx context.Context, env *CollectEnv) (map[string]any, error) {

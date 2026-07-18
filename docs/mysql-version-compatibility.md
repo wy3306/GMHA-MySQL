@@ -32,6 +32,16 @@ mysqld --defaults-file=<my.cnf> --validate-config
 
 Percona Toolkit 不属于 MySQL Server 本体。当前自动 PT 安装只对 8.x 开放；9.x 仍可正常安装 MySQL，但页面会禁用自动 PT 安装，避免把工具链兼容性误当成 Server 兼容性。
 
+## 版本升级门禁
+
+GMHA 安装 MySQL 时会把安装包解压到独立版本目录，并让实例 `base_dir` 指向该目录的软链接。升级继续使用这一布局：下载并解压目标版本后，通过临时链接加 `mv -T` 原子替换活动链接，再重启实例。
+
+升级前必须先生成与“实例、端口、目标安装包”绑定的预检报告。Agent 优先调用 MySQL Shell Upgrade Checker；主机未安装 `mysqlsh` 时回退到 MySQL 官方 `mysqlcheck --check-upgrade`。报告同时记录软链接目标、实际运行版本、配置验证、磁盘空间、活动事务和复制状态。报告成功后 30 分钟内有效；失败时可由用户显式选择强制升级。
+
+升级接口不接收 MySQL 用户名或密码。Agent 从本机实例管理配置读取管理凭据，创建权限为 `0600` 的临时 defaults file，命令执行完成后立即删除。
+
+软链接回退只在新版本尚未启动时自动执行。新版本一旦启动，MySQL 可能已经完成数据字典升级；此时 GMHA 不会使用旧二进制打开新数据目录，而是保留新版本并要求人工处理或从已验证的物理备份恢复。
+
 ## 官方依据
 
 - [MySQL Releases: Innovation and LTS](https://dev.mysql.com/doc/refman/9.7/en/mysql-releases.html)

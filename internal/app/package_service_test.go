@@ -78,6 +78,58 @@ func TestResolvePerconaToolkitPackageRejectsMissingArchitecture(t *testing.T) {
 	}
 }
 
+func TestResolveXtraBackupPackageMatchesSeriesArchitectureAndGlibc(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "xtrabackup")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{
+		"percona-xtrabackup-8.0.35-36-Linux-x86_64.glibc2.28-minimal.tar.gz",
+		"percona-xtrabackup-8.0.34-29-Linux-x86_64.glibc2.17-minimal.tar.gz",
+		"percona-xtrabackup-8.4.0-6-Linux-x86_64.glibc2.28-minimal.tar.gz",
+		"percona-xtrabackup-8.0.35-36-Linux-aarch64.glibc2.28-minimal.tar.gz",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("package"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service := &PackageService{storagePath: root}
+	name, err := service.ResolveXtraBackupPackage("8.0.44", "amd64", "2.31")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "percona-xtrabackup-8.0.35-36-Linux-x86_64.glibc2.28-minimal.tar.gz" {
+		t.Fatalf("selected package %q", name)
+	}
+	name, err = service.ResolveXtraBackupPackage("8.0.44", "x86_64", "2.17")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(name, "8.0.34-29") {
+		t.Fatalf("expected glibc 2.17 package, got %q", name)
+	}
+}
+
+func TestResolveXtraBackupPackageRejectsIncompatibleTarget(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "xtrabackup")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	name := "percona-xtrabackup-8.4.0-6-Linux-x86_64.glibc2.28-minimal.tar.gz"
+	if err := os.WriteFile(filepath.Join(dir, name), []byte("package"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	service := &PackageService{storagePath: root}
+	if _, err := service.ResolveXtraBackupPackage("8.0.44", "x86_64", "2.31"); err == nil {
+		t.Fatal("expected MySQL/XtraBackup series mismatch")
+	}
+	if _, err := service.ResolveXtraBackupPackage("8.4.10", "x86_64", "2.17"); err == nil {
+		t.Fatal("expected glibc mismatch")
+	}
+}
+
 func TestPackageUploadPersistsArchitectureAndChecksum(t *testing.T) {
 	root := t.TempDir()
 	if err := ensurePackageDirectories(root); err != nil {
@@ -99,6 +151,24 @@ func TestPackageUploadPersistsArchitectureAndChecksum(t *testing.T) {
 	}
 	if len(items) != 1 || items[0].Arch != "noarch" || items[0].SHA256 != item.SHA256 {
 		t.Fatalf("metadata was not persisted: %#v", items)
+	}
+}
+
+func TestComponentPackageUploadRequiresVersionMetadata(t *testing.T) {
+	root := t.TempDir()
+	if err := ensurePackageDirectories(root); err != nil {
+		t.Fatal(err)
+	}
+	service := &PackageService{storagePath: root}
+	if _, err := service.SaveUploadWithMetadata("gmha-agent", "x86_64", "agent-current.bin", "", "", strings.NewReader("binary")); err == nil {
+		t.Fatal("expected component upload without a detectable version to fail")
+	}
+	item, err := service.SaveUploadWithMetadata("gmha-agent", "x86_64", "agent-current.bin", "V1.2.3", "stable release", strings.NewReader("binary"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.Version != "V1.2.3" || item.Description != "stable release" {
+		t.Fatalf("unexpected component metadata: %#v", item)
 	}
 }
 

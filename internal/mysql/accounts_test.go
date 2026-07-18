@@ -42,6 +42,29 @@ func TestNormalizeAccountSpecsKeepsMultipleCustomUsers(t *testing.T) {
 	}
 }
 
+func TestNormalizeAccountSpecsCompletesMHARequiredPrivileges(t *testing.T) {
+	items := NormalizeAccountSpecs([]AccountSpec{{
+		Role: AccountRoleMHA, Username: "mha", Password: "secret", Host: "%", Enabled: true,
+		Privileges: []string{"SELECT", "PROCESS"},
+	}})
+	var mha AccountSpec
+	for _, item := range items {
+		if item.Role == AccountRoleMHA {
+			mha = item
+			break
+		}
+	}
+	granted := make(map[string]bool, len(mha.Privileges))
+	for _, privilege := range mha.Privileges {
+		granted[privilege] = true
+	}
+	for _, required := range DefaultPrivileges(AccountRoleMHA) {
+		if !granted[required] {
+			t.Fatalf("normalized MHA account missing required privilege %q: %#v", required, mha.Privileges)
+		}
+	}
+}
+
 // TestNormalizeAccountSpecsOverrideAndDisable 测试账号规格的覆盖和禁用功能。
 func TestNormalizeAccountSpecsOverrideAndDisable(t *testing.T) {
 	items := NormalizeAccountSpecs([]AccountSpec{
@@ -89,11 +112,16 @@ func TestAccountSQLStepsForMHA(t *testing.T) {
 	for _, want := range []string{
 		"CREATE USER IF NOT EXISTS 'mha'@'%' IDENTIFIED BY 'p''ass'",
 		"ALTER USER 'mha'@'%' IDENTIFIED BY 'p''ass'",
-		"GRANT CREATE, ALTER, DROP, INSERT, UPDATE, DELETE, SELECT",
-		"GRANT BACKUP_ADMIN, CLONE_ADMIN ON *.* TO 'mha'@'%'",
+		"GRANT CREATE, CREATE USER, ALTER, DROP, INSERT, UPDATE, DELETE, SELECT",
+		"GRANT CONNECTION_ADMIN, SYSTEM_VARIABLES_ADMIN, REPLICATION_SLAVE_ADMIN, BACKUP_ADMIN, CLONE_ADMIN ON *.* TO 'mha'@'%' WITH GRANT OPTION",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("generated SQL missing %q:\n%s", want, joined)
+		}
+	}
+	for _, line := range text {
+		if strings.HasPrefix(line, "grant_") && !strings.HasSuffix(line, "WITH GRANT OPTION") {
+			t.Fatalf("MHA grant must include grant option: %s", line)
 		}
 	}
 }

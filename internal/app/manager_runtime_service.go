@@ -15,6 +15,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"gmha/internal/buildinfo"
 )
 
 // ManagerRuntimeConfig 是 Manager 运行时配置参数，包含 HTTP/gRPC 监听地址、
@@ -33,6 +35,7 @@ type ManagerRuntimeConfig struct {
 
 // ManagerRuntimeStatus 是 Manager 运行时状态视图，包含是否运行中、PID、启动时间等。
 type ManagerRuntimeStatus struct {
+	Version   string               `json:"version"`
 	Running   bool                 `json:"running"`
 	PID       int                  `json:"pid"`
 	StartedAt time.Time            `json:"started_at"`
@@ -86,9 +89,9 @@ func (s *ManagerRuntimeService) GetStatus(ctx context.Context) (ManagerRuntimeSt
 	}
 	if !ok {
 		if s.managerHealthy(ctx, s.defaultConfig) {
-			return ManagerRuntimeStatus{Running: true, Discovery: "health", Config: s.defaultConfig}, nil
+			return ManagerRuntimeStatus{Version: buildinfo.CurrentVersion(), Running: true, Discovery: "health", Config: s.defaultConfig}, nil
 		}
-		return ManagerRuntimeStatus{Config: s.defaultConfig}, nil
+		return ManagerRuntimeStatus{Version: buildinfo.CurrentVersion(), Config: s.defaultConfig}, nil
 	}
 	running := processRunning(state.PID)
 	if running && state.PID != os.Getpid() && time.Since(state.StartedAt) > 3*time.Second {
@@ -97,12 +100,13 @@ func (s *ManagerRuntimeService) GetStatus(ctx context.Context) (ManagerRuntimeSt
 		running = s.managerHealthy(ctx, state.Config)
 	}
 	if !running && s.managerHealthy(ctx, state.Config) {
-		return ManagerRuntimeStatus{Running: true, Discovery: "health", LogPath: state.LogPath, Config: normalizeManagerRuntimeConfig(state.Config)}, nil
+		return ManagerRuntimeStatus{Version: buildinfo.CurrentVersion(), Running: true, Discovery: "health", LogPath: state.LogPath, Config: normalizeManagerRuntimeConfig(state.Config)}, nil
 	}
 	if !running {
-		return ManagerRuntimeStatus{Config: normalizeManagerRuntimeConfig(state.Config), LogPath: state.LogPath}, nil
+		return ManagerRuntimeStatus{Version: buildinfo.CurrentVersion(), Config: normalizeManagerRuntimeConfig(state.Config), LogPath: state.LogPath}, nil
 	}
 	return ManagerRuntimeStatus{
+		Version:   buildinfo.CurrentVersion(),
 		Running:   true,
 		PID:       state.PID,
 		StartedAt: state.StartedAt,
@@ -159,7 +163,7 @@ func (s *ManagerRuntimeService) AdoptCurrentProcess() (ManagerRuntimeStatus, err
 		}
 	}
 	return ManagerRuntimeStatus{
-		Running: true, PID: os.Getpid(), StartedAt: state.StartedAt,
+		Version: buildinfo.CurrentVersion(), Running: true, PID: os.Getpid(), StartedAt: state.StartedAt,
 		LogPath: state.LogPath, Discovery: "current", Config: normalizeManagerRuntimeConfig(state.Config),
 	}, nil
 }
@@ -298,7 +302,7 @@ func (s *ManagerRuntimeService) StopCurrentProcess() (ManagerRuntimeStatus, erro
 		return ManagerRuntimeStatus{}, err
 	}
 	signalCurrentProcessAfterDelay()
-	return ManagerRuntimeStatus{Config: normalizeManagerRuntimeConfig(state.Config), LogPath: state.LogPath}, nil
+	return ManagerRuntimeStatus{Version: buildinfo.CurrentVersion(), Config: normalizeManagerRuntimeConfig(state.Config), LogPath: state.LogPath}, nil
 }
 
 func signalCurrentProcessAfterDelay() {

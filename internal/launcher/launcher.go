@@ -26,6 +26,7 @@ type Config struct {
 	ManagerURL        string
 	ManagerListen     string
 	ManagerGRPCListen string
+	ManagerPublicKey  string
 	ManagerBinary     string
 	DataPath          string
 	AgentBinary       string
@@ -171,13 +172,7 @@ func (c *Controller) startManager() error {
 		return err
 	}
 	defer logFile.Close()
-	cmd := exec.Command(c.cfg.ManagerBinary,
-		"serve",
-		"--listen", c.cfg.ManagerListen,
-		"--grpc-listen", c.cfg.ManagerGRPCListen,
-		"--db", c.cfg.DataPath,
-		"--agent-binary", c.cfg.AgentBinary,
-	)
+	cmd := exec.Command(c.cfg.ManagerBinary, c.managerArgs()...)
 	cmd.Dir = filepath.Dir(c.cfg.ManagerBinary)
 	cmd.Stdin = nil
 	cmd.Stdout = logFile
@@ -186,6 +181,20 @@ func (c *Controller) startManager() error {
 		return err
 	}
 	return cmd.Process.Release()
+}
+
+func (c *Controller) managerArgs() []string {
+	args := []string{
+		"serve",
+		"--listen", c.cfg.ManagerListen,
+		"--grpc-listen", c.cfg.ManagerGRPCListen,
+		"--db", c.cfg.DataPath,
+		"--agent-binary", c.cfg.AgentBinary,
+	}
+	if keyPath := strings.TrimSpace(c.cfg.ManagerPublicKey); keyPath != "" {
+		args = append(args, "--manager-pubkey", keyPath)
+	}
+	return args
 }
 
 func (c *Controller) writeStatus(w http.ResponseWriter, r *http.Request, code int, running bool, message string) {

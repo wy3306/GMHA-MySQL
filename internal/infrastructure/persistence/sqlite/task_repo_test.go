@@ -80,6 +80,77 @@ func TestTaskRepositoryPagesAndFiltersTaskHistory(t *testing.T) {
 	}
 }
 
+func TestTaskRepositoryKeepsChildrenOutOfTopLevelHistory(t *testing.T) {
+	db, err := sql.Open("sqlite", t.TempDir()+"/task-children.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repo := NewTaskRepository(NewDB(db, DialectSQLite))
+	if err := repo.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	parent := taskdomain.Task{ID: "cluster-bootstrap-1", Type: taskdomain.TypeClusterBootstrap, MachineID: "demo", Status: taskdomain.StatusRunning, CreatedAt: now}
+	child := taskdomain.Task{ID: "task-install-child", ParentTaskID: parent.ID, Type: taskdomain.TypeMySQLInstall, MachineID: "db-1", Status: taskdomain.StatusRunning, CreatedAt: now.Add(time.Second)}
+	for _, item := range []taskdomain.Task{parent, child} {
+		if err := repo.CreateTask(context.Background(), item, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page, total, err := repo.ListTaskPage(context.Background(), taskdomain.ListQuery{Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 || len(page) != 1 || page[0].ID != parent.ID {
+		t.Fatalf("unexpected top-level tasks: total=%d items=%+v", total, page)
+	}
+	children, err := repo.ListChildTasks(context.Background(), parent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(children) != 1 || children[0].ID != child.ID || children[0].ParentTaskID != parent.ID {
+		t.Fatalf("unexpected child tasks: %+v", children)
+	}
+}
+
+func TestTaskRepositoryKeepsCollectionJobsOutOfTaskCenter(t *testing.T) {
+	db, err := sql.Open("sqlite", t.TempDir()+"/task-internal-collection.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repo := NewTaskRepository(NewDB(db, DialectSQLite))
+	if err := repo.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	items := []taskdomain.Task{
+		{ID: "collect-runtime", Type: taskdomain.TypeCollectMachineInfo, MachineID: "db-1", Status: taskdomain.StatusSuccess, CreatedAt: now},
+		{ID: "collect-static", Type: taskdomain.TypeCollectStaticInfo, MachineID: "db-1", Status: taskdomain.StatusSuccess, CreatedAt: now.Add(time.Second)},
+		{ID: "mysql-install", Type: taskdomain.TypeMySQLInstall, MachineID: "db-1", Status: taskdomain.StatusSuccess, CreatedAt: now.Add(2 * time.Second)},
+	}
+	for _, item := range items {
+		if err := repo.CreateTask(context.Background(), item, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page, total, err := repo.ListTaskPage(context.Background(), taskdomain.ListQuery{Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 || len(page) != 1 || page[0].ID != "mysql-install" {
+		t.Fatalf("collection jobs leaked into task center page: total=%d items=%+v", total, page)
+	}
+	recent, err := repo.ListTasks(context.Background(), 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recent) != 1 || recent[0].ID != "mysql-install" {
+		t.Fatalf("collection jobs leaked into recent tasks: %+v", recent)
+	}
+}
+
 func TestTaskRepositoryDeleteTaskRemovesCompleteHistory(t *testing.T) {
 	db, err := sql.Open("sqlite", t.TempDir()+"/task-delete.db")
 	if err != nil {
@@ -110,5 +181,50 @@ func TestTaskRepositoryDeleteTaskRemovesCompleteHistory(t *testing.T) {
 	events, err := repo.ListEvents(context.Background(), task.ID, -1)
 	if err != nil || len(events) != 0 {
 		t.Fatalf("task events were not deleted: events=%+v err=%v", events, err)
+	}
+}
+
+func TestTaskRepositoryAssignsAndDeletesNestedTaskTree(t *testing.T) {
+	db, err := sql.Open("sqlite", t.TempDir()+"/task-tree.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repo := NewTaskRepository(NewDB(db, DialectSQLite))
+	if err := repo.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	items := []taskdomain.Task{
+		{ID: "business-parent", Type: taskdomain.TypeBatchOperation, Status: taskdomain.StatusSuccess, CreatedAt: now},
+		{ID: "workflow-child", Type: taskdomain.TypeArchitecture, Status: taskdomain.StatusSuccess, CreatedAt: now.Add(time.Second)},
+		{ID: "agent-grandchild", ParentTaskID: "workflow-child", Type: taskdomain.TypeExec, Status: taskdomain.StatusSuccess, CreatedAt: now.Add(2 * time.Second)},
+	}
+	for _, item := range items {
+		step := taskdomain.Step{ID: item.ID + "-step", TaskID: item.ID, StepNo: 1, StepName: "run", Status: taskdomain.StepSuccess, StartedAt: &now, FinishedAt: &now}
+		event := taskdomain.Event{ID: item.ID + "-event", TaskID: item.ID, StepID: step.ID, EventType: taskdomain.EventInfo, Content: "done", CreatedAt: now}
+		if err := repo.CreateTask(context.Background(), item, []taskdomain.Step{step}, []taskdomain.Event{event}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := repo.AssignParentTasks(context.Background(), "business-parent", []string{"workflow-child"}); err != nil {
+		t.Fatal(err)
+	}
+	children, err := repo.ListChildTasks(context.Background(), "business-parent")
+	if err != nil || len(children) != 1 || children[0].ID != "workflow-child" {
+		t.Fatalf("assigned children = %+v, err=%v", children, err)
+	}
+	if err := repo.DeleteTaskTree(context.Background(), "business-parent"); err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range items {
+		if _, ok, err := repo.GetTask(context.Background(), item.ID); err != nil || ok {
+			t.Fatalf("task %s survived tree deletion: ok=%v err=%v", item.ID, ok, err)
+		}
+		steps, _ := repo.ListSteps(context.Background(), item.ID)
+		events, _ := repo.ListEvents(context.Background(), item.ID, -1)
+		if len(steps) != 0 || len(events) != 0 {
+			t.Fatalf("history for %s survived: steps=%d events=%d", item.ID, len(steps), len(events))
+		}
 	}
 }

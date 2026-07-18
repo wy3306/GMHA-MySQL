@@ -72,6 +72,14 @@ type deleteMachineRequest struct {
 	DetachOnly  bool `json:"detach_only"`
 }
 
+type batchDeleteMachinesRequest struct {
+	MachineIDs  []string `json:"machine_ids"`
+	DeleteMySQL bool     `json:"delete_mysql"`
+	DeleteAgent bool     `json:"delete_agent"`
+	DetachOnly  bool     `json:"detach_only"`
+	Concurrency int      `json:"concurrency"`
+}
+
 // assignClusterRequest 表示分配集群请求体。
 type assignClusterRequest struct {
 	Cluster string `json:"cluster"`
@@ -143,6 +151,29 @@ func (h *MachineHandler) HandleMachines(w http.ResponseWriter, r *http.Request) 
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+// HandleBatchDeleteMachines 将一次批量删除作为一个任务中心业务流程处理。
+func (h *MachineHandler) HandleBatchDeleteMachines(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var req batchDeleteMachinesRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	result, err := h.service.DeleteMachinesWithOptions(r.Context(), req.MachineIDs, app.DeleteMachineOptions{
+		DeleteMySQL: req.DeleteMySQL,
+		DeleteAgent: req.DeleteAgent,
+		DetachOnly:  req.DetachOnly,
+	}, req.Concurrency)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 // HandlePrecheck 在机器纳管前执行非破坏性的 SSH 与环境检查。
@@ -267,6 +298,10 @@ func (h *MachineHandler) HandleMachineByID(w http.ResponseWriter, r *http.Reques
 		h.handleMachineDynamicMetrics(w, r, strings.Trim(strings.TrimSuffix(path, "/dynamic-metrics"), "/"))
 		return
 	}
+	if strings.HasSuffix(path, "/delete-precheck") {
+		h.handleMachineDeletePrecheck(w, r, strings.Trim(strings.TrimSuffix(path, "/delete-precheck"), "/"))
+		return
+	}
 	machineID := strings.Trim(path, "/")
 	if machineID == "" {
 		w.WriteHeader(http.StatusNotFound)
@@ -315,6 +350,19 @@ func (h *MachineHandler) HandleMachineByID(w http.ResponseWriter, r *http.Reques
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func (h *MachineHandler) handleMachineDeletePrecheck(w http.ResponseWriter, r *http.Request, machineID string) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	report, err := h.service.PrecheckDeleteMachine(r.Context(), machineID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, report)
 }
 
 // handleMachineStaticInfo 查看已采集的静态信息（GET）或调用 CLI 同一内核重新采集（POST）。

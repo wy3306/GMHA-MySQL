@@ -1,0 +1,51 @@
+/* Readable desktop inspector for topology, VIP migration and plan actions. */
+.topology-architecture-layout {
+  grid-template-columns: minmax(0, 1fr) 380px;
+  gap: 18px;
+}
+
+.topology-inspector { gap: 14px; }
+.topology-inspector section > header { padding: 16px 18px; }
+.topology-inspector section > header b { font-size: 15px; }
+.topology-inspector section > header small { font-size: 12px; }
+.topology-summary-list { padding: 9px 18px; }
+.topology-summary-list p { padding: 10px 0; gap: 12px; font-size: 13px; }
+.topology-inspector-form { padding: 16px 18px; gap: 13px; }
+.topology-inspector-form label { gap: 7px; font-size: 13px; }
+.topology-inspector-form input,
+.topology-inspector-form select { height: 40px; padding: 0 11px; border-radius: 6px; font-size: 14px; }
+.topology-plan-action { padding: 17px 18px; gap: 12px; }
+.topology-plan-action small { font-size: 12px; line-height: 1.55; }
+.topology-plan-action button { min-height: 42px; font-size: 14px; }
+
+.topology-vip-editor-body { gap: 12px; padding: 16px 18px 18px; }
+.topology-vip-editor-body label { gap: 6px; font-size: 12px; }
+.topology-vip-editor-body input,
+.topology-vip-editor-body select { height: 40px; padding: 0 10px; font-size: 13px; }
+.topology-vip-live { padding: 12px 13px; gap: 4px 9px; }
+.topology-vip-live > span { font-size: 10px; }
+.topology-vip-live > b { font-size: 15px; }
+.topology-vip-live > small { font-size: 11px; }
+.topology-vip-inline { grid-template-columns: minmax(0, 1fr) 86px; gap: 10px; }
+.topology-vip-facts { gap: 4px 14px; padding: 10px 12px; }
+.topology-vip-facts div { gap: 3px; padding: 5px 0; }
+.topology-vip-facts dt { font-size: 10px; }
+.topology-vip-facts dd { font-size: 11px; }
+.topology-vip-switch { gap: 8px !important; font-size: 12px !important; }
+.topology-vip-switch input { width: 16px; height: 16px; }
+.topology-vip-error { padding: 10px 11px; font-size: 11px; }
+.topology-vip-actions { gap: 10px; padding-top: 4px; }
+.topology-vip-actions .primary { min-height: 40px; padding: 9px 13px; font-size: 12px; }
+.topology-vip-actions .danger-link { font-size: 11px; }
+.topology-vip-safety { padding: 9px 10px; border-radius: 6px; background: #f5f8fc; font-size: 10px; line-height: 1.55; }
+
+@media (max-width: 1180px) {
+  .topology-architecture-layout { grid-template-columns: 1fr; }
+  .topology-inspector { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .topology-vip-editor, .topology-plan-action { grid-column: 1 / -1; }
+}
+
+@media (max-width: 700px) {
+  .topology-inspector { display: flex; }
+  .topology-vip-editor-body { grid-template-columns: 1fr; }
+}

@@ -9,20 +9,27 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
+	"os"
 	"os/signal"
 	"syscall"
 
 	"gmha/internal/agent"
+	"gmha/internal/buildinfo"
 )
 
 // main 是 Agent 程序的入口函数。
 // 启动流程：
-//   1. 解析命令行参数，获取配置文件路径（默认 /home/gmha/agent/agent.yaml）
-//   2. 加载 Agent 配置（包含 agent_id、machine_id、Manager 地址等）
-//   3. 创建可被信号中断的 Context（SIGINT/SIGTERM）
-//   4. 调用 agent.Run 启动 Agent 主循环
+//  1. 解析命令行参数，获取配置文件路径（默认 /home/gmha/agent/agent.yaml）
+//  2. 加载 Agent 配置（包含 agent_id、machine_id、Manager 地址等）
+//  3. 创建可被信号中断的 Context（SIGINT/SIGTERM）
+//  4. 调用 agent.Run 启动 Agent 主循环
 func main() {
+	if len(os.Args) == 2 && (os.Args[1] == "version" || os.Args[1] == "--version") {
+		fmt.Println(buildinfo.CurrentVersion())
+		return
+	}
 	configPath := flag.String("config", "/home/gmha/agent/agent.yaml", "agent config path")
 	flag.Parse()
 

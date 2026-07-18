@@ -103,11 +103,18 @@ func (m *MySQLDynamicCollectManager) UpdateMySQLDynamicCollectConfig(ctx context
 		if !ok {
 			runner.cancel()
 			delete(m.runners, name)
+			m.deleteLastMetricResults(name)
 			continue
 		}
 		if !sameSpec(runner.spec, spec) {
 			runner.cancel()
 			delete(m.runners, name)
+		}
+	}
+	for key := range m.last {
+		name := strings.SplitN(key, "@", 2)[0]
+		if _, ok := desired[name]; !ok {
+			delete(m.last, key)
 		}
 	}
 	for name, spec := range desired {
@@ -211,6 +218,9 @@ func (m *MySQLDynamicCollectManager) collectAndStore(ctx context.Context, spec d
 		cancel()
 	}
 	m.mu.Lock()
+	if err == nil && len(envs) == 0 {
+		m.deleteLastMetricResults(spec.Name)
+	}
 	for _, result := range results {
 		m.last[metricResultKey(result)] = result
 	}
@@ -218,6 +228,17 @@ func (m *MySQLDynamicCollectManager) collectAndStore(ctx context.Context, spec d
 	for _, result := range results {
 		if !result.Success {
 			log.Printf("mysql dynamic collector %s failed: %s", metricResultKey(result), result.Error)
+		}
+	}
+}
+
+// deleteLastMetricResults removes both a single-instance key and all
+// name@instance keys. The caller must hold m.mu.
+func (m *MySQLDynamicCollectManager) deleteLastMetricResults(name string) {
+	delete(m.last, name)
+	for key := range m.last {
+		if strings.HasPrefix(key, name+"@") {
+			delete(m.last, key)
 		}
 	}
 }

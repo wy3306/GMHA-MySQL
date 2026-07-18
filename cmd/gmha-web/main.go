@@ -15,6 +15,7 @@ func main() {
 	flag.StringVar(&cfg.ManagerURL, "manager-url", "auto", "浏览器访问 Manager 的地址；auto 表示沿用当前主机名和 Manager 端口")
 	flag.StringVar(&cfg.ManagerListen, "manager-listen", ":8080", "Manager HTTP 监听地址")
 	flag.StringVar(&cfg.ManagerGRPCListen, "manager-grpc-listen", ":9100", "Manager gRPC 监听地址")
+	flag.StringVar(&cfg.ManagerPublicKey, "manager-pubkey", "", "Manager SSH 公钥路径；对应私钥将用于验证现有互信")
 	flag.StringVar(&cfg.ManagerBinary, "manager-binary", "", "gmha 程序路径，默认使用启动器同目录的 gmha")
 	flag.StringVar(&cfg.DataPath, "db", "", "SQLite 数据库路径，默认使用启动器同目录的 data/manager.db")
 	flag.StringVar(&cfg.AgentBinary, "agent-binary", "", "Agent 程序路径，默认使用启动器同目录的 bin/agentd")

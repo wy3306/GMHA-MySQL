@@ -101,9 +101,26 @@ func normalizeMySQLAccountPresets(items []taskdomain.MySQLAccountSpec) []taskdom
 		if item.Privileges != nil {
 			base.Privileges = append([]string(nil), item.Privileges...)
 		}
+		if role == "mha" {
+			base.Privileges = appendRequiredPrivileges(base.Privileges, mysqlapp.DefaultPrivileges(mysqlapp.AccountRoleMHA)...)
+		}
 		byRole[role] = base
 	}
 	return []taskdomain.MySQLAccountSpec{byRole["monitor"], byRole["mha"], byRole["backup"]}
+}
+
+func appendRequiredPrivileges(items []string, required ...string) []string {
+	result := append([]string(nil), items...)
+	seen := make(map[string]bool, len(result))
+	for _, item := range result {
+		seen[item] = true
+	}
+	for _, item := range required {
+		if !seen[item] {
+			result = append(result, item)
+		}
+	}
+	return result
 }
 
 // ListInstances 返回所有 MySQL 实例列表，会自动清理已卸载的实例记录。

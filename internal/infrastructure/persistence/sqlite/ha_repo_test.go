@@ -51,6 +51,38 @@ func TestHARepositoryFailoverLockIsClusterScoped(t *testing.T) {
 	}
 }
 
+func TestHARepositoryFailoverLockCanAtomicallyReplaceExpiredOwner(t *testing.T) {
+	db, err := sql.Open("sqlite", t.TempDir()+"/expired-lock.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store := NewDB(db, DialectSQLite)
+	if err := NewClusterRepository(store).Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := NewMySQLInstanceRepository(store).Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	repo := NewHARepository(store)
+	if err := repo.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`insert into failover_lock(cluster_id,failover_id,lock_owner,locked_at,expires_at) values('c1','old','test','2020-01-01T00:00:00Z','2020-01-01T00:01:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.AcquireFailoverLock(context.Background(), "c1", "new", "test", time.Minute); err != nil {
+		t.Fatalf("expired lock should be replaced: %v", err)
+	}
+	var owner string
+	if err := db.QueryRow(`select failover_id from failover_lock where cluster_id='c1'`).Scan(&owner); err != nil {
+		t.Fatal(err)
+	}
+	if owner != "new" {
+		t.Fatalf("lock owner = %q, want new", owner)
+	}
+}
+
 func TestHARepositoryVIPConfigRoundTripIncludesBGP(t *testing.T) {
 	db, err := sql.Open("sqlite", t.TempDir()+"/vip.db")
 	if err != nil {

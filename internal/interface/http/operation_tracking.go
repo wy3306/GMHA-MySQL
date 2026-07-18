@@ -65,7 +65,8 @@ func trackPlatformOperations(next http.Handler, tasks *app.TaskService) http.Han
 		operation, displayName, target := platformOperationMetadata(r.Method, r.URL.Path)
 		spec := taskdomain.PlatformOperationSpec{
 			Operation: operation, DisplayName: displayName, Method: r.Method, Path: r.URL.Path,
-			Target: target, HTTPStatus: status, DurationMillis: finishedAt.Sub(startedAt).Milliseconds(), RelatedTaskIDs: related,
+			RequestID: platformRequestID(r), Target: target, HTTPStatus: status,
+			DurationMillis: finishedAt.Sub(startedAt).Milliseconds(), RelatedTaskIDs: related,
 		}
 		errMessage := ""
 		if status >= http.StatusBadRequest {
@@ -77,6 +78,14 @@ func trackPlatformOperations(next http.Handler, tasks *app.TaskService) http.Han
 			log.Printf("record platform operation %s %s: %v", r.Method, r.URL.Path, err)
 		}
 	})
+}
+
+func platformRequestID(r *http.Request) string {
+	value := strings.TrimSpace(r.Header.Get("X-Idempotency-Key"))
+	if len(value) > 128 {
+		return value[:128]
+	}
+	return value
 }
 
 func isBatchTaskEndpoint(path string) bool {
@@ -93,13 +102,14 @@ func isMutatingMethod(method string) bool {
 }
 
 func isSystemMutation(path string) bool {
-	return path == "/api/v1/agents/register" || path == "/api/v1/agents/heartbeat" || path == "/api/v1/tasks/cluster-automation/report"
+	return path == "/api/v1/agents/register" || path == "/api/v1/agents/heartbeat" || path == "/api/v1/tasks/cluster-automation/report" || path == "/api/v1/tasks" || path == "/api/v1/machines/batch-delete"
 }
 
 func platformOperationMetadata(method, path string) (string, string, string) {
 	operation := strings.Trim(strings.TrimPrefix(path, "/api/v1/"), "/")
 	target := "平台"
 	labels := []struct{ fragment, label string }{
+		{"upgrades/manager", "升级 Manager"}, {"upgrades/agent", "按版本升级 Agent"},
 		{"retry-install", "重试安装 Agent"}, {"repair-mysql-config", "修复 Agent MySQL 配置"}, {"agents/upgrade", "升级 Agent"}, {"agents/uninstall", "卸载 Agent"}, {"agents/recover", "恢复 Agent"},
 		{"mysql-install", "部署 MySQL"}, {"mysql-uninstall", "卸载 MySQL"}, {"mysql-upgrade", "升级 MySQL"}, {"mysql-parameters", "维护 MySQL 参数"}, {"mysql-topology", "调整 MySQL 拓扑"},
 		{"backup", "备份与恢复操作"}, {"architecture", "调整集群架构"}, {"failover", "集群故障切换"}, {"/vip/", "维护集群 VIP"},
@@ -168,6 +178,9 @@ func isTrackableTaskID(value string) bool {
 		return true
 	}
 	if strings.HasPrefix(value, "arch-run-") {
+		return true
+	}
+	if strings.HasPrefix(value, "batch-task-") || strings.HasPrefix(value, "cluster-bootstrap-") {
 		return true
 	}
 	return strings.HasPrefix(value, "task-") && !strings.HasPrefix(value, "task-step-") && !strings.HasPrefix(value, "task-event-")

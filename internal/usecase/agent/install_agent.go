@@ -49,6 +49,8 @@ type InstallAgentRequest struct {
 	IP              string
 	SSHUser         string
 	SSHPassword     string
+	SSHPrivateKey   string
+	SSHPassphrase   string
 	InstallDir      string
 	Version         string
 	ManagerHTTPAddr string
@@ -137,7 +139,7 @@ func (u *InstallAgentUsecase) Execute(ctx context.Context, req InstallAgentReque
 	if sshUser == "" {
 		sshUser = machine.SSHUser
 	}
-	auth := machinedomain.SSHAuth{User: sshUser, Password: req.SSHPassword}
+	auth := machinedomain.SSHAuth{User: sshUser, Password: req.SSHPassword, PrivateKey: req.SSHPrivateKey, Passphrase: req.SSHPassphrase}
 	managerGRPCAddr := strings.TrimSpace(req.ManagerGRPCAddr)
 	if managerGRPCAddr == "" {
 		managerGRPCAddr, err = u.detectManagerGRPCAddr(ctx, endpoint, auth)

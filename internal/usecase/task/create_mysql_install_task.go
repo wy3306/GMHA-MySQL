@@ -26,10 +26,12 @@ type MachineInfoRepository interface {
 
 type PerconaToolkitPackageResolver interface {
 	ResolvePerconaToolkitPackage(arch string) (string, error)
+	ResolveXtraBackupPackage(mysqlVersion, arch, glibcVersion string) (string, error)
 }
 
 // CreateMySQLInstallTaskRequest 是创建 MySQL 安装任务的请求参数。
 type CreateMySQLInstallTaskRequest struct {
+	ParentTaskID      string
 	Machine           string
 	Port              int
 	ServerID          int
@@ -53,6 +55,8 @@ type CreateMySQLInstallTaskRequest struct {
 	Version           string
 	Architecture      string
 	InstallPTTools    bool
+	InstallXtraBackup bool
+	MemoryAllocator   string
 	RuntimeParameters map[string]string
 	Accounts          []taskdomain.MySQLAccountSpec
 }
@@ -86,6 +90,7 @@ type CreateMySQLInstallTaskUsecase struct {
 	packageSelector   *mysqlapp.PackageSelector
 	ptPackageResolver PerconaToolkitPackageResolver
 	managerHTTPAddr   string
+	managerAddrForIP  func(string) string
 }
 
 // NewCreateMySQLInstallTaskUsecase 创建一个新的 MySQL 安装任务用例实例。
@@ -99,7 +104,12 @@ func NewCreateMySQLInstallTaskUsecase(
 	selector *mysqlapp.PackageSelector,
 	ptPackageResolver PerconaToolkitPackageResolver,
 	managerHTTPAddr string,
+	managerAddrForIP ...func(string) string,
 ) *CreateMySQLInstallTaskUsecase {
+	var resolver func(string) string
+	if len(managerAddrForIP) > 0 {
+		resolver = managerAddrForIP[0]
+	}
 	return &CreateMySQLInstallTaskUsecase{
 		machines:          machines,
 		agents:            agents,
@@ -110,6 +120,7 @@ func NewCreateMySQLInstallTaskUsecase(
 		packageSelector:   selector,
 		ptPackageResolver: ptPackageResolver,
 		managerHTTPAddr:   strings.TrimRight(managerHTTPAddr, "/"),
+		managerAddrForIP:  resolver,
 	}
 }
 
@@ -191,6 +202,8 @@ func (u *CreateMySQLInstallTaskUsecase) Execute(ctx context.Context, req CreateM
 	}
 	ptPackageName := ""
 	ptPackageDownloadURL := ""
+	xtraBackupPackageName := ""
+	xtraBackupPackageDownloadURL := ""
 	if req.InstallPTTools {
 		if u.ptPackageResolver == nil {
 			return CreateMySQLInstallTaskResult{}, errors.New("Percona Toolkit package resolver is not configured")
@@ -199,7 +212,24 @@ func (u *CreateMySQLInstallTaskUsecase) Execute(ctx context.Context, req CreateM
 		if err != nil {
 			return CreateMySQLInstallTaskResult{}, err
 		}
-		ptPackageDownloadURL = fmt.Sprintf("%s/api/v1/packages/percona-toolkit/%s", strings.TrimRight(u.managerHTTPAddr, "/"), url.PathEscape(ptPackageName))
+		ptPackageDownloadURL = u.managerResourceURL(machine.IP, "/api/v1/packages/percona-toolkit/"+url.PathEscape(ptPackageName))
+	}
+	if req.InstallXtraBackup {
+		if u.ptPackageResolver == nil {
+			return CreateMySQLInstallTaskResult{}, errors.New("XtraBackup package resolver is not configured")
+		}
+		xtraBackupPackageName, err = u.ptPackageResolver.ResolveXtraBackupPackage(pkg.Version, info.Arch, info.GlibcVersion)
+		if err != nil {
+			return CreateMySQLInstallTaskResult{}, err
+		}
+		xtraBackupPackageDownloadURL = u.managerResourceURL(machine.IP, "/api/v1/packages/xtrabackup/"+url.PathEscape(xtraBackupPackageName))
+	}
+	memoryAllocator := strings.ToLower(strings.TrimSpace(req.MemoryAllocator))
+	if memoryAllocator == "" {
+		memoryAllocator = "system"
+	}
+	if memoryAllocator != "system" && memoryAllocator != "tcmalloc" {
+		return CreateMySQLInstallTaskResult{}, fmt.Errorf("unsupported memory allocator %q; use system or tcmalloc", req.MemoryAllocator)
 	}
 	if err := mysqlapp.ApplyRuntimeParametersForVersion(&vars, pkg.Version, req.RuntimeParameters); err != nil {
 		return CreateMySQLInstallTaskResult{}, err
@@ -229,6 +259,9 @@ func (u *CreateMySQLInstallTaskUsecase) Execute(ctx context.Context, req CreateM
 		return CreateMySQLInstallTaskResult{}, err
 	}
 	accounts := normalizeInstallAccounts(req.Accounts)
+	if req.InstallXtraBackup {
+		accounts = ensureXtraBackupAccountPrivileges(accounts)
+	}
 	accountCheck := make([]mysqlapp.AccountSpec, 0, len(accounts))
 	for _, item := range accounts {
 		accountCheck = append(accountCheck, mysqlapp.AccountSpec{
@@ -246,42 +279,46 @@ func (u *CreateMySQLInstallTaskUsecase) Execute(ctx context.Context, req CreateM
 	}
 
 	spec := taskdomain.MySQLInstallSpec{
-		Port:                      input.Port,
-		ServerID:                  vars.ServerID,
-		MySQLUser:                 input.MySQLUser,
-		InstanceDir:               input.InstanceDir,
-		DataDir:                   input.DataDir,
-		BinlogDir:                 input.BinlogDir,
-		RedoDir:                   input.RedoDir,
-		UndoDir:                   input.UndoDir,
-		TmpDir:                    input.TmpDir,
-		BaseDir:                   input.BaseDir,
-		RootPassword:              req.RootPassword,
-		Profile:                   req.Profile,
-		PackageName:               pkg.FileName,
-		Version:                   pkg.Version,
-		Architecture:              mysqlapp.NormalizeArchitecture(pkg.Arch),
-		PackageDownloadURL:        fmt.Sprintf("%s/api/v1/software/mysql/%s", strings.TrimRight(u.managerHTTPAddr, "/"), pkg.FileName),
-		MyCnfPath:                 input.MyCnfPath,
-		MyCnfContent:              string(renderedMyCnf),
-		SocketPath:                input.SocketPath,
-		ErrorLog:                  input.ErrorLog,
-		PIDFile:                   input.PIDFile,
-		CharacterSetsDir:          input.CharacterSetsDir,
-		PluginDir:                 input.PluginDir,
-		SystemdUnitName:           "mysqld",
-		SystemdContent:            string(renderedSystemd),
-		LimitsPath:                "/etc/security/limits.d/mysql.conf",
-		LimitsContent:             string(renderedLimits),
-		SysctlPath:                "/etc/sysctl.d/99-gmha-mysql.conf",
-		SysctlContent:             string(renderedSysctl),
-		EnvFilePath:               "/etc/profile.d/mysql.sh",
-		EnvContent:                string(renderedEnv),
-		InstallPTTools:            req.InstallPTTools,
-		PTToolsPackageName:        ptPackageName,
-		PTToolsPackageDownloadURL: ptPackageDownloadURL,
-		RuntimeParameters:         normalizedRuntimeParameters(req.RuntimeParameters),
-		Accounts:                  accounts,
+		Port:                         input.Port,
+		ServerID:                     vars.ServerID,
+		MySQLUser:                    input.MySQLUser,
+		InstanceDir:                  input.InstanceDir,
+		DataDir:                      input.DataDir,
+		BinlogDir:                    input.BinlogDir,
+		RedoDir:                      input.RedoDir,
+		UndoDir:                      input.UndoDir,
+		TmpDir:                       input.TmpDir,
+		BaseDir:                      input.BaseDir,
+		RootPassword:                 req.RootPassword,
+		Profile:                      req.Profile,
+		PackageName:                  pkg.FileName,
+		Version:                      pkg.Version,
+		Architecture:                 mysqlapp.NormalizeArchitecture(pkg.Arch),
+		PackageDownloadURL:           u.managerResourceURL(machine.IP, "/api/v1/software/mysql/"+url.PathEscape(pkg.FileName)),
+		MyCnfPath:                    input.MyCnfPath,
+		MyCnfContent:                 string(renderedMyCnf),
+		SocketPath:                   input.SocketPath,
+		ErrorLog:                     input.ErrorLog,
+		PIDFile:                      input.PIDFile,
+		CharacterSetsDir:             input.CharacterSetsDir,
+		PluginDir:                    input.PluginDir,
+		SystemdUnitName:              "mysqld",
+		SystemdContent:               string(renderedSystemd),
+		LimitsPath:                   "/etc/security/limits.d/mysql.conf",
+		LimitsContent:                string(renderedLimits),
+		SysctlPath:                   "/etc/sysctl.d/99-gmha-mysql.conf",
+		SysctlContent:                string(renderedSysctl),
+		EnvFilePath:                  "/etc/profile.d/mysql.sh",
+		EnvContent:                   string(renderedEnv),
+		InstallPTTools:               req.InstallPTTools,
+		PTToolsPackageName:           ptPackageName,
+		PTToolsPackageDownloadURL:    ptPackageDownloadURL,
+		InstallXtraBackup:            req.InstallXtraBackup,
+		XtraBackupPackageName:        xtraBackupPackageName,
+		XtraBackupPackageDownloadURL: xtraBackupPackageDownloadURL,
+		MemoryAllocator:              memoryAllocator,
+		RuntimeParameters:            normalizedRuntimeParameters(req.RuntimeParameters),
+		Accounts:                     accounts,
 	}
 	specJSON, _ := json.Marshal(spec)
 
@@ -289,6 +326,7 @@ func (u *CreateMySQLInstallTaskUsecase) Execute(ctx context.Context, req CreateM
 	taskID := fmt.Sprintf("task-%d", now.UnixNano())
 	task := taskdomain.Task{
 		ID:              taskID,
+		ParentTaskID:    strings.TrimSpace(req.ParentTaskID),
 		Type:            taskdomain.TypeMySQLInstall,
 		MachineID:       machine.ID,
 		AgentID:         agent.ID,
@@ -298,7 +336,7 @@ func (u *CreateMySQLInstallTaskUsecase) Execute(ctx context.Context, req CreateM
 		SpecJSON:        specJSON,
 		CreatedAt:       now,
 	}
-	steps := buildMySQLInstallSteps(taskID, req.InstallPTTools)
+	steps := buildMySQLInstallSteps(taskID, req.InstallPTTools, req.InstallXtraBackup, memoryAllocator)
 	events := []taskdomain.Event{{
 		ID:        fmt.Sprintf("task-event-%d", now.UnixNano()),
 		TaskID:    taskID,
@@ -308,6 +346,22 @@ func (u *CreateMySQLInstallTaskUsecase) Execute(ctx context.Context, req CreateM
 		CreatedAt: now,
 	}}
 	return CreateMySQLInstallTaskResult{Task: task, Steps: steps, Events: events}, nil
+}
+
+func (u *CreateMySQLInstallTaskUsecase) managerResourceURL(targetIP, path string) string {
+	base := u.managerHTTPAddr
+	if u.managerAddrForIP != nil {
+		// Resolver may return an ordered fallback list for Agent configuration.
+		// A task URL uses the first (target-specific) address; newer Agents also
+		// rebase it to the endpoint of their active task connection.
+		if resolved := strings.TrimSpace(strings.Split(u.managerAddrForIP(targetIP), ",")[0]); resolved != "" {
+			base = strings.TrimRight(resolved, "/")
+		}
+	}
+	if base == "" {
+		return "/" + strings.TrimLeft(path, "/")
+	}
+	return base + "/" + strings.TrimLeft(path, "/")
 }
 
 func normalizedRuntimeParameters(parameters map[string]string) map[string]string {
@@ -332,7 +386,7 @@ func (u *CreateMySQLInstallTaskUsecase) renderTemplate(name string, vars mysqlap
 }
 
 // buildMySQLInstallSteps 构建 MySQL 安装任务的所有步骤。
-func buildMySQLInstallSteps(taskID string, installPTTools bool) []taskdomain.Step {
+func buildMySQLInstallSteps(taskID string, installPTTools, installXtraBackup bool, memoryAllocator string) []taskdomain.Step {
 	names := []string{
 		"check_env",
 		"disable_firewall_selinux",
@@ -349,14 +403,22 @@ func buildMySQLInstallSteps(taskID string, installPTTools bool) []taskdomain.Ste
 		"setup_env",
 		"generate_mycnf",
 		"generate_systemd",
+	}
+	if memoryAllocator == "tcmalloc" {
+		names = append(names, "configure_memory_allocator")
+	}
+	names = append(names,
 		"initialize_mysql",
 		"start_mysql",
 		"wait_mysql_ready",
 		"set_root_password",
 		"verify_mysql",
-	}
+	)
 	if installPTTools {
 		names = append(names, "install_pt_tools")
+	}
+	if installXtraBackup {
+		names = append(names, "install_xtrabackup")
 	}
 	names = append(names,
 		"init_accounts",
@@ -401,6 +463,8 @@ func mysqlInstallStepMessage(name string) string {
 		"set_root_password":          "设置 root 密码",
 		"verify_mysql":               "验证 MySQL 服务",
 		"install_pt_tools":           "安装 PT 工具（Percona Toolkit）",
+		"install_xtrabackup":         "安装并验证 Percona XtraBackup",
+		"configure_memory_allocator": "安装并启用 tcmalloc（可选）",
 		"init_accounts":              "创建数据库用户并授权",
 		"ensure_heartbeat_table":     "初始化心跳表",
 		"setup_agent_collect_config": "配置 Agent 采集",
@@ -439,4 +503,26 @@ func normalizeInstallAccounts(input []taskdomain.MySQLAccountSpec) []taskdomain.
 		})
 	}
 	return out
+}
+
+// ensureXtraBackupAccountPrivileges makes the enabled backup account usable by
+// XtraBackup immediately after installation without changing disabled accounts.
+func ensureXtraBackupAccountPrivileges(accounts []taskdomain.MySQLAccountSpec) []taskdomain.MySQLAccountSpec {
+	for i := range accounts {
+		if accounts[i].Role != mysqlapp.AccountRoleBackup || !accounts[i].Enabled {
+			continue
+		}
+		accounts[i].ExtendedBackup = true
+		found := false
+		for _, privilege := range accounts[i].Privileges {
+			if strings.EqualFold(strings.TrimSpace(privilege), "BACKUP_ADMIN") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			accounts[i].Privileges = append(accounts[i].Privileges, "BACKUP_ADMIN")
+		}
+	}
+	return accounts
 }

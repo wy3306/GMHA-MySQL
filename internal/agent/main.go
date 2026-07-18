@@ -18,6 +18,7 @@ import (
 	"gmha/internal/agent/mysqlcheck"
 	agentmysqldynamic "gmha/internal/agent/mysqldynamic"
 	"gmha/internal/agent/selfcheck"
+	"gmha/internal/buildinfo"
 	dynamicdomain "gmha/internal/domain/dynamic"
 	hbdomain "gmha/internal/domain/heartbeat"
 	hbgrpc "gmha/pkg/rpc/heartbeat"
@@ -28,8 +29,8 @@ import (
 // Run 启动代理主循环，包括注册任务处理器、建立 gRPC 心跳流、启动动态指标采集，并定时发送心跳包。
 func Run(ctx context.Context, cfg Config) error {
 	dispatcher := agentcore.NewDispatcher(
-		agenthandler.NewExecHandler(cfg.ManagerHTTPAddr),
-		agenthandler.NewMySQLUpgradeHandler(cfg.ManagerHTTPAddr),
+		agenthandler.NewExecHandler(cfg.ManagerHTTPAddr, cfg.InstallDir),
+		agenthandler.NewMySQLUpgradeHandler(cfg.ManagerHTTPAddr, cfg.InstallDir),
 		agenthandler.NewCollectMachineInfoHandler(agentcollect.NewMachineCollector()),
 		agenthandler.NewCollectStaticInfoHandler(agentcollect.NewStaticCollector(cfg.InstallDir)),
 		agenthandler.NewMySQLInstallHandler(cfg.ManagerHTTPAddr, cfg.InstallDir),
@@ -102,7 +103,7 @@ func Run(ctx context.Context, cfg Config) error {
 				AgentID:   cfg.AgentID,
 				MachineID: cfg.MachineID,
 				Hostname:  hostname,
-				Version:   "0.1.0",
+				Version:   buildinfo.CurrentVersion(),
 				BootID:    bootID,
 			},
 			Runtime: hbgrpc.AgentRuntime{

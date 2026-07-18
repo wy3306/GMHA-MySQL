@@ -52,6 +52,7 @@ type App struct {
 	BackupService    *BackupService
 	AlertService     *AlertService
 	ManagerRuntime   *ManagerRuntimeService
+	UpgradeService   *UpgradeService
 }
 
 // New 创建并初始化应用核心实例。
@@ -134,7 +135,7 @@ func New(cfg Config) (*App, error) {
 		return nil, err
 	}
 
-	sshClient := sshinfra.NewClient()
+	sshClient := sshinfra.NewClient(cfg.ManagerPublicKey)
 	trustService, err := sshinfra.NewTrustService(cfg.ManagerPublicKey, sshClient)
 	if err != nil {
 		_ = db.Close()
@@ -213,12 +214,15 @@ func New(cfg Config) (*App, error) {
 		packageSelector,
 		packageService,
 		cfg.ManagerHTTPAddr,
+		func(targetIP string) string {
+			return ResolveManagerHTTPAddrForTarget(cfg.ManagerHTTPAddr, targetIP)
+		},
 	)
 	createMySQLUninstallTask := taskusecase.NewCreateMySQLUninstallTaskUsecase(machineRepo, agentRepo, mysqlInstanceRepo)
 	createMySQLTopologyTask := taskusecase.NewCreateMySQLTopologyTaskUsecase(machineRepo, agentRepo, mysqlInstanceRepo)
 	taskService := NewTaskService(taskdomain.Repository(taskRepo), createExecTask, createCollectTask, createStaticTask, createMySQLInstallTask, createMySQLUninstallTask, createMySQLTopologyTask, machineInfoRepo, staticInfoRepo, machineRepo, mysqlInstanceRepo)
 	mysqlService := NewMySQLService(mysqlInstanceRepo, machinedomain.Repository(machineRepo), heartbeatService, mysqlAccountPresetRepo)
-	haService := NewHAService(haRepo, machinedomain.Repository(machineRepo), mysqlInstanceRepo)
+	haService := NewHAService(haRepo, machinedomain.Repository(machineRepo), mysqlInstanceRepo, mysqlAccountPresetRepo)
 	haService.ConfigureArchitectureExecutor(taskService)
 	clusterService := NewClusterService(clusterRepo)
 	agentService := NewAgentService(agentRepo, machineRepo, sshClient, heartbeatService, recoveryService, installAgent, upgradeAgent, uninstallAgent, taskService, mysqlService, cfg.AgentBinaryPath, cfg.ManagerHTTPAddr, cfg.ManagerGRPCAddr)
@@ -226,6 +230,8 @@ func New(cfg Config) (*App, error) {
 	backupService := NewBackupService(backupRepo, taskService, machinedomain.Repository(machineRepo), mysqlInstanceRepo)
 	backupService.Start()
 
+	managerRuntime := NewManagerRuntimeService(cfg)
+	upgradeService := NewUpgradeService(filepath.Join(home, ".gmha", "upgrade-jobs.json"), packageService, agentService, managerRuntime)
 	return &App{
 		db:               db,
 		MachineService:   machineService,
@@ -239,7 +245,8 @@ func New(cfg Config) (*App, error) {
 		PackageService:   packageService,
 		BackupService:    backupService,
 		AlertService:     alertService,
-		ManagerRuntime:   NewManagerRuntimeService(cfg),
+		ManagerRuntime:   managerRuntime,
+		UpgradeService:   upgradeService,
 	}, nil
 }
 

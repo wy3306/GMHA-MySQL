@@ -32,15 +32,18 @@ func (h *HAHandler) HandleClusterActions(w http.ResponseWriter, r *http.Request)
 		items, err := h.ha.ListVIPConfigs(r.Context(), clusterID)
 		writeHAJSON(w, items, err)
 	case len(parts) == 3 && parts[1] == "vip" && parts[2] == "config" && r.Method == http.MethodPost:
-		var req hadomain.ClusterVIPConfig
+		var req struct {
+			hadomain.ClusterVIPConfig
+			TargetMachineID string `json:"target_machine_id"`
+		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeHAError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		item, err := h.ha.SaveVIPConfig(r.Context(), clusterID, req)
+		item, err := h.ha.ApplyVIPConfig(r.Context(), clusterID, req.TargetMachineID, req.ClusterVIPConfig)
 		writeHAJSON(w, item, err)
 	case len(parts) == 3 && parts[1] == "vip" && parts[2] == "config" && r.Method == http.MethodDelete:
-		err := h.ha.DeleteVIPConfig(r.Context(), clusterID, r.URL.Query().Get("vip"))
+		err := h.ha.RemoveVIPConfig(r.Context(), clusterID, r.URL.Query().Get("vip"))
 		writeHAJSON(w, map[string]bool{"deleted": err == nil}, err)
 	case len(parts) == 3 && parts[1] == "vip" && parts[2] == "status" && r.Method == http.MethodGet:
 		items, err := h.ha.VIP().Status(r.Context(), clusterID)
@@ -76,6 +79,14 @@ func (h *HAHandler) HandleClusterActions(w http.ResponseWriter, r *http.Request)
 			return
 		}
 		item, err := h.ha.StartArchitectureAdjustment(r.Context(), clusterID, req)
+		writeHAJSON(w, item, err)
+	case len(parts) == 2 && parts[1] == "bootstrap" && r.Method == http.MethodPost:
+		var req app.ClusterBootstrapRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeHAError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		item, err := h.ha.StartClusterBootstrap(r.Context(), clusterID, req)
 		writeHAJSON(w, item, err)
 	case len(parts) == 3 && parts[1] == "architecture" && r.Method == http.MethodGet:
 		item, ok, err := h.ha.GetArchitectureRun(r.Context(), clusterID, parts[2])

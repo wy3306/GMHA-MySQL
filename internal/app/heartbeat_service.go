@@ -41,6 +41,7 @@ type HeartbeatService struct {
 	}
 	mu                 sync.RWMutex
 	latest             map[string]hbdomain.LatestStatus
+	metricSnapshotAt   map[string]time.Time
 	dynamicConfig      dynamicdomain.DynamicCollectConfig
 	mysqlDynamicConfig dynamicdomain.DynamicCollectConfig
 }
@@ -107,6 +108,7 @@ func NewHeartbeatService(repo hbdomain.Repository, cfg HeartbeatConfig, agentRep
 		machines:           machineRepo,
 		mysql:              mysqlRepo,
 		latest:             make(map[string]hbdomain.LatestStatus),
+		metricSnapshotAt:   make(map[string]time.Time),
 		dynamicConfig:      dynamicdomain.BuildDefaultDynamicCollectConfig(),
 		mysqlDynamicConfig: dynamicdomain.BuildDefaultMySQLDynamicCollectConfig(),
 	}
@@ -119,6 +121,13 @@ func (s *HeartbeatService) GetDynamicCollectConfig() dynamicdomain.DynamicCollec
 }
 
 func (s *HeartbeatService) UpdateDynamicCollectConfig(cfg dynamicdomain.DynamicCollectConfig) dynamicdomain.DynamicCollectConfig {
+	hostTasks := make([]dynamicdomain.CollectTaskSpec, 0, len(cfg.Tasks))
+	for _, task := range cfg.Tasks {
+		if !strings.HasPrefix(strings.TrimSpace(task.Name), "mysql_") {
+			hostTasks = append(hostTasks, task)
+		}
+	}
+	cfg.Tasks = hostTasks
 	if cfg.UpdatedAt.IsZero() {
 		cfg.UpdatedAt = time.Now().UTC()
 	}
@@ -334,6 +343,7 @@ func (s *HeartbeatService) getByMachineIDRefreshing(ctx context.Context, machine
 func (s *HeartbeatService) ProcessHeartbeat(ctx context.Context, req *hbgrpc.HeartbeatRequest) (*hbgrpc.HeartbeatResponse, error) {
 	now := time.Now().UTC()
 	payload := s.enrichAlertPayload(ctx, mapRequest(req))
+	payload = s.filterUnregisteredMySQLMetrics(ctx, payload)
 
 	s.mu.Lock()
 	current, ok := s.latest[payload.AgentID]
@@ -355,6 +365,17 @@ func (s *HeartbeatService) ProcessHeartbeat(ctx context.Context, req *hbgrpc.Hea
 	if err := s.repo.UpsertLatestStatus(ctx, next); err != nil {
 		return nil, err
 	}
+	if writer, ok := s.repo.(hbdomain.MetricSnapshotWriter); ok {
+		metrics := s.dashboardMetricSnapshot(next.AgentID, next.Metrics, now)
+		if len(metrics) > 0 {
+			if err := writer.AppendMetricSnapshot(ctx, hbdomain.MetricSnapshot{
+				AgentID: next.AgentID, MachineID: next.MachineID, ClusterID: next.ClusterID,
+				Metrics: metrics, CollectedAt: now,
+			}); err != nil {
+				return nil, err
+			}
+		}
+	}
 	s.syncOperationalState(ctx, next)
 	if changed {
 		_ = s.repo.AppendEvent(ctx, buildEvent(current, next, reason, payload, now))
@@ -375,6 +396,38 @@ func (s *HeartbeatService) ProcessHeartbeat(ctx context.Context, req *hbgrpc.Hea
 		DynamicCollect:      &cfg,
 		MySQLDynamicCollect: &mysqlCfg,
 	}, nil
+}
+
+func (s *HeartbeatService) dashboardMetricSnapshot(agentID string, metrics []dynamicdomain.MetricResult, now time.Time) []dynamicdomain.MetricResult {
+	s.mu.Lock()
+	last := s.metricSnapshotAt[agentID]
+	if !last.IsZero() && now.Sub(last) < 15*time.Second {
+		s.mu.Unlock()
+		return nil
+	}
+	s.metricSnapshotAt[agentID] = now
+	s.mu.Unlock()
+	wanted := map[string]bool{
+		"mysql_qps": true, "mysql_tps": true, "cpu_usage_percent": true,
+		"io_status": true, "filesystem_usage": true, "network_throughput": true,
+	}
+	out := make([]dynamicdomain.MetricResult, 0, 8)
+	for _, metric := range metrics {
+		if wanted[metric.Name] {
+			out = append(out, metric)
+		}
+	}
+	return out
+}
+
+// MetricHistory returns persisted Agent metric snapshots for dashboard trend
+// aggregation. Repositories without history support return an empty series.
+func (s *HeartbeatService) MetricHistory(ctx context.Context, clusterID string, since time.Time, limit int) ([]hbdomain.MetricSnapshot, error) {
+	reader, ok := s.repo.(hbdomain.MetricSnapshotReader)
+	if !ok {
+		return []hbdomain.MetricSnapshot{}, nil
+	}
+	return reader.ListMetricSnapshots(ctx, strings.TrimSpace(clusterID), since, limit)
 }
 
 func (s *HeartbeatService) Reconcile(ctx context.Context) error {
@@ -426,6 +479,40 @@ func (s *HeartbeatService) enrichAlertPayload(ctx context.Context, payload hbdom
 	return payload
 }
 
+// filterUnregisteredMySQLMetrics prevents an Agent without mysql-heartbeat
+// configuration from inventing a default :3306 instance and raising alarms.
+// Only metrics that map to a Manager-registered instance are retained.
+func (s *HeartbeatService) filterUnregisteredMySQLMetrics(ctx context.Context, payload hbdomain.HeartbeatPayload) hbdomain.HeartbeatPayload {
+	reader, ok := s.mysql.(interface {
+		Get(context.Context, string, int) (mysqlapp.Instance, bool, error)
+	})
+	if !ok {
+		return payload
+	}
+	filtered := make([]dynamicdomain.MetricResult, 0, len(payload.Metrics))
+	registered := make(map[int]bool)
+	checked := make(map[int]bool)
+	for _, metric := range payload.Metrics {
+		if !strings.HasPrefix(metric.Name, "mysql_") {
+			filtered = append(filtered, metric)
+			continue
+		}
+		port, err := strconv.Atoi(strings.TrimSpace(metric.Labels["mysql_port"]))
+		if err != nil || port <= 0 {
+			continue
+		}
+		if !checked[port] {
+			_, registered[port], _ = reader.Get(ctx, payload.MachineID, port)
+			checked[port] = true
+		}
+		if registered[port] {
+			filtered = append(filtered, metric)
+		}
+	}
+	payload.Metrics = filtered
+	return payload
+}
+
 func withAlertHealthMetrics(payload hbdomain.HeartbeatPayload, heartbeatAlive float64) hbdomain.HeartbeatPayload {
 	now := time.Now().UTC()
 	healthValue := float64(0)
@@ -460,6 +547,21 @@ func (s *HeartbeatService) syncOperationalState(ctx context.Context, item hbdoma
 		msg := item.LastErrorSummary
 		_ = s.agents.UpdateState(ctx, item.MachineID, agentdomain.StateError, msg)
 		_ = s.machines.UpdateStatus(ctx, item.MachineID, machinedomain.StatusAgentError, msg)
+	}
+}
+
+// machineStatusFromHeartbeat maps the live heartbeat transport state to the
+// machine-management status. Health degradation is shown separately from
+// connectivity, so a DEGRADED Agent remains online while SUSPECT/OFFLINE is
+// consistently reported as an Agent error.
+func machineStatusFromHeartbeat(state hbdomain.AgentState, lastError string) (machinedomain.Status, string, bool) {
+	switch state {
+	case hbdomain.StateOnline, hbdomain.StateDegraded:
+		return machinedomain.StatusAgentOnline, "", true
+	case hbdomain.StateOffline, hbdomain.StateSuspect:
+		return machinedomain.StatusAgentError, lastError, true
+	default:
+		return "", "", false
 	}
 }
 

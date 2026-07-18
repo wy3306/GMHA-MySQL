@@ -31,17 +31,19 @@ type Config struct {
 
 // InstanceConfig 是单个 MySQL 实例的连接和路径配置。
 type InstanceConfig struct {
-	Port        int    `json:"port"`
-	Socket      string `json:"socket"`
-	Username    string `json:"username"`
-	Password    string `json:"password"`
-	Database    string `json:"database"`
-	SystemdUnit string `json:"systemd_unit"`
-	DataDir     string `json:"data_dir,omitempty"`
-	BinlogDir   string `json:"binlog_dir,omitempty"`
-	RedoDir     string `json:"redo_dir,omitempty"`
-	TmpDir      string `json:"tmp_dir,omitempty"`
-	UndoDir     string `json:"undo_dir,omitempty"`
+	Port               int    `json:"port"`
+	Socket             string `json:"socket"`
+	Username           string `json:"username"`
+	Password           string `json:"password"`
+	ManagementUsername string `json:"management_username,omitempty"`
+	ManagementPassword string `json:"management_password,omitempty"`
+	Database           string `json:"database"`
+	SystemdUnit        string `json:"systemd_unit"`
+	DataDir            string `json:"data_dir,omitempty"`
+	BinlogDir          string `json:"binlog_dir,omitempty"`
+	RedoDir            string `json:"redo_dir,omitempty"`
+	TmpDir             string `json:"tmp_dir,omitempty"`
+	UndoDir            string `json:"undo_dir,omitempty"`
 }
 
 // Checker 是 MySQL 心跳检查器，管理数据库连接池并定期执行心跳检查，支持自动恢复。
@@ -113,13 +115,20 @@ func (c *Checker) checkInstance(ctx context.Context, instance InstanceConfig, ke
 	}
 	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	var one int
-	if err := db.QueryRowContext(checkCtx, "select 1 from dual").Scan(&one); err != nil {
+	var one, readOnly, superReadOnly int
+	if err := db.QueryRowContext(checkCtx, "select 1, @@global.read_only, @@global.super_read_only from dual").Scan(&one, &readOnly, &superReadOnly); err != nil {
 		c.reset(key)
 		return c.failCheck(ctx, instance, key, now, "select 1 failed: "+err.Error())
 	}
 	if one != 1 {
 		return c.failCheck(ctx, instance, key, now, "select 1 returned unexpected value")
+	}
+	if readOnly == 1 || superReadOnly == 1 {
+		c.markSuccess(key, now)
+		return hbdomain.HealthCheck{Name: "mysql.heartbeat." + instanceName(instance), Status: hbdomain.CheckOK, Detail: "read-only replica heartbeat ok", CheckedAt: now}
+	}
+	if err := c.ensureHeartbeat(ctx, db, key); err != nil {
+		return c.failCheck(ctx, instance, key, now, err.Error())
 	}
 	if _, err := db.ExecContext(checkCtx, "update gmha.heartbeat set ts = current_timestamp where id = 1"); err != nil {
 		c.reset(key)
@@ -173,22 +182,28 @@ func (c *Checker) db(ctx context.Context, instance InstanceConfig, key string) (
 		}
 		c.clients[key] = db
 	}
+	c.mu.Unlock()
+	return db, nil
+}
+
+func (c *Checker) ensureHeartbeat(ctx context.Context, db *sql.DB, key string) error {
+	c.mu.Lock()
 	ensured := c.ensured[key]
 	c.mu.Unlock()
-
-	if !ensured {
-		ensureCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		err := ensureHeartbeatTable(ensureCtx, db)
-		cancel()
-		if err != nil {
-			c.reset(key)
-			return nil, err
-		}
-		c.mu.Lock()
-		c.ensured[key] = true
-		c.mu.Unlock()
+	if ensured {
+		return nil
 	}
-	return db, nil
+	ensureCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	err := ensureHeartbeatTable(ensureCtx, db)
+	cancel()
+	if err != nil {
+		c.reset(key)
+		return err
+	}
+	c.mu.Lock()
+	c.ensured[key] = true
+	c.mu.Unlock()
+	return nil
 }
 
 func openDB(instance InstanceConfig) (*sql.DB, error) {

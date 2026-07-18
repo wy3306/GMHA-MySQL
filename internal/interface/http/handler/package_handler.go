@@ -37,7 +37,7 @@ func (h *PackageHandler) HandlePackages(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		defer file.Close()
-		item, err := h.service.SaveUpload(r.FormValue("category"), r.FormValue("arch"), header.Filename, file)
+		item, err := h.service.SaveUploadWithMetadata(r.FormValue("category"), r.FormValue("arch"), header.Filename, r.FormValue("version"), r.FormValue("description"), file)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return

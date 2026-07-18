@@ -18,7 +18,7 @@ type TaskRepository struct {
 }
 
 func (r *TaskRepository) ListTaskPage(ctx context.Context, query taskdomain.ListQuery) ([]taskdomain.Task, int, error) {
-	where := make([]string, 0, 3)
+	where := []string{"parent_task_id = ''", "type not in ('collect_machine_info', 'collect_static_info')"}
 	args := make([]any, 0)
 	if keyword := strings.ToLower(strings.TrimSpace(query.Keyword)); keyword != "" {
 		where = append(where, `(lower(id) like ? or lower(type) like ? or lower(machine_id) like ? or lower(current_step) like ? or lower(spec_json) like ?)`)
@@ -51,7 +51,7 @@ func (r *TaskRepository) ListTaskPage(ctx context.Context, query taskdomain.List
 	}
 	pageArgs := append(append([]any{}, args...), query.Limit, query.Offset)
 	rows, err := r.db.QueryContext(ctx, fmt.Sprintf(`
-		select id, type, machine_id, agent_id, status, progress_percent, current_step, spec_json, created_at, started_at, finished_at
+		select id, parent_task_id, type, machine_id, agent_id, status, progress_percent, current_step, spec_json, created_at, started_at, finished_at
 		from tasks%s order by created_at desc, id desc limit ? offset ?`, whereSQL), pageArgs...)
 	if err != nil {
 		return nil, 0, err
@@ -76,6 +76,7 @@ func (r *TaskRepository) Migrate() error {
 	_, err := r.db.Exec(`
 		create table if not exists tasks (
 			id text primary key,
+			parent_task_id text not null default '',
 			type text not null,
 			machine_id text not null,
 			agent_id text not null,
@@ -109,7 +110,62 @@ func (r *TaskRepository) Migrate() error {
 		);
 		create index if not exists idx_task_events_task_time on task_events(task_id, created_at desc);
 	`)
+	if err != nil {
+		return err
+	}
+	if _, alterErr := r.db.Exec(`alter table tasks add column parent_task_id text not null default ''`); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column") && !strings.Contains(strings.ToLower(alterErr.Error()), "already exists") {
+		return alterErr
+	}
+	_, err = r.db.Exec(`create index if not exists idx_tasks_parent_created on tasks(parent_task_id, created_at desc)`)
+	if err == nil {
+		_, err = r.db.Exec(`
+			update tasks as child set parent_task_id = coalesce((
+				select parent.id from tasks as parent join task_events as event on event.task_id = parent.id
+				where parent.type = 'mysql_cluster_bootstrap' and instr(event.content, child.id) > 0 limit 1
+			), '') where child.type = 'mysql_install' and child.parent_task_id = ''
+		`)
+	}
+	if err == nil {
+		err = r.backfillPlatformTaskParents()
+	}
 	return err
+}
+
+func (r *TaskRepository) backfillPlatformTaskParents() error {
+	rows, err := r.db.Query(`select id, spec_json from tasks where type = 'platform_operation'`)
+	if err != nil {
+		return err
+	}
+	type relation struct {
+		parent string
+		child  string
+	}
+	var relations []relation
+	for rows.Next() {
+		var parentID, raw string
+		if err := rows.Scan(&parentID, &raw); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		var spec taskdomain.PlatformOperationSpec
+		if json.Unmarshal([]byte(raw), &spec) != nil {
+			continue
+		}
+		for _, childID := range spec.RelatedTaskIDs {
+			if childID = strings.TrimSpace(childID); childID != "" && childID != parentID {
+				relations = append(relations, relation{parent: parentID, child: childID})
+			}
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, item := range relations {
+		if _, err := r.db.Exec(`update tasks set parent_task_id = ? where id = ? and parent_task_id = ''`, item.parent, item.child); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *TaskRepository) CreateTask(ctx context.Context, task taskdomain.Task, steps []taskdomain.Step, events []taskdomain.Event) error {
@@ -120,9 +176,9 @@ func (r *TaskRepository) CreateTask(ctx context.Context, task taskdomain.Task, s
 	defer tx.Rollback()
 
 	if _, err := tx.ExecContext(ctx, `
-		insert into tasks (id, type, machine_id, agent_id, status, progress_percent, current_step, spec_json, created_at, started_at, finished_at)
-		values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, task.ID, string(task.Type), task.MachineID, task.AgentID, string(task.Status), task.ProgressPercent, task.CurrentStep, string(task.SpecJSON), formatDatabaseTime(task.CreatedAt), formatNullableTime(task.StartedAt), formatNullableTime(task.FinishedAt)); err != nil {
+		insert into tasks (id, parent_task_id, type, machine_id, agent_id, status, progress_percent, current_step, spec_json, created_at, started_at, finished_at)
+		values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, task.ID, task.ParentTaskID, string(task.Type), task.MachineID, task.AgentID, string(task.Status), task.ProgressPercent, task.CurrentStep, string(task.SpecJSON), formatDatabaseTime(task.CreatedAt), formatNullableTime(task.StartedAt), formatNullableTime(task.FinishedAt)); err != nil {
 		return err
 	}
 	for _, step := range steps {
@@ -146,7 +202,7 @@ func (r *TaskRepository) CreateTask(ctx context.Context, task taskdomain.Task, s
 
 func (r *TaskRepository) GetTask(ctx context.Context, taskID string) (taskdomain.Task, bool, error) {
 	row := r.db.QueryRowContext(ctx, `
-		select id, type, machine_id, agent_id, status, progress_percent, current_step, spec_json, created_at, started_at, finished_at
+		select id, parent_task_id, type, machine_id, agent_id, status, progress_percent, current_step, spec_json, created_at, started_at, finished_at
 		from tasks where id = ?
 	`, taskID)
 	item, err := scanTask(row)
@@ -164,8 +220,8 @@ func (r *TaskRepository) ListTasks(ctx context.Context, limit int) ([]taskdomain
 		limit = 20
 	}
 	rows, err := r.db.QueryContext(ctx, `
-		select id, type, machine_id, agent_id, status, progress_percent, current_step, spec_json, created_at, started_at, finished_at
-		from tasks
+		select id, parent_task_id, type, machine_id, agent_id, status, progress_percent, current_step, spec_json, created_at, started_at, finished_at
+		from tasks where parent_task_id = '' and type not in ('collect_machine_info', 'collect_static_info')
 		order by created_at desc
 		limit ?
 	`, limit)
@@ -189,7 +245,7 @@ func (r *TaskRepository) ListTasksByStatus(ctx context.Context, status taskdomai
 		limit = 20
 	}
 	rows, err := r.db.QueryContext(ctx, `
-		select id, type, machine_id, agent_id, status, progress_percent, current_step, spec_json, created_at, started_at, finished_at
+		select id, parent_task_id, type, machine_id, agent_id, status, progress_percent, current_step, spec_json, created_at, started_at, finished_at
 		from tasks
 		where status = ?
 		order by created_at asc
@@ -228,6 +284,50 @@ func (r *TaskRepository) ListSteps(ctx context.Context, taskID string) ([]taskdo
 		out = append(out, item)
 	}
 	return out, rows.Err()
+}
+
+func (r *TaskRepository) ListChildTasks(ctx context.Context, parentTaskID string) ([]taskdomain.Task, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		select id, parent_task_id, type, machine_id, agent_id, status, progress_percent, current_step, spec_json, created_at, started_at, finished_at
+		from tasks where parent_task_id = ? order by created_at asc, id asc
+	`, parentTaskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []taskdomain.Task
+	for rows.Next() {
+		item, err := scanTask(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+// AssignParentTasks attaches existing execution tasks to one business-level
+// parent. Existing relationships are never overwritten.
+func (r *TaskRepository) AssignParentTasks(ctx context.Context, parentTaskID string, childTaskIDs []string) error {
+	parentTaskID = strings.TrimSpace(parentTaskID)
+	if parentTaskID == "" {
+		return errors.New("parent task id is required")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, childID := range childTaskIDs {
+		childID = strings.TrimSpace(childID)
+		if childID == "" || childID == parentTaskID {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `update tasks set parent_task_id = ? where id = ? and parent_task_id = ''`, parentTaskID, childID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (r *TaskRepository) ListEvents(ctx context.Context, taskID string, limit int) ([]taskdomain.Event, error) {
@@ -309,6 +409,41 @@ func (r *TaskRepository) DeleteTask(ctx context.Context, taskID string) error {
 	return tx.Commit()
 }
 
+// DeleteTaskTree atomically removes a parent and every nested execution task.
+func (r *TaskRepository) DeleteTaskTree(ctx context.Context, taskID string) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var count int
+	if err := tx.QueryRowContext(ctx, `with recursive tree(id) as (
+		select id from tasks where id = ? union all
+		select task.id from tasks task join tree on task.parent_task_id = tree.id
+	) select count(*) from tree`, taskID).Scan(&count); err != nil {
+		return err
+	}
+	if count == 0 {
+		return errors.New("task not found")
+	}
+	for _, table := range []string{"task_events", "task_steps"} {
+		query := fmt.Sprintf(`with recursive tree(id) as (
+			select id from tasks where id = ? union all
+			select task.id from tasks task join tree on task.parent_task_id = tree.id
+		) delete from %s where task_id in (select id from tree)`, table)
+		if _, err := tx.ExecContext(ctx, query, taskID); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `with recursive tree(id) as (
+		select id from tasks where id = ? union all
+		select task.id from tasks task join tree on task.parent_task_id = tree.id
+	) delete from tasks where id in (select id from tree)`, taskID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (r *TaskRepository) DeleteByMachineID(ctx context.Context, machineID string) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -336,7 +471,7 @@ func scanTask(scanner taskScanner) (taskdomain.Task, error) {
 	var taskType, status, createdAt string
 	var specJSON sql.NullString
 	var startedAt, finishedAt sql.NullString
-	if err := scanner.Scan(&item.ID, &taskType, &item.MachineID, &item.AgentID, &status, &item.ProgressPercent, &item.CurrentStep, &specJSON, &createdAt, &startedAt, &finishedAt); err != nil {
+	if err := scanner.Scan(&item.ID, &item.ParentTaskID, &taskType, &item.MachineID, &item.AgentID, &status, &item.ProgressPercent, &item.CurrentStep, &specJSON, &createdAt, &startedAt, &finishedAt); err != nil {
 		return taskdomain.Task{}, err
 	}
 	item.Type = taskdomain.Type(taskType)

@@ -115,7 +115,14 @@ func (s *PackageSelector) SelectVersionArchitecture(info collectdomain.MachineIn
 		candidates = append(candidates, item)
 	}
 	if len(candidates) == 0 {
-		return Package{}, fmt.Errorf("no local mysql package matches version=%s architecture=%s machine_glibc=%s", firstNonEmpty(mysqlVersion, "auto"), requestedArch, info.GlibcVersion)
+		available := make([]string, 0)
+		for _, entry := range entries {
+			if item, ok := parsePackage(entry.Name()); ok && normalizeArch(item.Arch) == requestedArch {
+				available = append(available, fmt.Sprintf("%s/glibc%d.%d", item.Version, item.GlibcVersion.Major, item.GlibcVersion.Minor))
+			}
+		}
+		sort.Strings(available)
+		return Package{}, fmt.Errorf("没有兼容的本地 MySQL 安装包：版本=%s，架构=%s，目标 glibc=%s；当前同架构制品=%s", firstNonEmpty(mysqlVersion, "自动"), requestedArch, info.GlibcVersion, firstNonEmpty(strings.Join(available, "、"), "无"))
 	}
 	sort.Slice(candidates, func(i, j int) bool {
 		left, _ := parseMySQLVersion(candidates[i].Version)

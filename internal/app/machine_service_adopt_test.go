@@ -12,16 +12,17 @@ import (
 )
 
 type cleanupSSHClient struct {
-	commands  []string
-	output    string
-	outputErr error
+	commands   []string
+	output     string
+	outputErr  error
+	connectErr error
 }
 
-func (c *cleanupSSHClient) CheckTrustConnection(context.Context, machinedomain.Endpoint, string) (bool, error) {
+func (c *cleanupSSHClient) CheckTrustConnection(context.Context, machinedomain.Endpoint, machinedomain.SSHAuth) (bool, error) {
 	return true, nil
 }
 func (c *cleanupSSHClient) TestConnection(context.Context, machinedomain.Endpoint, machinedomain.SSHAuth) error {
-	return nil
+	return c.connectErr
 }
 func (c *cleanupSSHClient) Run(_ context.Context, _ machinedomain.Endpoint, _ machinedomain.SSHAuth, command string) error {
 	c.commands = append(c.commands, command)
@@ -82,6 +83,55 @@ func TestParsePreservedMySQLConfigAllowsNoConfig(t *testing.T) {
 	}
 }
 
+func TestParseMySQLResiduesCoversInactiveServicesAndPaths(t *testing.T) {
+	output := "MYSQL_ABSENT\n" + mysqlResidueMarker + "systemd:mysqld.service\n" + mysqlResidueMarker + "path:/data/3306\n" + mysqlResidueMarker + "systemd:mysqld.service\n"
+	items := parseMySQLResidues(output)
+	if len(items) != 2 || items[0] != "systemd:mysqld.service" || items[1] != "path:/data/3306" {
+		t.Fatalf("unexpected residues: %#v", items)
+	}
+}
+
+func TestDeletePrecheckDetectsRemoteMySQLWithoutRegisteredInstance(t *testing.T) {
+	repo := &detachMachineRepo{machine: machinedomain.Machine{ID: "machine-remote-mysql", IP: "192.0.2.30", SSHPort: 22, SSHUser: "root"}}
+	sshClient := &cleanupSSHClient{output: mysqlResidueMarker + "systemd:mysqld.service\n" + mysqlResidueMarker + "config:/data/3306/my.cnf\nMYSQL_PRESENT\n"}
+	service := &MachineService{machineRepo: repo, sshClient: sshClient}
+	report, err := service.PrecheckDeleteMachine(context.Background(), repo.machine.ID)
+	if err != nil {
+		t.Fatalf("delete precheck: %v", err)
+	}
+	if !report.RemoteChecked || !report.SSHReachable || !report.MySQLDetected {
+		t.Fatalf("expected remote MySQL detection, got %+v", report)
+	}
+	if len(report.RegisteredMySQLPorts) != 0 || len(report.MySQLResidues) != 2 {
+		t.Fatalf("registered and remote state must remain distinct: %+v", report)
+	}
+}
+
+func TestMySQLResidueCleanupArchivesBeforeRemovingInstallPaths(t *testing.T) {
+	command := mysqlResidueCleanupCommand()
+	for _, expected := range []string{"gmha-cleanup-backup", "mysql*.service", "--defaults-file", "pgrep -x mysqld", "/usr/local/mysql", "/data/3306", "systemctl daemon-reload"} {
+		if !strings.Contains(command, expected) {
+			t.Fatalf("cleanup command does not contain %q: %s", expected, command)
+		}
+	}
+}
+
+func TestVerifyMySQLRemovedRequiresExplicitAbsentResult(t *testing.T) {
+	repo := &detachMachineRepo{machine: machinedomain.Machine{ID: "machine-clean", IP: "192.0.2.31", SSHPort: 22, SSHUser: "root"}}
+	sshClient := &cleanupSSHClient{output: "MYSQL_ABSENT\n"}
+	service := &MachineService{machineRepo: repo, sshClient: sshClient}
+	residues, err := service.verifyMySQLRemovedViaSSH(context.Background(), repo.machine)
+	if err != nil || len(residues) != 0 {
+		t.Fatalf("expected verified cleanup, residues=%v err=%v", residues, err)
+	}
+
+	sshClient.output = mysqlResidueMarker + "process:mysqld:42\nMYSQL_PRESENT\n"
+	residues, err = service.verifyMySQLRemovedViaSSH(context.Background(), repo.machine)
+	if err == nil || len(residues) != 1 || !strings.Contains(err.Error(), "MySQL 残留") {
+		t.Fatalf("expected residual verification failure, residues=%v err=%v", residues, err)
+	}
+}
+
 func TestDeleteMachineDetachOnlyDoesNotNeedRemoteServices(t *testing.T) {
 	repo := &detachMachineRepo{machine: machinedomain.Machine{ID: "machine-offline", IP: "192.0.2.20"}}
 	service := &MachineService{machineRepo: repo}
@@ -103,6 +153,19 @@ func TestDeleteMachineRejectsClusterMember(t *testing.T) {
 	}
 	if repo.deleted {
 		t.Fatal("cluster member must not be deleted")
+	}
+}
+
+func TestDeleteMachineChecksSSHBeforeRemoteCleanup(t *testing.T) {
+	repo := &detachMachineRepo{machine: machinedomain.Machine{ID: "machine-unreachable", IP: "192.168.31.210", SSHPort: 22, SSHUser: "root"}}
+	sshClient := &cleanupSSHClient{connectErr: errors.New("dial tcp 192.168.31.210:22: connect: no route to host")}
+	service := &MachineService{machineRepo: repo, sshClient: sshClient}
+	_, err := service.DeleteMachineWithOptions(context.Background(), repo.machine.ID, DeleteMachineOptions{DeleteAgent: true})
+	if err == nil || !strings.Contains(err.Error(), "卸载前检查失败") || !strings.Contains(err.Error(), "Manager 无法路由到目标主机") {
+		t.Fatalf("expected actionable SSH precheck error, got %v", err)
+	}
+	if repo.deleted || len(sshClient.commands) != 0 {
+		t.Fatalf("remote or local cleanup must not start after failed SSH precheck: deleted=%v commands=%v", repo.deleted, sshClient.commands)
 	}
 }
 
@@ -149,5 +212,14 @@ func TestConfirmPreservedAgentReportsShortServiceDiagnosis(t *testing.T) {
 	err := service.confirmPreservedAgentOnline(context.Background(), sshClient, machinedomain.Endpoint{}, machinedomain.SSHAuth{}, "machine-1", time.Now(), errors.New("exit status 1"))
 	if err == nil || !strings.Contains(err.Error(), "state=failed") {
 		t.Fatalf("expected concise service diagnosis, got %v", err)
+	}
+}
+
+func TestPreservedAgentSystemdUnitKeepsAgentRunning(t *testing.T) {
+	unit := preservedAgentSystemdUnit("/home/gmha/agent")
+	for _, expected := range []string{"Type=simple", "Restart=always", "ExecStart=/home/gmha/agent/agentd --config /home/gmha/agent/agent.yaml", "WantedBy=multi-user.target"} {
+		if !strings.Contains(unit, expected) {
+			t.Fatalf("preserved Agent unit missing %q:\n%s", expected, unit)
+		}
 	}
 }

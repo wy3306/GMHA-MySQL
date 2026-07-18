@@ -54,9 +54,71 @@ func (r *HeartbeatRepository) Migrate() error {
 			created_at text not null
 		);
 		create index if not exists idx_agent_event_log_agent_time on agent_event_log(agent_id, created_at desc);
+		create table if not exists agent_metric_snapshot (
+			id integer primary key autoincrement,
+			agent_id text not null,
+			machine_id text not null,
+			cluster_id text not null default '',
+			metrics_json text not null default '[]',
+			collected_at text not null
+		);
+		create index if not exists idx_agent_metric_snapshot_cluster_time on agent_metric_snapshot(cluster_id, collected_at desc);
+		create index if not exists idx_agent_metric_snapshot_machine_time on agent_metric_snapshot(machine_id, collected_at desc);
 	`)
 	_, _ = r.db.Exec(`alter table agent_latest_status add column metrics_json text not null default '[]'`)
 	return err
+}
+
+// AppendMetricSnapshot stores only snapshots that contain metrics and keeps a
+// rolling seven-day window. Cleanup is intentionally amortized to every 128th
+// insert so the heartbeat hot path does not perform a delete each time.
+func (r *HeartbeatRepository) AppendMetricSnapshot(ctx context.Context, item hbdomain.MetricSnapshot) error {
+	if len(item.Metrics) == 0 {
+		return nil
+	}
+	metricsJSON, err := json.Marshal(item.Metrics)
+	if err != nil {
+		return err
+	}
+	result, err := r.db.ExecContext(ctx, `
+		insert into agent_metric_snapshot (agent_id, machine_id, cluster_id, metrics_json, collected_at)
+		values (?, ?, ?, ?, ?)
+	`, item.AgentID, item.MachineID, item.ClusterID, string(metricsJSON), item.CollectedAt.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return err
+	}
+	if id, idErr := result.LastInsertId(); idErr == nil && id%128 == 0 {
+		_, _ = r.db.ExecContext(ctx, `delete from agent_metric_snapshot where collected_at < ?`, time.Now().UTC().Add(-7*24*time.Hour).Format(time.RFC3339Nano))
+	}
+	return nil
+}
+
+func (r *HeartbeatRepository) ListMetricSnapshots(ctx context.Context, clusterID string, since time.Time, limit int) ([]hbdomain.MetricSnapshot, error) {
+	if limit <= 0 || limit > 20000 {
+		limit = 10000
+	}
+	rows, err := r.db.QueryContext(ctx, `
+		select id, agent_id, machine_id, cluster_id, metrics_json, collected_at
+		from agent_metric_snapshot
+		where cluster_id = ? and collected_at >= ?
+		order by collected_at asc limit ?
+	`, clusterID, since.UTC().Format(time.RFC3339Nano), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]hbdomain.MetricSnapshot, 0)
+	for rows.Next() {
+		var item hbdomain.MetricSnapshot
+		var metricsJSON, collectedAt string
+		if err := rows.Scan(&item.ID, &item.AgentID, &item.MachineID, &item.ClusterID, &metricsJSON, &collectedAt); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal([]byte(metricsJSON), &item.Metrics)
+		item.CollectedAt, _ = time.Parse(time.RFC3339Nano, collectedAt)
+		out = append(out, item)
+	}
+	return out, rows.Err()
 }
 
 func (r *HeartbeatRepository) UpsertLatestStatus(ctx context.Context, item hbdomain.LatestStatus) error {
@@ -163,6 +225,9 @@ func (r *HeartbeatRepository) DeleteByMachineID(ctx context.Context, machineID s
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `delete from agent_event_log where machine_id = ?`, machineID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `delete from agent_metric_snapshot where machine_id = ?`, machineID); err != nil {
 		return err
 	}
 	return tx.Commit()

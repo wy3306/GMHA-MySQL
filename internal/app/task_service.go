@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,8 @@ import (
 	taskdomain "gmha/internal/domain/task"
 	taskusecase "gmha/internal/usecase/task"
 )
+
+const mysqlDefaultsFilePlaceholder = "__GMHA_MYSQL_DEFAULTS_FILE__"
 
 // TaskConnection 定义了 Agent 任务连接接口，用于向 Agent 发送任务下发消息。
 type TaskConnection interface {
@@ -41,6 +44,8 @@ type TaskService struct {
 	mu             sync.RWMutex
 	agents         map[string]TaskConnection
 	agentCaps      map[string]map[string]bool
+	agentMachines  map[string]string
+	machineAgents  map[string]string
 }
 
 // MachineInfoSaver 定义了机器信息保存接口。
@@ -72,11 +77,13 @@ type MySQLInstanceSaver interface {
 
 // TaskDetail 是任务的完整详情，包含任务本身、步骤和事件列表。
 type TaskDetail struct {
-	Task        taskdomain.Task    `json:"task"`
-	MachineName string             `json:"machine_name,omitempty"`
-	MachineIP   string             `json:"machine_ip,omitempty"`
-	Steps       []taskdomain.Step  `json:"steps"`
-	Events      []taskdomain.Event `json:"events"`
+	Task         taskdomain.Task    `json:"task"`
+	MachineName  string             `json:"machine_name,omitempty"`
+	MachineIP    string             `json:"machine_ip,omitempty"`
+	Steps        []taskdomain.Step  `json:"steps"`
+	Events       []taskdomain.Event `json:"events"`
+	Children     []taskdomain.Task  `json:"children,omitempty"`
+	ChildDetails []TaskDetail       `json:"child_details,omitempty"`
 }
 
 type TaskListQuery = taskdomain.ListQuery
@@ -88,8 +95,36 @@ type TaskListPage struct {
 	Size  int               `json:"page_size"`
 }
 
+type DeleteTasksRequest struct {
+	TaskIDs     []string
+	AllFiltered bool
+	Query       TaskListQuery
+}
+
+type DeleteTaskResult struct {
+	TaskID string `json:"task_id"`
+	Error  string `json:"error,omitempty"`
+}
+
+type DeleteTasksResult struct {
+	Requested int                `json:"requested"`
+	Deleted   int                `json:"deleted"`
+	Failed    int                `json:"failed"`
+	Items     []DeleteTaskResult `json:"items"`
+}
+
 type taskPageRepository interface {
 	ListTaskPage(ctx context.Context, query TaskListQuery) ([]taskdomain.Task, int, error)
+}
+
+type childTaskRepository interface {
+	ListChildTasks(ctx context.Context, parentTaskID string) ([]taskdomain.Task, error)
+}
+
+type taskHierarchyRepository interface {
+	ListChildTasks(ctx context.Context, parentTaskID string) ([]taskdomain.Task, error)
+	AssignParentTasks(ctx context.Context, parentTaskID string, childTaskIDs []string) error
+	DeleteTaskTree(ctx context.Context, taskID string) error
 }
 
 // ClusterMySQLInstallRequest 是集群级 MySQL 批量安装请求。
@@ -116,6 +151,8 @@ type ClusterMySQLInstallRequest struct {
 	Version           string
 	Architecture      string
 	InstallPTTools    bool
+	InstallXtraBackup bool
+	MemoryAllocator   string
 	RuntimeParameters map[string]string
 	Accounts          []taskdomain.MySQLAccountSpec
 }
@@ -132,6 +169,7 @@ type ClusterMySQLInstallItem struct {
 // ClusterMySQLInstallResult 是集群 MySQL 批量安装的总结果。
 type ClusterMySQLInstallResult struct {
 	Cluster string                    `json:"cluster"`
+	Parent  TaskDetail                `json:"parent"`
 	Created int                       `json:"created"`
 	Failed  int                       `json:"failed"`
 	Items   []ClusterMySQLInstallItem `json:"items"`
@@ -155,6 +193,7 @@ type ClusterMySQLUninstallItem struct {
 // ClusterMySQLUninstallResult 是集群 MySQL 批量卸载的总结果。
 type ClusterMySQLUninstallResult struct {
 	Cluster string                      `json:"cluster"`
+	Parent  TaskDetail                  `json:"parent"`
 	Created int                         `json:"created"`
 	Failed  int                         `json:"failed"`
 	Items   []ClusterMySQLUninstallItem `json:"items"`
@@ -163,15 +202,17 @@ type ClusterMySQLUninstallResult struct {
 // MySQLTopologyTaskResult 是 MySQL 拓扑检查任务的创建结果。
 type MySQLTopologyTaskResult struct {
 	Created int          `json:"created"`
+	Parent  TaskDetail   `json:"parent"`
 	Tasks   []TaskDetail `json:"tasks"`
 }
 
 type MySQLUpgradeRequest struct {
-	Machine     string
-	Port        int
-	PackageName string
-	Username    string
-	Password    string
+	Machine          string
+	Port             int
+	PackageName      string
+	PrecheckTaskID   string
+	Force            bool
+	RiskAcknowledged bool
 }
 
 type MySQLUpgradePlan struct {
@@ -179,12 +220,24 @@ type MySQLUpgradePlan struct {
 	TargetVersion  string     `json:"target_version"`
 	CurrentPackage string     `json:"current_package"`
 	TargetPackage  string     `json:"target_package"`
+	PrecheckTaskID string     `json:"precheck_task_id,omitempty"`
+	Forced         bool       `json:"forced"`
+	Task           TaskDetail `json:"task"`
+}
+
+type MySQLUpgradePrecheckPlan struct {
+	CurrentVersion string     `json:"current_version"`
+	TargetVersion  string     `json:"target_version"`
+	CurrentPackage string     `json:"current_package"`
+	TargetPackage  string     `json:"target_package"`
+	Checker        string     `json:"checker"`
 	Task           TaskDetail `json:"task"`
 }
 
 // ExecTaskOptions 为复用 exec 协议的业务任务补充可展示的操作元数据。
 // Agent 仍按 exec 执行，任务中心则可据此展示真实的数据库操作名称与步骤。
 type ExecTaskOptions struct {
+	ParentTaskID    string
 	Operation       string
 	DisplayName     string
 	StepName        string
@@ -193,6 +246,187 @@ type ExecTaskOptions struct {
 	RollbackCommand string
 	PackageName     string
 	TaskType        taskdomain.Type
+}
+
+// CreateBatchTrackingTask creates one business-level parent for a fan-out
+// operation. Agent execution tasks must be attached through AttachChildTasks.
+func (s *TaskService) CreateBatchTrackingTask(ctx context.Context, operation, displayName, target string) (TaskDetail, error) {
+	if s.repo == nil {
+		return TaskDetail{}, errors.New("task repository is not configured")
+	}
+	now := time.Now().UTC()
+	taskID := fmt.Sprintf("batch-task-%d", now.UnixNano())
+	spec, err := json.Marshal(map[string]any{"operation": strings.TrimSpace(operation), "display_name": strings.TrimSpace(displayName), "target": strings.TrimSpace(target), "creation_failures": 0})
+	if err != nil {
+		return TaskDetail{}, err
+	}
+	task := taskdomain.Task{ID: taskID, Type: taskdomain.TypeBatchOperation, MachineID: strings.TrimSpace(target), AgentID: "manager", Status: taskdomain.StatusPending, CurrentStep: "create_children", SpecJSON: spec, CreatedAt: now}
+	steps := []taskdomain.Step{{ID: taskID + "-children", TaskID: taskID, StepNo: 1, StepName: "create_children", Status: taskdomain.StepRunning, Message: "正在创建 Agent 执行子任务。", StartedAt: &now}}
+	events := []taskdomain.Event{{ID: taskID + "-created", TaskID: taskID, StepID: steps[0].ID, EventType: taskdomain.EventInfo, Content: "批量父任务已创建。", CreatedAt: now}}
+	if err := s.repo.CreateTask(ctx, task, steps, events); err != nil {
+		return TaskDetail{}, err
+	}
+	return s.GetTaskDetail(ctx, taskID)
+}
+
+// FinalizeBatchTrackingTask records fan-out creation results. Runtime status
+// and progress are subsequently aggregated from the attached child tasks.
+func (s *TaskService) FinalizeBatchTrackingTask(ctx context.Context, parentTaskID string, created, failed int) error {
+	task, ok, err := s.repo.GetTask(ctx, strings.TrimSpace(parentTaskID))
+	if err != nil || !ok {
+		if err != nil {
+			return err
+		}
+		return errors.New("batch parent task not found")
+	}
+	var spec map[string]any
+	_ = json.Unmarshal(task.SpecJSON, &spec)
+	if spec == nil {
+		spec = map[string]any{}
+	}
+	spec["targets"] = created + failed
+	spec["created"] = created
+	spec["creation_failures"] = failed
+	task.SpecJSON, _ = json.Marshal(spec)
+	now := time.Now().UTC()
+	steps, err := s.repo.ListSteps(ctx, task.ID)
+	if err != nil {
+		return err
+	}
+	if len(steps) > 0 {
+		steps[0].Message = fmt.Sprintf("已创建 %d 个执行子任务，%d 个目标创建失败。", created, failed)
+		steps[0].FinishedAt = &now
+		if created == 0 && failed > 0 {
+			steps[0].Status = taskdomain.StepFailed
+		} else {
+			steps[0].Status = taskdomain.StepSuccess
+		}
+		if err := s.repo.UpdateStep(ctx, steps[0]); err != nil {
+			return err
+		}
+	}
+	if created == 0 {
+		task.ProgressPercent = 100
+		task.FinishedAt = &now
+		if failed > 0 {
+			task.Status, task.CurrentStep = taskdomain.StatusFailed, "create_children"
+		} else {
+			task.Status, task.CurrentStep = taskdomain.StatusSuccess, "completed"
+		}
+	} else {
+		task.Status, task.CurrentStep = taskdomain.StatusRunning, "waiting_children"
+		if task.StartedAt == nil {
+			task.StartedAt = &now
+		}
+	}
+	if err := s.repo.UpdateTask(ctx, task); err != nil {
+		return err
+	}
+	return s.syncParentTask(ctx, task.ID)
+}
+
+// AttachChildTasks establishes the only supported parent-child relation.
+func (s *TaskService) AttachChildTasks(ctx context.Context, parentTaskID string, childTaskIDs []string) error {
+	repo, ok := s.repo.(taskHierarchyRepository)
+	if !ok {
+		return errors.New("task hierarchy repository is not configured")
+	}
+	if err := repo.AssignParentTasks(ctx, strings.TrimSpace(parentTaskID), childTaskIDs); err != nil {
+		return err
+	}
+	return s.syncParentTask(ctx, parentTaskID)
+}
+
+// aggregateParentTask derives the business task state from its direct Agent
+// execution children. The stored parent is kept as an audit anchor; callers
+// always receive a current aggregate even when an Agent report just arrived.
+func (s *TaskService) aggregateParentTask(ctx context.Context, parent taskdomain.Task) (taskdomain.Task, []taskdomain.Task, error) {
+	repo, ok := s.repo.(childTaskRepository)
+	if !ok {
+		return parent, nil, nil
+	}
+	children, err := repo.ListChildTasks(ctx, parent.ID)
+	if err != nil || len(children) == 0 {
+		return parent, children, err
+	}
+	// Manager-driven workflows own their state machine and step progress. Their
+	// Agent children are displayed hierarchically, but must not complete the
+	// parent before later workflow steps have even been created.
+	if parent.Type == taskdomain.TypeArchitecture || parent.Type == taskdomain.TypeClusterBootstrap {
+		return parent, children, nil
+	}
+	completed, failed, progress := 0, 0, 0
+	parentFailed := parent.Status == taskdomain.StatusFailed
+	var earliestStart *time.Time
+	var latestFinish *time.Time
+	for _, child := range children {
+		progress += child.ProgressPercent
+		if child.Status == taskdomain.StatusSuccess || child.Status == taskdomain.StatusFailed {
+			completed++
+		}
+		if child.Status == taskdomain.StatusFailed {
+			failed++
+		}
+		if child.StartedAt != nil && (earliestStart == nil || child.StartedAt.Before(*earliestStart)) {
+			value := *child.StartedAt
+			earliestStart = &value
+		}
+		if child.FinishedAt != nil && (latestFinish == nil || child.FinishedAt.After(*latestFinish)) {
+			value := *child.FinishedAt
+			latestFinish = &value
+		}
+	}
+	creationFailures := 0
+	var spec map[string]any
+	if json.Unmarshal(parent.SpecJSON, &spec) == nil {
+		if value, ok := spec["creation_failures"].(float64); ok {
+			creationFailures = int(value)
+		}
+	}
+	parent.ProgressPercent = progress / len(children)
+	if earliestStart != nil {
+		parent.StartedAt = earliestStart
+	}
+	if completed == len(children) {
+		parent.ProgressPercent = 100
+		parent.FinishedAt = latestFinish
+		if parent.FinishedAt == nil {
+			now := time.Now().UTC()
+			parent.FinishedAt = &now
+		}
+		if parentFailed || failed > 0 || creationFailures > 0 {
+			parent.Status = taskdomain.StatusFailed
+			parent.CurrentStep = fmt.Sprintf("子任务完成 %d/%d，失败 %d", completed, len(children), failed+creationFailures)
+		} else {
+			parent.Status = taskdomain.StatusSuccess
+			parent.CurrentStep = fmt.Sprintf("子任务完成 %d/%d", completed, len(children))
+		}
+		return parent, children, nil
+	}
+	parent.FinishedAt = nil
+	if parent.StartedAt == nil {
+		parent.Status = taskdomain.StatusPending
+	} else {
+		parent.Status = taskdomain.StatusRunning
+	}
+	parent.CurrentStep = fmt.Sprintf("子任务完成 %d/%d", completed, len(children))
+	return parent, children, nil
+}
+
+func (s *TaskService) syncParentTask(ctx context.Context, parentTaskID string) error {
+	parentTaskID = strings.TrimSpace(parentTaskID)
+	if parentTaskID == "" {
+		return nil
+	}
+	parent, ok, err := s.repo.GetTask(ctx, parentTaskID)
+	if err != nil || !ok {
+		return err
+	}
+	aggregated, children, err := s.aggregateParentTask(ctx, parent)
+	if err != nil || len(children) == 0 {
+		return err
+	}
+	return s.repo.UpdateTask(ctx, aggregated)
 }
 
 // NewTaskService 创建任务管理服务实例。
@@ -211,6 +445,8 @@ func NewTaskService(repo taskdomain.Repository, createExec *taskusecase.CreateEx
 		mysqlInstance:  mysqlInstance,
 		agents:         make(map[string]TaskConnection),
 		agentCaps:      make(map[string]map[string]bool),
+		agentMachines:  make(map[string]string),
+		machineAgents:  make(map[string]string),
 	}
 }
 
@@ -231,13 +467,21 @@ func (s *TaskService) CreateMySQLTopologyTasks(ctx context.Context, req taskusec
 	if err != nil {
 		return MySQLTopologyTaskResult{}, err
 	}
-	out := MySQLTopologyTaskResult{Created: len(result.Tasks)}
+	parent, err := s.CreateBatchTrackingTask(ctx, "mysql_topology", "创建 MySQL 复制拓扑", req.Topology)
+	if err != nil {
+		return MySQLTopologyTaskResult{}, err
+	}
+	out := MySQLTopologyTaskResult{Created: len(result.Tasks), Parent: parent}
+	created := 0
 	for _, task := range result.Tasks {
+		task.ParentTaskID = parent.Task.ID
 		steps := result.Steps[task.ID]
 		events := result.Events[task.ID]
 		if err := s.repo.CreateTask(ctx, task, steps, events); err != nil {
+			_ = s.FinalizeBatchTrackingTask(ctx, parent.Task.ID, created, len(result.Tasks)-created)
 			return MySQLTopologyTaskResult{}, err
 		}
+		created++
 		_ = s.tryDispatchPendingTask(ctx, task.ID)
 		detail, err := s.GetTaskDetail(ctx, task.ID)
 		if err != nil {
@@ -245,6 +489,10 @@ func (s *TaskService) CreateMySQLTopologyTasks(ctx context.Context, req taskusec
 		}
 		out.Tasks = append(out.Tasks, detail)
 	}
+	if err := s.FinalizeBatchTrackingTask(ctx, parent.Task.ID, created, len(result.Tasks)-created); err != nil {
+		return MySQLTopologyTaskResult{}, err
+	}
+	out.Parent, _ = s.GetTaskDetail(ctx, parent.Task.ID)
 	return out, nil
 }
 
@@ -314,6 +562,10 @@ func (s *TaskService) SyncArchitectureTrackingTask(ctx context.Context, run hado
 			step.Status = taskdomain.StepSuccess
 			step.Message = "拓扑复核通过，切换锁已释放。"
 			completed++
+		} else if !ok && run.Status == hadomain.ArchitectureRunSucceeded && architectureStepMayBeSkipped(step.StepName) {
+			step.Status = taskdomain.StepSuccess
+			step.Message = "当前转换路径无需执行此步骤，Manager 已安全跳过。"
+			completed++
 		} else if ok {
 			step.StartedAt = &result.StartedAt
 			step.FinishedAt = result.FinishedAt
@@ -349,6 +601,15 @@ func (s *TaskService) SyncArchitectureTrackingTask(ctx context.Context, run hado
 	return s.repo.UpdateTask(ctx, task)
 }
 
+func architectureStepMayBeSkipped(code string) bool {
+	switch code {
+	case "freeze_old_master", "kill_business_sessions", "wait_replication_zero", "force_gate", "fence_old_master", "pt_repair_on_failure", "pt_verify_before_split":
+		return true
+	default:
+		return false
+	}
+}
+
 // RegisterAgent 注册 Agent 的任务连接（无能力声明）。
 func (s *TaskService) RegisterAgent(agentID string, conn TaskConnection) {
 	s.RegisterAgentWithCapabilities(agentID, conn, nil)
@@ -356,9 +617,24 @@ func (s *TaskService) RegisterAgent(agentID string, conn TaskConnection) {
 
 // RegisterAgentWithCapabilities 注册 Agent 的任务连接及其支持的任务类型。
 func (s *TaskService) RegisterAgentWithCapabilities(agentID string, conn TaskConnection, capabilities []string) {
+	s.RegisterAgentForMachineWithCapabilities(agentID, "", conn, capabilities)
+}
+
+// RegisterAgentForMachineWithCapabilities registers the live connection and
+// retains its machine identity so feature gates can be evaluated before a task
+// is created.
+func (s *TaskService) RegisterAgentForMachineWithCapabilities(agentID, machineID string, conn TaskConnection, capabilities []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.agents[agentID] = conn
+	machineID = strings.TrimSpace(machineID)
+	if previous := s.agentMachines[agentID]; previous != "" && previous != machineID {
+		delete(s.machineAgents, previous)
+	}
+	if machineID != "" {
+		s.agentMachines[agentID] = machineID
+		s.machineAgents[machineID] = agentID
+	}
 	if len(capabilities) == 0 {
 		delete(s.agentCaps, agentID)
 		return
@@ -381,7 +657,32 @@ func (s *TaskService) UnregisterAgent(agentID string, conn TaskConnection) {
 	if ok && current == conn {
 		delete(s.agents, agentID)
 		delete(s.agentCaps, agentID)
+		if machineID := s.agentMachines[agentID]; machineID != "" {
+			delete(s.machineAgents, machineID)
+		}
+		delete(s.agentMachines, agentID)
 	}
+}
+
+// MachineCapability reports whether the currently connected Agent for a
+// machine explicitly advertises a feature capability. Missing declarations
+// are never treated as compatible, because legacy Agents only advertised task
+// types and cannot safely execute commands that depend on newer substitutions.
+func (s *TaskService) MachineCapability(machineID, capability string) (bool, string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	machineID = strings.TrimSpace(machineID)
+	agentID := s.machineAgents[machineID]
+	if agentID == "" {
+		agentID = "agent-" + machineID
+	}
+	if _, online := s.agents[agentID]; !online {
+		return false, "Agent 未连接任务通道"
+	}
+	if !s.agentCaps[agentID][capability] {
+		return false, "Agent 版本过旧，缺少安全 MySQL 凭证注入能力"
+	}
+	return true, ""
 }
 
 // IsAgentOnline 检查指定 Agent 的任务连接是否在线。
@@ -441,6 +742,7 @@ func (s *TaskService) CreateExecTaskWithOptions(ctx context.Context, machine, co
 	if err != nil {
 		return TaskDetail{}, err
 	}
+	result.Task.ParentTaskID = strings.TrimSpace(opts.ParentTaskID)
 	if err := s.repo.CreateTask(ctx, result.Task, result.Steps, result.Events); err != nil {
 		return TaskDetail{}, err
 	}
@@ -604,41 +906,124 @@ func (s *TaskService) ResolveMySQLInstance(ctx context.Context, selector string,
 	return machinedomain.Machine{}, mysqlapp.Instance{}, fmt.Errorf("machine %s not found", selector)
 }
 
-// CreateMySQLUpgradeTask builds a fully logged in-place upgrade workflow. The
-// active installation path remains stable and only its symbolic-link target is
-// atomically replaced; any failing step triggers an automatic link rollback.
-func (s *TaskService) CreateMySQLUpgradeTask(ctx context.Context, req MySQLUpgradeRequest) (MySQLUpgradePlan, error) {
+func (s *TaskService) resolveMySQLUpgrade(ctx context.Context, machineName string, port int, packageName string) (machinedomain.Machine, mysqlapp.Instance, mysqlapp.Package, string, error) {
 	if s.createMySQL == nil || s.machineInfo == nil || s.mysqlInstance == nil || s.machines == nil {
-		return MySQLUpgradePlan{}, errors.New("mysql upgrade dependencies are not configured")
+		return machinedomain.Machine{}, mysqlapp.Instance{}, mysqlapp.Package{}, "", errors.New("mysql upgrade dependencies are not configured")
 	}
-	req.Machine, req.PackageName, req.Username = strings.TrimSpace(req.Machine), strings.TrimSpace(req.PackageName), strings.TrimSpace(req.Username)
-	if req.Machine == "" || req.PackageName == "" || req.Port <= 0 || req.Port > 65535 || req.Username == "" || req.Password == "" {
-		return MySQLUpgradePlan{}, errors.New("machine, port, target package, username and password are required")
+	machineName, packageName = strings.TrimSpace(machineName), strings.TrimSpace(packageName)
+	if machineName == "" || packageName == "" || port <= 0 || port > 65535 {
+		return machinedomain.Machine{}, mysqlapp.Instance{}, mysqlapp.Package{}, "", errors.New("machine, port and target package are required")
 	}
-	machine, instance, err := s.ResolveMySQLInstance(ctx, req.Machine, req.Port)
+	machine, instance, err := s.ResolveMySQLInstance(ctx, machineName, port)
 	if err != nil {
-		return MySQLUpgradePlan{}, err
+		return machinedomain.Machine{}, mysqlapp.Instance{}, mysqlapp.Package{}, "", err
 	}
 	info, ok, err := s.machineInfo.Get(ctx, machine.ID)
 	if err != nil || !ok {
 		if err == nil {
 			err = errors.New("machine architecture and glibc information must be collected before upgrade")
 		}
-		return MySQLUpgradePlan{}, err
+		return machinedomain.Machine{}, mysqlapp.Instance{}, mysqlapp.Package{}, "", err
 	}
-	targetPackage, err := s.createMySQL.ResolvePackage(info, req.PackageName)
+	targetPackage, err := s.createMySQL.ResolvePackage(info, packageName)
 	if err != nil {
-		return MySQLUpgradePlan{}, err
+		return machinedomain.Machine{}, mysqlapp.Instance{}, mysqlapp.Package{}, "", err
 	}
 	currentVersion := strings.TrimSpace(instance.Version)
 	if currentVersion == "" {
 		currentVersion, err = mysqlapp.PackageVersion(instance.PackageName)
 		if err != nil {
-			return MySQLUpgradePlan{}, fmt.Errorf("cannot determine current MySQL version from %s: %w", instance.PackageName, err)
+			return machinedomain.Machine{}, mysqlapp.Instance{}, mysqlapp.Package{}, "", fmt.Errorf("cannot determine current MySQL version from %s: %w", instance.PackageName, err)
 		}
 	}
 	if err := mysqlapp.ValidateUpgradeCompatibility(currentVersion, targetPackage.Version); err != nil {
+		return machinedomain.Machine{}, mysqlapp.Instance{}, mysqlapp.Package{}, "", err
+	}
+	return machine, instance, targetPackage, currentVersion, nil
+}
+
+// CreateMySQLUpgradePrecheck creates a separate, reviewable report. Credentials
+// are injected by the Agent from its local 0600 management configuration and
+// never cross the Manager API or appear in the durable task specification.
+func (s *TaskService) CreateMySQLUpgradePrecheck(ctx context.Context, req MySQLUpgradeRequest) (MySQLUpgradePrecheckPlan, error) {
+	machine, instance, targetPackage, currentVersion, err := s.resolveMySQLUpgrade(ctx, req.Machine, req.Port, req.PackageName)
+	if err != nil {
+		return MySQLUpgradePrecheckPlan{}, err
+	}
+	if compatible, reason := s.MachineCapability(machine.ID, taskdomain.CapabilityMySQLDefaultsFile); !compatible {
+		return MySQLUpgradePrecheckPlan{}, errors.New(reason)
+	}
+	baseDir, myCnf := filepath.Clean(instance.BaseDir), filepath.Clean(instance.MyCnfPath)
+	q := upgradeShellQuote
+	defaults := mysqlDefaultsFilePlaceholder
+	client := q(baseDir+"/bin/mysql") + " --defaults-extra-file=" + defaults + fmt.Sprintf(" --protocol=tcp --host=127.0.0.1 --port=%d --batch --raw --table", instance.Port)
+	checker := "if command -v mysqlsh >/dev/null 2>&1; then echo 'checker=mysqlsh util.checkForServerUpgrade'; mysqlsh --defaults-file=" + defaults + fmt.Sprintf(" --host=127.0.0.1 --port=%d -- util check-for-server-upgrade --target-version=%s; else echo 'checker=mysqlcheck --check-upgrade (mysqlsh unavailable)'; %s --defaults-extra-file=%s --protocol=tcp --host=127.0.0.1 --port=%d --all-databases --check-upgrade; fi", instance.Port, q(targetPackage.Version), q(baseDir+"/bin/mysqlcheck"), defaults, instance.Port)
+	commands := []taskdomain.ExecCommandStep{
+		{Name: "安装布局与系统环境", Command: strings.Join([]string{
+			"echo 'GMHA_PRECHECK_SECTION=安装布局与系统环境'",
+			"test -L " + q(baseDir) + " || { echo 'BLOCKER: base_dir 不是软链接，禁止执行换链升级'; exit 1; }",
+			"current_target=$(readlink -f " + q(baseDir) + ") && test -x \"$current_target/bin/mysqld\"",
+			"echo current_target=$current_target",
+			"echo current_binary_version=$(" + q(baseDir+"/bin/mysqld") + " --version)",
+			"echo target_version=" + q(targetPackage.Version) + " target_package=" + q(targetPackage.FileName),
+			"echo machine_arch=$(uname -m) glibc=$(ldd --version 2>&1 | head -1)",
+			"df -Pk " + q(filepath.Dir(baseDir)) + " | tail -1",
+			"test -r " + q(myCnf) + " && " + q(baseDir+"/bin/mysqld") + " --defaults-file=" + q(myCnf) + " --validate-config",
+		}, " && ")},
+		{Name: "运行状态与复制风险", Command: "echo 'GMHA_PRECHECK_SECTION=运行状态与复制风险' && " + client + " --execute=" + q("SELECT @@version AS current_version, @@version_comment AS edition, @@global.read_only AS read_only, @@global.super_read_only AS super_read_only; SELECT COUNT(*) AS active_transactions FROM information_schema.innodb_trx; SELECT CHANNEL_NAME, SERVICE_STATE, LAST_ERROR_NUMBER, LAST_ERROR_MESSAGE FROM performance_schema.replication_connection_status; SELECT CHANNEL_NAME, SERVICE_STATE, LAST_ERROR_NUMBER, LAST_ERROR_MESSAGE FROM performance_schema.replication_applier_status_by_coordinator;")},
+		{Name: "MySQL 官方升级检查", Command: "echo 'GMHA_PRECHECK_SECTION=MySQL 官方升级检查' && " + checker},
+	}
+	detail, err := s.CreateExecTaskWithOptions(ctx, machine.IP, "", ExecTaskOptions{Operation: "mysql_upgrade_precheck", DisplayName: fmt.Sprintf("MySQL %s → %s 升级预检", currentVersion, targetPackage.Version), Port: instance.Port, PackageName: targetPackage.FileName, Commands: commands, TaskType: taskdomain.TypeMySQLUpgrade})
+	if err != nil {
+		return MySQLUpgradePrecheckPlan{}, err
+	}
+	return MySQLUpgradePrecheckPlan{CurrentVersion: currentVersion, TargetVersion: targetPackage.Version, CurrentPackage: instance.PackageName, TargetPackage: targetPackage.FileName, Checker: "MySQL Shell Upgrade Checker（优先）/ mysqlcheck --check-upgrade（回退）", Task: detail}, nil
+}
+
+func (s *TaskService) validateMySQLUpgradePrecheck(ctx context.Context, taskID, machineID string, port int, packageName string) error {
+	if strings.TrimSpace(taskID) == "" {
+		return errors.New("请先完成升级预检")
+	}
+	task, ok, err := s.repo.GetTask(ctx, strings.TrimSpace(taskID))
+	if err != nil || !ok {
+		if err == nil {
+			err = errors.New("预检任务不存在")
+		}
+		return err
+	}
+	var spec taskdomain.ExecSpec
+	if err := json.Unmarshal(task.SpecJSON, &spec); err != nil {
+		return errors.New("预检任务数据无效")
+	}
+	if task.Status != taskdomain.StatusSuccess || task.MachineID != machineID || spec.Operation != "mysql_upgrade_precheck" || spec.Port != port || spec.PackageName != packageName {
+		return errors.New("预检未通过，或报告与当前实例/目标版本不匹配")
+	}
+	if time.Since(task.CreatedAt) > 30*time.Minute {
+		return errors.New("预检报告已超过 30 分钟，请重新检查")
+	}
+	return nil
+}
+
+// CreateMySQLUpgradeTask builds a fully logged in-place upgrade workflow. The
+// active installation path remains stable and only its symbolic-link target is
+// atomically replaced. Binary rollback is automatic only before the new server
+// has started; after a data-dictionary upgrade, restoring a verified backup is
+// safer than starting old binaries against upgraded data files.
+func (s *TaskService) CreateMySQLUpgradeTask(ctx context.Context, req MySQLUpgradeRequest) (MySQLUpgradePlan, error) {
+	machine, instance, targetPackage, currentVersion, err := s.resolveMySQLUpgrade(ctx, req.Machine, req.Port, req.PackageName)
+	if err != nil {
 		return MySQLUpgradePlan{}, err
+	}
+	if !req.RiskAcknowledged {
+		return MySQLUpgradePlan{}, errors.New("必须确认已完成可恢复备份并接受停机与兼容性风险")
+	}
+	if compatible, reason := s.MachineCapability(machine.ID, taskdomain.CapabilityMySQLDefaultsFile); !compatible {
+		return MySQLUpgradePlan{}, errors.New(reason)
+	}
+	if !req.Force {
+		if err := s.validateMySQLUpgradePrecheck(ctx, req.PrecheckTaskID, machine.ID, instance.Port, targetPackage.FileName); err != nil {
+			return MySQLUpgradePlan{}, err
+		}
 	}
 	baseDir := filepath.Clean(instance.BaseDir)
 	myCnf := filepath.Clean(instance.MyCnfPath)
@@ -649,11 +1034,12 @@ func (s *TaskService) CreateMySQLUpgradeTask(ctx context.Context, req MySQLUpgra
 	targetDir := filepath.Join(filepath.Dir(baseDir), strings.TrimSuffix(targetPackage.FileName, ".tar.xz"))
 	archive := filepath.Join("/tmp", targetPackage.FileName)
 	stateDir := fmt.Sprintf("/var/lib/gmha/mysql-upgrade-%d", instance.Port)
-	client := fmt.Sprintf("MYSQL_PWD=%s %s/bin/mysql --protocol=tcp --host=127.0.0.1 --port=%d --user=%s --batch --raw --skip-column-names", upgradeShellQuote(req.Password), upgradeShellQuote(baseDir), instance.Port, upgradeShellQuote(req.Username))
+	client := fmt.Sprintf("%s/bin/mysql --defaults-extra-file=%s --protocol=tcp --host=127.0.0.1 --port=%d --batch --raw --skip-column-names", upgradeShellQuote(baseDir), mysqlDefaultsFilePlaceholder, instance.Port)
 	downloadURL := "__GMHA_MANAGER_URL__/api/v1/software/mysql/" + url.PathEscape(targetPackage.FileName)
 	q := upgradeShellQuote
 	commands := []taskdomain.ExecCommandStep{
-		{Name: "升级兼容性检查", Command: strings.Join([]string{
+		{Name: "执行前安全复核", Command: strings.Join([]string{
+			fmt.Sprintf("echo force_upgrade=%t precheck_task=%s", req.Force, q(req.PrecheckTaskID)),
 			"test -L " + q(baseDir) + " || { echo 'MySQL base_dir is not a symbolic link'; exit 1; }",
 			"test -x " + q(baseDir+"/bin/mysqld"),
 			"echo current_version=$(" + q(baseDir+"/bin/mysqld") + " --version)",
@@ -661,24 +1047,27 @@ func (s *TaskService) CreateMySQLUpgradeTask(ctx context.Context, req MySQLUpgra
 			"echo machine_arch=$(uname -m) glibc=$(ldd --version 2>&1 | head -1)",
 			"df -h " + q(filepath.Dir(baseDir)),
 		}, " && ")},
-		{Name: "数据库与复制预检", Command: client + " --execute=" + q("SELECT @@version, @@version_comment, @@global.read_only, @@global.super_read_only; SELECT COUNT(*) AS active_transactions FROM information_schema.innodb_trx; SELECT CHANNEL_NAME, SERVICE_STATE FROM performance_schema.replication_connection_status;") + " && " + fmt.Sprintf("MYSQL_PWD=%s %s/bin/mysqlcheck --protocol=tcp --host=127.0.0.1 --port=%d --user=%s --all-databases --check-upgrade", q(req.Password), q(baseDir), instance.Port, q(req.Username))},
 		{Name: "暂停数据库写入", Command: "mkdir -p " + q(stateDir) + " && readlink -f " + q(baseDir) + " > " + q(stateDir+"/old_target") + " && " + client + " --execute=" + q("SELECT @@global.read_only") + " > " + q(stateDir+"/read_only") + " && " + client + " --execute=" + q("SET GLOBAL super_read_only=ON; SET GLOBAL read_only=ON;") + " && for i in $(seq 1 60); do n=$(" + client + " --execute=" + q("SELECT COUNT(*) FROM information_schema.innodb_trx") + "); [ \"${n:-1}\" = 0 ] && break; sleep 1; done; [ \"${n:-1}\" = 0 ]"},
 		{Name: "下载目标安装包", Command: "rm -f " + q(archive) + " && if command -v curl >/dev/null 2>&1; then curl -fL --retry 3 -o " + q(archive) + " " + q(downloadURL) + "; else wget -O " + q(archive) + " " + q(downloadURL) + "; fi && test -s " + q(archive)},
 		{Name: "解压并检查新版本", Command: "rm -rf " + q(targetDir) + " && tar -xJf " + q(archive) + " -C " + q(filepath.Dir(baseDir)) + " && test -x " + q(targetDir+"/bin/mysqld") + " && " + q(targetDir+"/bin/mysqld") + " --version && chown -R " + q(instance.MySQLUser+":"+instance.MySQLUser) + " " + q(targetDir)},
 		{Name: "停止数据库服务", Command: "systemctl stop " + q(unit) + " && ! systemctl is-active --quiet " + q(unit)},
 		{Name: "原子切换软连接", Command: "ln -sfn " + q(targetDir) + " " + q(baseDir+".gmha-next") + " && mv -Tf " + q(baseDir+".gmha-next") + " " + q(baseDir) + " && test \"$(readlink -f " + q(baseDir) + ")\" = " + q(targetDir)},
 		{Name: "校验升级后配置", Command: q(baseDir+"/bin/mysqld") + " --defaults-file=" + q(myCnf) + " --validate-config"},
-		{Name: "启动与数据字典升级", Command: "systemctl start " + q(unit) + " && for i in $(seq 1 120); do " + client + " --execute=" + q("SELECT 1") + " >/dev/null 2>&1 && break; sleep 1; done && " + client + " --execute=" + q("SELECT CONCAT('upgraded_version=', @@version); SELECT TABLE_SCHEMA, COUNT(*) FROM information_schema.tables GROUP BY TABLE_SCHEMA ORDER BY TABLE_SCHEMA;")},
-		{Name: "数据库完整性检查", Command: fmt.Sprintf("MYSQL_PWD=%s %s/bin/mysqlcheck --protocol=tcp --host=127.0.0.1 --port=%d --user=%s --all-databases --check-upgrade", q(req.Password), q(baseDir), instance.Port, q(req.Username))},
+		{Name: "启动与数据字典升级", Command: "systemctl start " + q(unit) + " && touch " + q(stateDir+"/new_server_started") + " && for i in $(seq 1 120); do " + client + " --execute=" + q("SELECT 1") + " >/dev/null 2>&1 && break; sleep 1; done && " + client + " --execute=" + q("SELECT CONCAT('upgraded_version=', @@version); SELECT TABLE_SCHEMA, COUNT(*) FROM information_schema.tables GROUP BY TABLE_SCHEMA ORDER BY TABLE_SCHEMA;")},
+		{Name: "数据库完整性检查", Command: fmt.Sprintf("%s/bin/mysqlcheck --defaults-extra-file=%s --protocol=tcp --host=127.0.0.1 --port=%d --all-databases --check-upgrade", q(baseDir), mysqlDefaultsFilePlaceholder, instance.Port)},
 		{Name: "主从复制检查与修复", Command: client + " --execute=" + q("START REPLICA") + " 2>/dev/null || " + client + " --execute=" + q("START SLAVE") + " 2>/dev/null || true; " + client + " --execute=" + q("SELECT CHANNEL_NAME, SERVICE_STATE, LAST_ERROR_NUMBER, LAST_ERROR_MESSAGE FROM performance_schema.replication_connection_status; SELECT CHANNEL_NAME, SERVICE_STATE, LAST_ERROR_NUMBER, LAST_ERROR_MESSAGE FROM performance_schema.replication_applier_status_by_coordinator;")},
 		{Name: "恢复业务访问", Command: "old_read_only=$(cat " + q(stateDir+"/read_only") + "); if [ \"$old_read_only\" = 0 ]; then " + client + " --execute=" + q("SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;") + "; fi; " + client + " --execute=" + q("SELECT @@version, @@global.read_only, @@global.super_read_only;") + " && rm -rf " + q(stateDir)},
 	}
-	rollback := "old_target=$(cat " + q(stateDir+"/old_target") + " 2>/dev/null || true); systemctl stop " + q(unit) + " || true; if [ -n \"$old_target\" ] && [ -x \"$old_target/bin/mysqld\" ]; then ln -sfn \"$old_target\" " + q(baseDir+".gmha-rollback") + " && mv -Tf " + q(baseDir+".gmha-rollback") + " " + q(baseDir) + "; fi; systemctl start " + q(unit) + " || true; echo rollback_target=$(readlink -f " + q(baseDir) + ")"
-	detail, err := s.CreateExecTaskWithOptions(ctx, machine.IP, "", ExecTaskOptions{Operation: "mysql_upgrade", DisplayName: fmt.Sprintf("MySQL %s 升级到 %s", currentVersion, targetPackage.Version), Port: instance.Port, PackageName: targetPackage.FileName, Commands: commands, RollbackCommand: rollback, TaskType: taskdomain.TypeMySQLUpgrade})
+	rollback := "old_target=$(cat " + q(stateDir+"/old_target") + " 2>/dev/null || true); if [ -e " + q(stateDir+"/new_server_started") + " ]; then echo 'SAFEGUARD: 新版本已启动并可能升级数据字典，不自动切回旧二进制；实例保持新版本并需要人工检查或从备份恢复'; systemctl start " + q(unit) + " || true; else systemctl stop " + q(unit) + " || true; if [ -n \"$old_target\" ] && [ -x \"$old_target/bin/mysqld\" ]; then ln -sfn \"$old_target\" " + q(baseDir+".gmha-rollback") + " && mv -Tf " + q(baseDir+".gmha-rollback") + " " + q(baseDir) + "; fi; systemctl start " + q(unit) + " || true; echo rollback_target=$(readlink -f " + q(baseDir) + "); fi"
+	displayName := fmt.Sprintf("MySQL %s 升级到 %s", currentVersion, targetPackage.Version)
+	if req.Force {
+		displayName = "[强制] " + displayName
+	}
+	detail, err := s.CreateExecTaskWithOptions(ctx, machine.IP, "", ExecTaskOptions{Operation: "mysql_upgrade", DisplayName: displayName, Port: instance.Port, PackageName: targetPackage.FileName, Commands: commands, RollbackCommand: rollback, TaskType: taskdomain.TypeMySQLUpgrade})
 	if err != nil {
 		return MySQLUpgradePlan{}, err
 	}
-	return MySQLUpgradePlan{CurrentVersion: currentVersion, TargetVersion: targetPackage.Version, CurrentPackage: instance.PackageName, TargetPackage: targetPackage.FileName, Task: detail}, nil
+	return MySQLUpgradePlan{CurrentVersion: currentVersion, TargetVersion: targetPackage.Version, CurrentPackage: instance.PackageName, TargetPackage: targetPackage.FileName, PrecheckTaskID: req.PrecheckTaskID, Forced: req.Force, Task: detail}, nil
 }
 
 func upgradeShellQuote(value string) string {
@@ -699,7 +1088,20 @@ func (s *TaskService) CreateClusterMySQLInstallTasks(ctx context.Context, req Cl
 		return ClusterMySQLInstallResult{}, err
 	}
 
-	result := ClusterMySQLInstallResult{Cluster: cluster}
+	targetCount := 0
+	for _, machine := range machines {
+		if machine.Cluster == cluster {
+			targetCount++
+		}
+	}
+	if targetCount == 0 {
+		return ClusterMySQLInstallResult{}, fmt.Errorf("cluster %s has no machines", cluster)
+	}
+	parent, err := s.CreateBatchTrackingTask(ctx, "cluster_mysql_install", "批量安装 MySQL", cluster)
+	if err != nil {
+		return ClusterMySQLInstallResult{}, err
+	}
+	result := ClusterMySQLInstallResult{Cluster: cluster, Parent: parent}
 	serverID := req.ServerIDStart
 	if serverID <= 0 {
 		serverID = 1
@@ -710,6 +1112,7 @@ func (s *TaskService) CreateClusterMySQLInstallTasks(ctx context.Context, req Cl
 		}
 		item := ClusterMySQLInstallItem{MachineID: machine.ID, Name: machine.Name, IP: machine.IP}
 		installReq := taskusecase.CreateMySQLInstallTaskRequest{
+			ParentTaskID:      parent.Task.ID,
 			Machine:           machine.IP,
 			Port:              req.Port,
 			ServerID:          serverID,
@@ -732,6 +1135,8 @@ func (s *TaskService) CreateClusterMySQLInstallTasks(ctx context.Context, req Cl
 			Version:           req.Version,
 			Architecture:      req.Architecture,
 			InstallPTTools:    req.InstallPTTools,
+			InstallXtraBackup: req.InstallXtraBackup,
+			MemoryAllocator:   req.MemoryAllocator,
 			RuntimeParameters: req.RuntimeParameters,
 			Accounts:          req.Accounts,
 		}
@@ -746,9 +1151,10 @@ func (s *TaskService) CreateClusterMySQLInstallTasks(ctx context.Context, req Cl
 		result.Items = append(result.Items, item)
 		serverID++
 	}
-	if len(result.Items) == 0 {
-		return ClusterMySQLInstallResult{}, fmt.Errorf("cluster %s has no machines", cluster)
+	if err := s.FinalizeBatchTrackingTask(ctx, parent.Task.ID, result.Created, result.Failed); err != nil {
+		return ClusterMySQLInstallResult{}, err
 	}
+	result.Parent, _ = s.GetTaskDetail(ctx, parent.Task.ID)
 	return result, nil
 }
 
@@ -767,6 +1173,7 @@ func (s *TaskService) CreateClusterMySQLUninstallTasks(ctx context.Context, req 
 	}
 
 	result := ClusterMySQLUninstallResult{Cluster: cluster}
+	var parent TaskDetail
 	for _, machine := range machines {
 		if machine.Cluster != cluster {
 			continue
@@ -780,11 +1187,19 @@ func (s *TaskService) CreateClusterMySQLUninstallTasks(ctx context.Context, req 
 			// 如果没有记录，跳过，不计入失败，因为可能本来就没装
 			continue
 		}
+		if parent.Task.ID == "" {
+			parent, err = s.CreateBatchTrackingTask(ctx, "cluster_mysql_uninstall", "批量卸载 MySQL", cluster)
+			if err != nil {
+				return ClusterMySQLUninstallResult{}, err
+			}
+			result.Parent = parent
+		}
 
 		item := ClusterMySQLUninstallItem{MachineID: machine.ID, Name: machine.Name, IP: machine.IP}
 		uninstallReq := taskusecase.CreateMySQLUninstallTaskRequest{
-			Machine: machine.IP,
-			Port:    req.Port,
+			ParentTaskID: parent.Task.ID,
+			Machine:      machine.IP,
+			Port:         req.Port,
 		}
 		detail, err := s.CreateMySQLUninstallTask(ctx, uninstallReq)
 		if err != nil {
@@ -799,6 +1214,10 @@ func (s *TaskService) CreateClusterMySQLUninstallTasks(ctx context.Context, req 
 	if len(result.Items) == 0 {
 		return ClusterMySQLUninstallResult{}, fmt.Errorf("集群 %s 中未找到运行在端口 %d 的 MySQL 实例", cluster, req.Port)
 	}
+	if err := s.FinalizeBatchTrackingTask(ctx, parent.Task.ID, result.Created, result.Failed); err != nil {
+		return ClusterMySQLUninstallResult{}, err
+	}
+	result.Parent, _ = s.GetTaskDetail(ctx, parent.Task.ID)
 	return result, nil
 }
 
@@ -988,6 +1407,9 @@ func (s *TaskService) HandleReport(ctx context.Context, report taskdomain.Report
 	}
 	if !ok {
 		return errors.New("task not found")
+	}
+	if task.ParentTaskID != "" {
+		defer func() { _ = s.syncParentTask(context.WithoutCancel(ctx), task.ParentTaskID) }()
 	}
 	if task.Status == taskdomain.StatusSuccess || task.Status == taskdomain.StatusFailed {
 		return s.applyTerminalTaskSideEffects(ctx, task, report, time.Now().UTC())
@@ -1246,6 +1668,10 @@ func (s *TaskService) ListTasks(ctx context.Context, limit int) ([]taskdomain.Ta
 		return nil, err
 	}
 	for i := range items {
+		if aggregated, children, aggregateErr := s.aggregateParentTask(ctx, items[i]); aggregateErr == nil {
+			items[i] = aggregated
+			items[i].Children = taskChildrenForDisplay(children)
+		}
 		items[i] = taskForDisplay(items[i])
 	}
 	return items, nil
@@ -1267,6 +1693,10 @@ func (s *TaskService) ListTaskPage(ctx context.Context, query TaskListQuery) (Ta
 			return TaskListPage{}, err
 		}
 		for i := range items {
+			if aggregated, children, aggregateErr := s.aggregateParentTask(ctx, items[i]); aggregateErr == nil {
+				items[i] = aggregated
+				items[i].Children = taskChildrenForDisplay(children)
+			}
 			items[i] = taskForDisplay(items[i])
 		}
 		return TaskListPage{Items: items, Total: total, Page: query.Offset/query.Limit + 1, Size: query.Limit}, nil
@@ -1288,6 +1718,17 @@ func (s *TaskService) ListTaskPage(ctx context.Context, query TaskListQuery) (Ta
 	return TaskListPage{Items: items, Total: total, Page: query.Offset/query.Limit + 1, Size: query.Limit}, nil
 }
 
+func taskChildrenForDisplay(children []taskdomain.Task) []taskdomain.Task {
+	if len(children) == 0 {
+		return nil
+	}
+	out := make([]taskdomain.Task, len(children))
+	for i := range children {
+		out[i] = taskForDisplay(children[i])
+	}
+	return out
+}
+
 // RecordPlatformOperation persists a synchronous management action in the same
 // task timeline used by Agent work. It intentionally stores only operational
 // metadata, never request bodies or credentials.
@@ -1301,11 +1742,23 @@ func (s *TaskService) RecordPlatformOperation(ctx context.Context, spec taskdoma
 	if finishedAt.Before(startedAt) {
 		finishedAt = startedAt
 	}
+	if parentID := s.commonRelatedParent(ctx, spec.RelatedTaskIDs); parentID != "" {
+		return s.GetTaskDetail(ctx, parentID)
+	}
 	data, err := json.Marshal(spec)
 	if err != nil {
 		return TaskDetail{}, err
 	}
 	taskID := fmt.Sprintf("platform-task-%d", time.Now().UTC().UnixNano())
+	if strings.TrimSpace(spec.RequestID) != "" {
+		digest := sha256.Sum256([]byte(spec.Method + "\x00" + spec.Path + "\x00" + spec.RequestID))
+		taskID = fmt.Sprintf("platform-task-%x", digest[:12])
+		if _, ok, lookupErr := s.repo.GetTask(ctx, taskID); lookupErr != nil {
+			return TaskDetail{}, lookupErr
+		} else if ok {
+			return s.GetTaskDetail(ctx, taskID)
+		}
+	}
 	status := taskdomain.StatusSuccess
 	stepStatus := taskdomain.StepSuccess
 	message := "平台操作执行成功"
@@ -1333,9 +1786,53 @@ func (s *TaskService) RecordPlatformOperation(ctx context.Context, spec taskdoma
 		{ID: taskID + "-result", TaskID: taskID, StepID: steps[1].ID, EventType: eventType, Content: message, CreatedAt: finishedAt},
 	}
 	if err := s.repo.CreateTask(ctx, task, steps, events); err != nil {
+		// Concurrent retries can both pass the lookup. The deterministic task
+		// ID lets one writer win without adding a duplicate audit record.
+		if strings.TrimSpace(spec.RequestID) != "" {
+			if _, ok, lookupErr := s.repo.GetTask(ctx, taskID); lookupErr == nil && ok {
+				return s.GetTaskDetail(ctx, taskID)
+			}
+		}
 		return TaskDetail{}, err
 	}
+	if len(spec.RelatedTaskIDs) > 0 {
+		if err := s.AttachChildTasks(ctx, taskID, spec.RelatedTaskIDs); err != nil {
+			return TaskDetail{}, err
+		}
+		return s.GetTaskDetail(ctx, taskID)
+	}
 	return TaskDetail{Task: taskForDisplay(task), Steps: steps, Events: events}, nil
+}
+
+func (s *TaskService) commonRelatedParent(ctx context.Context, taskIDs []string) string {
+	if len(taskIDs) == 0 {
+		return ""
+	}
+	candidate := ""
+	items := make([]taskdomain.Task, 0, len(taskIDs))
+	for _, id := range taskIDs {
+		item, ok, err := s.repo.GetTask(ctx, strings.TrimSpace(id))
+		if err != nil || !ok {
+			return ""
+		}
+		items = append(items, item)
+		if item.ParentTaskID != "" {
+			if candidate == "" {
+				candidate = item.ParentTaskID
+			} else if candidate != item.ParentTaskID {
+				return ""
+			}
+		}
+	}
+	if candidate == "" {
+		return ""
+	}
+	for _, item := range items {
+		if item.ID != candidate && item.ParentTaskID != candidate {
+			return ""
+		}
+	}
+	return candidate
 }
 
 // DeleteTask removes a terminal task together with its steps and events.
@@ -1353,10 +1850,84 @@ func (s *TaskService) DeleteTask(ctx context.Context, taskID string) error {
 	if !ok {
 		return errors.New("task not found")
 	}
-	if task.Status != taskdomain.StatusSuccess && task.Status != taskdomain.StatusFailed {
-		return fmt.Errorf("task %s is %s and cannot be deleted before completion", taskID, task.Status)
+	if task.ParentTaskID != "" {
+		return fmt.Errorf("task %s is a child task; delete its parent task %s instead", taskID, task.ParentTaskID)
+	}
+	if aggregated, children, aggregateErr := s.aggregateParentTask(ctx, task); aggregateErr != nil {
+		return aggregateErr
+	} else if len(children) > 0 {
+		task = aggregated
+	}
+	if err := s.ensureTaskTreeTerminal(ctx, task); err != nil {
+		return err
+	}
+	if repo, ok := s.repo.(taskHierarchyRepository); ok {
+		return repo.DeleteTaskTree(ctx, taskID)
 	}
 	return s.repo.DeleteTask(ctx, taskID)
+}
+
+func (s *TaskService) ensureTaskTreeTerminal(ctx context.Context, item taskdomain.Task) error {
+	if item.Status != taskdomain.StatusSuccess && item.Status != taskdomain.StatusFailed {
+		return fmt.Errorf("task %s is %s and cannot be deleted before completion", item.ID, item.Status)
+	}
+	repo, ok := s.repo.(childTaskRepository)
+	if !ok {
+		return nil
+	}
+	children, err := repo.ListChildTasks(ctx, item.ID)
+	if err != nil {
+		return err
+	}
+	for _, child := range children {
+		if err := s.ensureTaskTreeTerminal(ctx, child); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *TaskService) DeleteTasks(ctx context.Context, req DeleteTasksRequest) (DeleteTasksResult, error) {
+	ids := append([]string(nil), req.TaskIDs...)
+	if req.AllFiltered {
+		query := req.Query
+		query.Offset, query.Limit = 0, 200
+		for {
+			page, err := s.ListTaskPage(ctx, query)
+			if err != nil {
+				return DeleteTasksResult{}, err
+			}
+			for _, item := range page.Items {
+				ids = append(ids, item.ID)
+			}
+			query.Offset += len(page.Items)
+			if len(page.Items) == 0 || query.Offset >= page.Total {
+				break
+			}
+		}
+	}
+	seen := make(map[string]bool, len(ids))
+	result := DeleteTasksResult{Items: []DeleteTaskResult{}}
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		result.Requested++
+		item := DeleteTaskResult{TaskID: id}
+		if err := s.DeleteTask(ctx, id); err != nil {
+			item.Error = err.Error()
+			result.Failed++
+		} else {
+			result.Deleted++
+		}
+		result.Items = append(result.Items, item)
+	}
+	if result.Requested == 0 {
+		return result, errors.New("at least one task id or all_filtered is required")
+	}
+	return result, nil
 }
 
 // GetTaskDetail 获取任务的完整详情（任务、步骤、事件、机器信息）。
@@ -1377,6 +1948,26 @@ func (s *TaskService) GetTaskDetail(ctx context.Context, taskID string) (TaskDet
 		return TaskDetail{}, err
 	}
 	detail := TaskDetail{Task: taskForDisplay(task), Steps: steps, Events: events}
+	if repo, ok := s.repo.(childTaskRepository); ok {
+		children, err := repo.ListChildTasks(ctx, taskID)
+		if err != nil {
+			return TaskDetail{}, err
+		}
+		for i := range children {
+			children[i] = taskForDisplay(children[i])
+			childDetail, detailErr := s.GetTaskDetail(ctx, children[i].ID)
+			if detailErr != nil {
+				return TaskDetail{}, detailErr
+			}
+			detail.ChildDetails = append(detail.ChildDetails, childDetail)
+		}
+		if len(children) > 0 {
+			if aggregated, _, aggregateErr := s.aggregateParentTask(ctx, task); aggregateErr == nil {
+				detail.Task = taskForDisplay(aggregated)
+			}
+		}
+		detail.Children = children
+	}
 	if s.machines != nil {
 		machine, ok, err := s.machines.GetByID(ctx, task.MachineID)
 		if err != nil {
@@ -1415,7 +2006,7 @@ func taskForDisplay(task taskdomain.Task) taskdomain.Task {
 		display = map[string]any{
 			"port": spec.Port, "server_id": spec.ServerID, "mysql_user": spec.MySQLUser,
 			"profile": spec.Profile, "version": spec.Version, "architecture": spec.Architecture,
-			"package_name": spec.PackageName, "install_pt_tools": spec.InstallPTTools,
+			"package_name": spec.PackageName, "install_pt_tools": spec.InstallPTTools, "install_xtrabackup": spec.InstallXtraBackup, "memory_allocator": spec.MemoryAllocator,
 		}
 	case taskdomain.TypeMySQLUninstall:
 		var spec taskdomain.MySQLUninstallSpec
@@ -1451,6 +2042,17 @@ func taskForDisplay(task taskdomain.Task) taskdomain.Task {
 			return task
 		}
 		display = spec
+	case taskdomain.TypeBatchOperation, taskdomain.TypeClusterBootstrap, taskdomain.TypeArchitecture:
+		var spec map[string]any
+		if json.Unmarshal(task.SpecJSON, &spec) != nil {
+			task.SpecJSON = json.RawMessage(`{}`)
+			return task
+		}
+		display = map[string]any{
+			"operation": spec["operation"], "display_name": spec["display_name"], "target": spec["target"],
+			"cluster": spec["cluster"], "architecture": spec["architecture"], "targets": spec["targets"],
+			"created": spec["created"], "creation_failures": spec["creation_failures"], "run_id": spec["run_id"],
+		}
 	default:
 		// 未知任务类型默认不暴露规格，新增类型必须显式声明可展示字段。
 		display = map[string]any{}
