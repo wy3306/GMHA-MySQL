@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -151,8 +152,13 @@ func (s *PackageService) Settings() PackageSettings {
 
 func officialPackageCatalog() []PackageCatalogItem {
 	return []PackageCatalogItem{
-		{ID: "mysql-8.0.44-x86_64", Category: "mysql", Name: "mysql-8.0.44-linux-glibc2.28-x86_64.tar.xz", Version: "8.0.44", Arch: "x86_64", SourceURL: "https://dev.mysql.com/get/Downloads/MySQL-8.0/mysql-8.0.44-linux-glibc2.28-x86_64.tar.xz", Description: "MySQL Community Server 8.0.44 Linux Generic（默认推荐）"},
+		{ID: "mysql-5.7.44-x86_64", Category: "mysql", Name: "mysql-5.7.44-linux-glibc2.12-x86_64.tar.gz", Version: "5.7.44", Arch: "x86_64", SourceURL: "https://dev.mysql.com/get/Downloads/MySQL-5.7/mysql-5.7.44-linux-glibc2.12-x86_64.tar.gz", Description: "MySQL Community Server 5.7.44 Linux Generic（5.7 最终版）"},
+		{ID: "mysql-8.0.46-x86_64", Category: "mysql", Name: "mysql-8.0.46-linux-glibc2.28-x86_64.tar.xz", Version: "8.0.46", Arch: "x86_64", SourceURL: "https://dev.mysql.com/get/Downloads/MySQL-8.0/mysql-8.0.46-linux-glibc2.28-x86_64.tar.xz", Description: "MySQL Community Server 8.0.46 Linux Generic（8.0 当前维护版）"},
+		{ID: "mysql-8.0.46-aarch64", Category: "mysql", Name: "mysql-8.0.46-linux-glibc2.28-aarch64.tar.xz", Version: "8.0.46", Arch: "aarch64", SourceURL: "https://dev.mysql.com/get/Downloads/MySQL-8.0/mysql-8.0.46-linux-glibc2.28-aarch64.tar.xz", Description: "MySQL Community Server 8.0.46 Linux Generic ARM64"},
 		{ID: "mysql-8.4.10-x86_64", Category: "mysql", Name: "mysql-8.4.10-linux-glibc2.28-x86_64.tar.xz", Version: "8.4.10", Arch: "x86_64", SourceURL: "https://dev.mysql.com/get/Downloads/MySQL-8.4/mysql-8.4.10-linux-glibc2.28-x86_64.tar.xz", Description: "MySQL Community Server 8.4.10 LTS Linux Generic"},
+		{ID: "mysql-8.4.10-aarch64", Category: "mysql", Name: "mysql-8.4.10-linux-glibc2.28-aarch64.tar.xz", Version: "8.4.10", Arch: "aarch64", SourceURL: "https://dev.mysql.com/get/Downloads/MySQL-8.4/mysql-8.4.10-linux-glibc2.28-aarch64.tar.xz", Description: "MySQL Community Server 8.4.10 LTS Linux Generic ARM64"},
+		{ID: "mysql-9.7.1-x86_64", Category: "mysql", Name: "mysql-9.7.1-linux-glibc2.28-x86_64.tar.xz", Version: "9.7.1", Arch: "x86_64", SourceURL: "https://dev.mysql.com/get/Downloads/MySQL-9.7/mysql-9.7.1-linux-glibc2.28-x86_64.tar.xz", Description: "MySQL Community Server 9.7.1 LTS Linux Generic"},
+		{ID: "mysql-9.7.1-aarch64", Category: "mysql", Name: "mysql-9.7.1-linux-glibc2.28-aarch64.tar.xz", Version: "9.7.1", Arch: "aarch64", SourceURL: "https://dev.mysql.com/get/Downloads/MySQL-9.7/mysql-9.7.1-linux-glibc2.28-aarch64.tar.xz", Description: "MySQL Community Server 9.7.1 LTS Linux Generic ARM64"},
 		{ID: "mysql-router-9.7.1-x86_64", Category: "mysql-router", Name: "mysql-router-9.7.1-linux-glibc2.28-x86_64.tar.xz", Version: "9.7.1", Arch: "x86_64", SourceURL: "https://dev.mysql.com/get/Downloads/MySQL-Router/mysql-router-9.7.1-linux-glibc2.28-x86_64.tar.xz", Description: "Oracle MySQL Router 9.7.1 Linux Generic"},
 		{ID: "mysql-router-9.7.1-aarch64", Category: "mysql-router", Name: "mysql-router-9.7.1-linux-glibc2.28-aarch64.tar.xz", Version: "9.7.1", Arch: "aarch64", SourceURL: "https://dev.mysql.com/get/Downloads/MySQL-Router/mysql-router-9.7.1-linux-glibc2.28-aarch64.tar.xz", Description: "Oracle MySQL Router 9.7.1 Linux Generic"},
 		{ID: "binlog2sql-5a8e65c", Category: "binlog2sql", Name: "binlog2sql-5a8e65c-noarch.tar.gz", Version: "5a8e65c", Arch: "noarch", SourceURL: "https://github.com/danfengcao/binlog2sql/archive/5a8e65c432e74950b48b7ead28f424ec931b755d.tar.gz", Description: "MySQL binlog 解析与回滚 SQL 生成工具"},
@@ -161,28 +167,63 @@ func officialPackageCatalog() []PackageCatalogItem {
 		{ID: "proxysql-3.0.9-debian12-x86_64", Category: "proxysql", Name: "proxysql_3.0.9-debian12_amd64.deb", Version: "3.0.9", Arch: "x86_64", SourceURL: "https://github.com/sysown/proxysql/releases/download/v3.0.9/proxysql_3.0.9-debian12_amd64.deb", Description: "ProxySQL 3.0.9 Debian 12"},
 		{ID: "proxysql-3.0.9-debian12-aarch64", Category: "proxysql", Name: "proxysql_3.0.9-debian12_arm64.deb", Version: "3.0.9", Arch: "aarch64", SourceURL: "https://github.com/sysown/proxysql/releases/download/v3.0.9/proxysql_3.0.9-debian12_arm64.deb", Description: "ProxySQL 3.0.9 Debian 12"},
 		{ID: "sysbench-1.0.20-source", Category: "sysbench", Name: "sysbench-1.0.20-source-noarch.tar.gz", Version: "1.0.20", Arch: "noarch", SourceURL: "https://github.com/akopytov/sysbench/archive/refs/tags/1.0.20.tar.gz", Description: "Sysbench 1.0.20 官方源码包"},
-		{ID: "percona-toolkit-3.7.1-source", Category: "percona-toolkit", Name: "percona-toolkit-3.7.1-noarch.tar.gz", Version: "3.7.1", Arch: "noarch", SourceURL: "https://github.com/percona/percona-toolkit/archive/refs/tags/v3.7.1.tar.gz", Description: "Percona Toolkit 3.7.1，支持 MySQL 8.0/8.4"},
+		{ID: "percona-toolkit-3.7.1-source", Category: "percona-toolkit", Name: "percona-toolkit-3.7.1-noarch.tar.gz", Version: "3.7.1", Arch: "noarch", SourceURL: "https://github.com/percona/percona-toolkit/archive/refs/tags/v3.7.1.tar.gz", Description: "Percona Toolkit 3.7.1 源码包；离线部署前需按 README 的 PT 离线包章节合并目标发行版依赖"},
 		{ID: "xtrabackup-8.0.35-36-x86_64", Category: "xtrabackup", Name: "percona-xtrabackup-8.0.35-36-Linux-x86_64.glibc2.28-minimal.tar.gz", Version: "8.0.35-36", Arch: "x86_64", SourceURL: "https://downloads.percona.com/downloads/Percona-XtraBackup-8.0/Percona-XtraBackup-8.0.35-36/binary/tarball/percona-xtrabackup-8.0.35-36-Linux-x86_64.glibc2.28-minimal.tar.gz", Description: "Percona XtraBackup 8.0 最终版，兼容 MySQL 8.0.34 及以上"},
+		{ID: "xtrabackup-2.4.29-x86_64", Category: "xtrabackup", Name: "percona-xtrabackup-2.4.29-Linux-x86_64.glibc2.17.tar.gz", Version: "2.4.29", Arch: "x86_64", SourceURL: "https://downloads.percona.com/downloads/Percona-XtraBackup-2.4/Percona-XtraBackup-2.4.29/binary/tarball/percona-xtrabackup-2.4.29-Linux-x86_64.glibc2.17.tar.gz", Description: "Percona XtraBackup 2.4 最终完整包，兼容 MySQL 5.7（要求 glibc 2.17+）"},
 		{ID: "xtrabackup-8.4.0-6-x86_64", Category: "xtrabackup", Name: "percona-xtrabackup-8.4.0-6-Linux-x86_64.glibc2.28-minimal.tar.gz", Version: "8.4.0-6", Arch: "x86_64", SourceURL: "https://downloads.percona.com/downloads/Percona-XtraBackup-8.4/Percona-XtraBackup-8.4.0-6/binary/tarball/percona-xtrabackup-8.4.0-6-Linux-x86_64.glibc2.28-minimal.tar.gz", Description: "Percona XtraBackup 8.4，匹配 MySQL 8.4 LTS"},
+		{ID: "xtrabackup-9.7.1-rc1-x86_64", Category: "xtrabackup", Name: "percona-xtrabackup-9.7.1-rc1-Linux-x86_64.glibc2.28.tar.gz", Version: "9.7.1-rc1", Arch: "x86_64", SourceURL: "https://downloads.percona.com/downloads/Percona-XtraBackup-9.7/Percona-XtraBackup-9.7.1-rc1/binary/tarball/percona-xtrabackup-9.7.1-rc1-Linux-x86_64.glibc2.28.tar.gz", Description: "Percona XtraBackup 9.7.1 RC1，专用于 MySQL 9.7（上游预发布版）"},
 	}
 }
 
 func officialPackageBundles() []PackageBundleProfile {
-	common := []string{"mysql-router-9.7.1-x86_64", "percona-toolkit-3.7.1-source", "sysbench-1.0.20-source"}
+	commonX86 := []string{"mysql-router-9.7.1-x86_64", "sysbench-1.0.20-source"}
+	commonARM := []string{"mysql-router-9.7.1-aarch64", "sysbench-1.0.20-source"}
 	return []PackageBundleProfile{
 		{
-			ID: "mysql-8.0.44-x86_64", Label: "MySQL 8.0.44 · x86_64", MySQLVersion: "8.0.44", Arch: "x86_64", Default: true,
-			MySQLCatalogID:        "mysql-8.0.44-x86_64",
-			RecommendedCatalogIDs: append(append([]string{}, common...), "xtrabackup-8.0.35-36-x86_64"),
+			ID: "mysql-5.7.44-x86_64", Label: "MySQL 5.7.44 · x86_64", MySQLVersion: "5.7.44", Arch: "x86_64",
+			MySQLCatalogID:        "mysql-5.7.44-x86_64",
+			RecommendedCatalogIDs: []string{"sysbench-1.0.20-source", "xtrabackup-2.4.29-x86_64"},
+			OptionalCatalogIDs:    []string{"proxysql-3.0.9-debian12-x86_64", "binlog2sql-5a8e65c", "mycat-1.6"},
+			CompatibilityNote:     "MySQL 5.7 最终稳定组合：XtraBackup 必须使用 2.4；Clone 与 MySQL 8 动态权限不可用；Toolkit 使用 Manager 离线包。",
+		},
+		{
+			ID: "mysql-8.0.46-x86_64", Label: "MySQL 8.0.46 · x86_64", MySQLVersion: "8.0.46", Arch: "x86_64", Default: true,
+			MySQLCatalogID:        "mysql-8.0.46-x86_64",
+			RecommendedCatalogIDs: append(append([]string{}, commonX86...), "xtrabackup-8.0.35-36-x86_64"),
 			OptionalCatalogIDs:    []string{"proxysql-3.0.9-debian12-x86_64", "binlog2sql-5a8e65c", "mycat2-1.22-source"},
-			CompatibilityNote:     "默认稳定组合：Router 9.7 支持仍受支持的 MySQL Server；XtraBackup 8.0.35-36 支持 MySQL 8.0.34 及以上；Toolkit 3.7.1 可用于 MySQL 8.0。",
+			CompatibilityNote:     "默认稳定组合：Router 9.7 支持仍受支持的 MySQL Server；XtraBackup 8.0.35-36 支持 MySQL 8.0.34 及以上；Toolkit 请按目标 Linux 发行版另行制作离线依赖包。",
 		},
 		{
 			ID: "mysql-8.4.10-x86_64", Label: "MySQL 8.4.10 LTS · x86_64", MySQLVersion: "8.4.10", Arch: "x86_64",
 			MySQLCatalogID:        "mysql-8.4.10-x86_64",
-			RecommendedCatalogIDs: append(append([]string{}, common...), "xtrabackup-8.4.0-6-x86_64"),
+			RecommendedCatalogIDs: append(append([]string{}, commonX86...), "xtrabackup-8.4.0-6-x86_64"),
 			OptionalCatalogIDs:    []string{"proxysql-3.0.9-debian12-x86_64", "mycat2-1.22-source"},
-			CompatibilityNote:     "LTS 组合：MySQL Router 9.7、Percona Toolkit 3.7.1 与 XtraBackup 8.4 均适配 MySQL 8.4；适合新建且希望获得更长支持周期的环境。",
+			CompatibilityNote:     "LTS 组合：MySQL Router 9.7 与 XtraBackup 8.4 适配 MySQL 8.4；Toolkit 请按目标 Linux 发行版另行制作离线依赖包。",
+		},
+		{
+			ID: "mysql-9.7.1-x86_64", Label: "MySQL 9.7.1 LTS · x86_64", MySQLVersion: "9.7.1", Arch: "x86_64",
+			MySQLCatalogID:        "mysql-9.7.1-x86_64",
+			RecommendedCatalogIDs: append(append([]string{}, commonX86...), "xtrabackup-9.7.1-rc1-x86_64"),
+			OptionalCatalogIDs:    []string{"proxysql-3.0.9-debian12-x86_64", "mycat2-1.22-source"},
+			CompatibilityNote:     "9.7 LTS 组合：Router 使用当前版本；Toolkit 可离线安装但上游尚未声明 9.7 支持，变更类 PT 命令需先预演；物理备份只能使用 XtraBackup 9.7，当前上游发布为 RC1，生产启用前需完成恢复演练。",
+		},
+		{
+			ID: "mysql-8.0.46-aarch64", Label: "MySQL 8.0.46 · aarch64", MySQLVersion: "8.0.46", Arch: "aarch64",
+			MySQLCatalogID:        "mysql-8.0.46-aarch64",
+			RecommendedCatalogIDs: commonARM,
+			CompatibilityNote:     "ARM64 官方通用二进制组合；XtraBackup 需另行上传与目标版本、glibc 和 aarch64 匹配的制品。",
+		},
+		{
+			ID: "mysql-8.4.10-aarch64", Label: "MySQL 8.4.10 LTS · aarch64", MySQLVersion: "8.4.10", Arch: "aarch64",
+			MySQLCatalogID:        "mysql-8.4.10-aarch64",
+			RecommendedCatalogIDs: commonARM,
+			CompatibilityNote:     "ARM64 8.4 LTS 官方通用二进制组合；XtraBackup 需另行上传匹配的 aarch64 制品。",
+		},
+		{
+			ID: "mysql-9.7.1-aarch64", Label: "MySQL 9.7.1 LTS · aarch64", MySQLVersion: "9.7.1", Arch: "aarch64",
+			MySQLCatalogID:        "mysql-9.7.1-aarch64",
+			RecommendedCatalogIDs: commonARM,
+			CompatibilityNote:     "ARM64 9.7 LTS 官方通用二进制组合；Percona 尚未在目录提供对应 aarch64 9.7 制品，物理备份需上传经过验证的同架构包。",
 		},
 	}
 }
@@ -372,20 +413,82 @@ func (s *PackageService) List(category, keyword string) ([]PackageItem, error) {
 // ResolvePerconaToolkitPackage selects a local Toolkit archive for the target
 // architecture. A noarch source archive is preferred because the core pt-*
 // commands are Perl programs and can be deployed to both x86_64 and aarch64.
-func (s *PackageService) ResolvePerconaToolkitPackage(arch string) (string, error) {
+func (s *PackageService) ResolvePerconaToolkitPackage(arch, osName string) (string, error) {
 	items, err := s.List("percona-toolkit", "")
 	if err != nil {
 		return "", err
 	}
 	arch = normalizePackageArch(arch)
-	for _, wantedArch := range []string{"noarch", arch} {
-		for _, item := range items {
-			if item.Arch == wantedArch && (item.Format == "tar.gz" || item.Format == "tgz") {
-				return item.Name, nil
-			}
+	bestName, bestScore := "", -1
+	for _, item := range items {
+		if item.Format != "tar.gz" && item.Format != "tgz" {
+			continue
+		}
+		score := perconaToolkitPackageScore(item, arch, osName)
+		if score > bestScore {
+			bestName, bestScore = item.Name, score
 		}
 	}
+	if bestName != "" {
+		return bestName, nil
+	}
 	return "", fmt.Errorf("no local Percona Toolkit package matches architecture %s", arch)
+}
+
+func perconaToolkitPackageScore(item PackageItem, targetArch, osName string) int {
+	score := -1
+	switch normalizePackageArch(item.Arch) {
+	case targetArch:
+		score = 100
+	case "noarch":
+		score = 10
+	default:
+		return -1
+	}
+	name := strings.ToLower(item.Name)
+	targetFamily := linuxPackageFamily(osName)
+	familyMarkers := map[string][]string{
+		"debian": {"ubuntu", "debian"},
+		"rhel":   {"rhel", "centos", "rocky", "alma"},
+		"suse":   {"opensuse", "sles", "suse"},
+		"alpine": {"alpine"},
+		"arch":   {"archlinux"},
+	}
+	for family, markers := range familyMarkers {
+		for _, marker := range markers {
+			if !strings.Contains(name, marker) {
+				continue
+			}
+			if family == targetFamily {
+				score += 100
+			} else {
+				score -= 100
+			}
+			break
+		}
+	}
+	if strings.Contains(name, "offline") {
+		score += 5
+	}
+	return score
+}
+
+func linuxPackageFamily(osName string) string {
+	name := strings.ToLower(osName)
+	switch {
+	case strings.Contains(name, "ubuntu"), strings.Contains(name, "debian"):
+		return "debian"
+	case strings.Contains(name, "red hat"), strings.Contains(name, "rhel"), strings.Contains(name, "centos"), strings.Contains(name, "rocky"), strings.Contains(name, "alma"):
+		return "rhel"
+	case strings.Contains(name, "suse"), strings.Contains(name, "sles"):
+		return "suse"
+	case strings.Contains(name, "alpine"):
+		return "alpine"
+	case strings.Contains(name, "arch linux"):
+		return "arch"
+	default:
+		return ""
+	}
 }
 
 // ResolveXtraBackupPackage selects a Manager-hosted XtraBackup binary archive
@@ -396,16 +499,19 @@ func (s *PackageService) ResolveXtraBackupPackage(mysqlVersion, arch, glibcVersi
 	if err != nil {
 		return "", err
 	}
-	seriesParts := strings.Split(strings.TrimSpace(mysqlVersion), ".")
-	if len(seriesParts) < 2 {
-		return "", fmt.Errorf("cannot determine XtraBackup series for MySQL %s", mysqlVersion)
+	capabilities, err := mysqlapp.CapabilitiesForVersion(mysqlVersion)
+	if err != nil {
+		return "", err
 	}
-	series := seriesParts[0] + "." + seriesParts[1]
+	series := capabilities.XtraBackupSeries
 	arch = normalizePackageArch(arch)
 	targetGlibc := parsePackageGlibc(glibcVersion)
 	candidates := make([]PackageItem, 0)
 	for _, item := range items {
 		if normalizePackageArch(item.Arch) != arch || !strings.HasPrefix(item.Version, series+".") {
+			continue
+		}
+		if !xtraBackupPackageSupportsServer(item.Version, mysqlVersion) {
 			continue
 		}
 		if item.Format != "tar.gz" && item.Format != "tgz" {
@@ -424,9 +530,81 @@ func (s *PackageService) ResolveXtraBackupPackage(mysqlVersion, arch, glibcVersi
 		if candidates[i].Version == candidates[j].Version {
 			return parsePackageGlibc(candidates[i].Name) > parsePackageGlibc(candidates[j].Name)
 		}
-		return candidates[i].Version > candidates[j].Version
+		return comparePackageRelease(candidates[i].Version, candidates[j].Version) > 0
 	})
 	return candidates[0].Name, nil
+}
+
+// Package release identifiers include values such as 8.0.35-36 and
+// 9.7.1-rc1. Lexical ordering would incorrectly rank 8.0.9 above 8.0.35, so
+// select offline tools by numeric components and prefer GA over prereleases
+// when the numeric components are otherwise equal.
+func comparePackageRelease(left, right string) int {
+	numbers := func(value string) []int {
+		lower := strings.ToLower(value)
+		for _, marker := range []string{"rc", "beta", "alpha"} {
+			if index := strings.Index(lower, marker); index >= 0 {
+				value = value[:index]
+				break
+			}
+		}
+		parts := regexp.MustCompile(`[0-9]+`).FindAllString(value, -1)
+		out := make([]int, 0, len(parts))
+		for _, part := range parts {
+			number, _ := strconv.Atoi(part)
+			out = append(out, number)
+		}
+		return out
+	}
+	a, b := numbers(left), numbers(right)
+	for index := 0; index < len(a) || index < len(b); index++ {
+		var av, bv int
+		if index < len(a) {
+			av = a[index]
+		}
+		if index < len(b) {
+			bv = b[index]
+		}
+		if av < bv {
+			return -1
+		}
+		if av > bv {
+			return 1
+		}
+	}
+	isPrerelease := func(value string) bool {
+		value = strings.ToLower(value)
+		return strings.Contains(value, "rc") || strings.Contains(value, "beta") || strings.Contains(value, "alpha")
+	}
+	if isPrerelease(left) != isPrerelease(right) {
+		if isPrerelease(left) {
+			return -1
+		}
+		return 1
+	}
+	return strings.Compare(left, right)
+}
+
+// Current XtraBackup 8.0.34+ releases intentionally dropped direct support
+// for MySQL 8.0.0-8.0.33. Those servers require a matching historical PXB
+// build, which the user can keep in the offline repository. Innovation and
+// LTS releases are already isolated by their exact x.y series above.
+func xtraBackupPackageSupportsServer(xtraBackupVersion, mysqlVersion string) bool {
+	serverParts := strings.Split(strings.TrimSpace(mysqlVersion), ".")
+	if len(serverParts) < 3 || serverParts[0] != "8" || serverParts[1] != "0" {
+		return true
+	}
+	serverPatch, err := strconv.Atoi(serverParts[2])
+	if err != nil || serverPatch >= 34 {
+		return true
+	}
+	base := strings.Split(strings.TrimSpace(xtraBackupVersion), "-")[0]
+	parts := strings.Split(base, ".")
+	if len(parts) < 3 {
+		return false
+	}
+	xtraBackupPatch, err := strconv.Atoi(parts[2])
+	return err == nil && xtraBackupPatch < 34
 }
 
 func parsePackageGlibc(value string) int {

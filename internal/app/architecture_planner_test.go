@@ -542,11 +542,65 @@ func TestStandaloneDetachKeepsBusinessConnectionsOfflineUntilVerification(t *tes
 	}
 }
 
-func TestPTInstallUsesOfficialRepositoryAndVersionGate(t *testing.T) {
+func TestArchitectureRoleChangesPersistAcrossMySQLRestart(t *testing.T) {
+	client := mysqlArchitectureClient("secret", 3306)
+	writable := mysqlRolePersistenceCommand(client, false)
+	for _, required := range []string{
+		"SET PERSIST super_read_only=OFF",
+		"SET PERSIST read_only=OFF",
+		"SET GLOBAL super_read_only=OFF",
+		"SET GLOBAL read_only=OFF",
+	} {
+		if !strings.Contains(writable, required) {
+			t.Fatalf("writable role command missing %q: %s", required, writable)
+		}
+	}
+	readOnly := mysqlRolePersistenceCommand(client, true)
+	for _, required := range []string{
+		"SET PERSIST read_only=ON",
+		"SET PERSIST super_read_only=ON",
+		"SET GLOBAL read_only=ON",
+		"SET GLOBAL super_read_only=ON",
+	} {
+		if !strings.Contains(readOnly, required) {
+			t.Fatalf("read-only role command missing %q: %s", required, readOnly)
+		}
+	}
+	for name, command := range map[string]string{"writable": writable, "read-only": readOnly} {
+		if output, err := exec.Command("sh", "-n", "-c", command).CombinedOutput(); err != nil {
+			t.Fatalf("%s role command has invalid shell syntax: %v\n%s", name, err, output)
+		}
+	}
+}
+
+func TestDualMasterVerificationRequiresBothWritableFlagsOff(t *testing.T) {
+	req := hadomain.ArchitectureAdjustmentRequest{
+		Architecture: hadomain.ArchitectureDualMaster,
+		Nodes: []hadomain.ArchitectureNodeRequest{
+			{MachineID: "db-1", Port: 3306, Role: "M"},
+			{MachineID: "db-2", Port: 3306, Role: "M"},
+		},
+	}
+	for _, node := range req.Nodes {
+		command := verifyArchitectureNodeCommand(req, node, "db-1")
+		for _, required := range []string{"@@read_only=0", "@@super_read_only=0", "ROLE_OK"} {
+			if !strings.Contains(command, required) {
+				t.Fatalf("dual-master verification for %s missing %q: %s", node.MachineID, required, command)
+			}
+		}
+	}
+}
+
+func TestPTCheckRequiresOfflineInstallationAndVersionGate(t *testing.T) {
 	command := installCompatiblePTCommand("secret", 3306)
-	for _, want := range []string{"repo.percona.com/apt/percona-release_latest.generic_all.deb", "repo.percona.com/yum/percona-release-latest.noarch.rpm", "min_pt=3.7.1", "8.4.*", "pt-table-checksum", "libdbi-perl", "perl-DBI", "perl-DBD-MySQL"} {
+	for _, want := range []string{"offline dependencies are missing", "enable offline PT installation", "min_pt=3.7.1", "8.*|9.*", "pt-table-checksum", "perl -MDBI -MDBD::mysql"} {
 		if !strings.Contains(command, want) {
 			t.Fatalf("PT install command missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{"repo.percona.com", "apt-get", "dnf install", "yum install"} {
+		if strings.Contains(command, forbidden) {
+			t.Fatalf("PT compatibility check must not access package repositories: %s", command)
 		}
 	}
 }

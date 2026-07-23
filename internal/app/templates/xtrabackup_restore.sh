@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 FULL_DIR=""; INCREMENTAL_DIRS=(); DATA_DIR=""; MYSQL_OS_USER="mysql"; SYSTEMD_UNIT=""; XTRABACKUP_BIN="xtrabackup"
 RECOVERY_MODE="physical"; RESTORE_TIME=""; BINLOG_DIR=""; PORT="3306"; SOCKET=""; DB_USER="root"; DB_PASSWORD_B64=""; REPAIR_REPLICATION="false"
+DEFAULTS_FILE=""; INSTANCE_BINLOG_DIR=""; REDO_DIR=""; UNDO_DIR=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --full-dir) FULL_DIR="$2"; shift 2;;
@@ -16,6 +17,10 @@ while [[ $# -gt 0 ]]; do
     --db-password-base64) DB_PASSWORD_B64="$2"; shift 2;;
     --repair-replication) REPAIR_REPLICATION="$2"; shift 2;;
     --data-dir) DATA_DIR="$2"; shift 2;;
+    --instance-binlog-dir) INSTANCE_BINLOG_DIR="$2"; shift 2;;
+    --redo-dir) REDO_DIR="$2"; shift 2;;
+    --undo-dir) UNDO_DIR="$2"; shift 2;;
+    --defaults-file) DEFAULTS_FILE="$2"; shift 2;;
     --mysql-os-user) MYSQL_OS_USER="$2"; shift 2;;
     --systemd-unit) SYSTEMD_UNIT="$2"; shift 2;;
     --xtrabackup) XTRABACKUP_BIN="$2"; shift 2;;
@@ -24,45 +29,157 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -f "$FULL_DIR/.gmha-backup-complete" ]] || { echo "[gmha-restore][ERROR] full backup marker is missing" >&2; exit 2; }
-for dir in "${INCREMENTAL_DIRS[@]}"; do [[ -f "$dir/.gmha-backup-complete" ]] || { echo "[gmha-restore][ERROR] incremental backup marker is missing: $dir" >&2; exit 2; }; done
-[[ -n "$DATA_DIR" && "$DATA_DIR" = /* ]] || { echo "[gmha-restore][ERROR] valid absolute --data-dir is required" >&2; exit 2; }
+incremental_count=0
+# ${array[@]+...} avoids Bash 3.x treating a declared-but-empty array as an
+# unbound variable while nounset is enabled.
+for dir in "${INCREMENTAL_DIRS[@]+"${INCREMENTAL_DIRS[@]}"}"; do
+  [[ -f "$dir/.gmha-backup-complete" ]] || { echo "[gmha-restore][ERROR] incremental backup marker is missing: $dir" >&2; exit 2; }
+  ((incremental_count += 1))
+done
+[[ -n "$DATA_DIR" && "$DATA_DIR" = /* && "$DATA_DIR" != "/" ]] || { echo "[gmha-restore][ERROR] safe absolute --data-dir is required" >&2; exit 2; }
 [[ -n "$SYSTEMD_UNIT" ]] || { echo "[gmha-restore][ERROR] --systemd-unit is required" >&2; exit 2; }
+[[ -z "$DEFAULTS_FILE" || -f "$DEFAULTS_FILE" ]] || { echo "[gmha-restore][ERROR] MySQL defaults file does not exist: $DEFAULTS_FILE" >&2; exit 2; }
 command -v "$XTRABACKUP_BIN" >/dev/null 2>&1 || { echo "[gmha-restore][ERROR] xtrabackup is not installed" >&2; exit 127; }
 [[ "$RECOVERY_MODE" == "physical" || "$RECOVERY_MODE" == "point_in_time" ]] || { echo "[gmha-restore][ERROR] invalid recovery mode" >&2; exit 2; }
+
+# New backups persist the exact server/tool pair. For older GMHA backups,
+# recover the server version from xtrabackup_info when possible. This check is
+# deliberately done before stopping MySQL or moving the current data dir.
+backup_meta="$FULL_DIR/gmha-backup.meta"
+backup_mysql_version=""
+required_xtrabackup_series=""
+if [[ -f "$backup_meta" ]]; then
+  backup_mysql_version="$(sed -n 's/^mysql_version=//p' "$backup_meta" | head -n1)"
+  required_xtrabackup_series="$(sed -n 's/^xtrabackup_series=//p' "$backup_meta" | head -n1)"
+fi
+if [[ -z "$backup_mysql_version" && -f "$FULL_DIR/xtrabackup_info" ]]; then
+  backup_mysql_version="$(sed -nE 's/^[[:space:]]*server_version[[:space:]]*=[[:space:]]*//p' "$FULL_DIR/xtrabackup_info" | tr -d "'\"[:space:]" | head -n1)"
+fi
+if [[ -z "$required_xtrabackup_series" && "$backup_mysql_version" =~ ^([0-9]+)\.([0-9]+)\. ]]; then
+  backup_mysql_series="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+  if [[ "$backup_mysql_series" == "5.7" ]]; then required_xtrabackup_series="2.4"; else required_xtrabackup_series="$backup_mysql_series"; fi
+fi
+if [[ -n "$required_xtrabackup_series" ]]; then
+  xtrabackup_version_output="$("$XTRABACKUP_BIN" --version 2>&1 || true)"
+  escaped_required_series="${required_xtrabackup_series//./\\.}"
+  printf '%s\n' "$xtrabackup_version_output" | grep -Eq "xtrabackup version ${escaped_required_series}([.-]|[[:space:]]|$)" || {
+    echo "[gmha-restore][ERROR] backup from MySQL ${backup_mysql_version:-unknown} requires XtraBackup ${required_xtrabackup_series}.x; installed binary is incompatible" >&2
+    exit 1
+  }
+  echo "[gmha-restore][INFO] compatibility precheck: backup MySQL ${backup_mysql_version:-unknown}, required XtraBackup ${required_xtrabackup_series}.x"
+else
+  echo "[gmha-restore][WARN] legacy backup has no version metadata; relying on XtraBackup prepare-time compatibility validation"
+fi
 if [[ "$RECOVERY_MODE" == "point_in_time" ]]; then
   [[ -n "$RESTORE_TIME" ]] || { echo "[gmha-restore][ERROR] restore time is required" >&2; exit 2; }
   [[ -d "$BINLOG_DIR" ]] || { echo "[gmha-restore][ERROR] binlog recovery directory does not exist: $BINLOG_DIR" >&2; exit 2; }
   command -v mysqlbinlog >/dev/null 2>&1 || { echo "[gmha-restore][ERROR] mysqlbinlog is required" >&2; exit 127; }
 fi
 
-stamp="$(date +%Y%m%d_%H%M%S)"; STAGING="$(dirname "$DATA_DIR")/.gmha_restore_${stamp}"
-echo "[gmha-restore][INFO] copying full backup into restore staging: $STAGING"
-mkdir -p "$STAGING"; trap 'rm -rf "$STAGING"' EXIT
-if command -v rsync >/dev/null 2>&1; then rsync -a --exclude gmha-binlog "$FULL_DIR/" "$STAGING/"; else cp -a "$FULL_DIR/." "$STAGING/"; rm -rf "$STAGING/gmha-binlog"; fi
+# Keep all instance-owned storage locations transactionally aligned. XtraBackup
+# restores external binlog/redo/undo files according to my.cnf, so each distinct
+# directory must be empty for copy-back and must participate in rollback.
+MANAGED_DIRS=()
+for candidate in "$DATA_DIR" "$INSTANCE_BINLOG_DIR" "$REDO_DIR" "$UNDO_DIR"; do
+  [[ -n "$candidate" ]] || continue
+  [[ "$candidate" = /* && "$candidate" != "/" ]] || { echo "[gmha-restore][ERROR] unsafe instance directory: $candidate" >&2; exit 2; }
+  skip=false
+  for existing in "${MANAGED_DIRS[@]+"${MANAGED_DIRS[@]}"}"; do
+    if [[ "$candidate" == "$existing" || "$candidate" == "$existing/"* ]]; then skip=true; break; fi
+  done
+  [[ "$skip" == "true" ]] || MANAGED_DIRS+=("$candidate")
+done
 
-if (( ${#INCREMENTAL_DIRS[@]} == 0 )); then
+# InnoDB deliberately skips hidden directories during tablespace discovery.
+# Keep the staging directory visible or prepare can report missing tablespaces.
+stamp="$(date +%Y%m%d_%H%M%S)"; STAGING="$(dirname "$DATA_DIR")/gmha_restore_${stamp}"
+INCREMENTAL_STAGING_ROOT="${STAGING}_incrementals"
+ROLLBACK_REQUIRED="false"; AUTH_FILE=""; ORIGINAL_DIRS=(); SAVED_DIRS=(); HAD_ORIGINAL=()
+
+rollback_original() {
+  local i path saved
+  echo "[gmha-restore][WARN] restore failed; rolling back all original instance directories" >&2
+  systemctl stop "$SYSTEMD_UNIT" >/dev/null 2>&1 || true
+  for ((i=${#ORIGINAL_DIRS[@]}-1; i>=0; i--)); do
+    path="${ORIGINAL_DIRS[$i]}"; saved="${SAVED_DIRS[$i]}"
+    if [[ "${HAD_ORIGINAL[$i]}" == "true" && -e "$saved" ]]; then
+      rm -rf "$path"; mv "$saved" "$path"
+    elif [[ "${HAD_ORIGINAL[$i]}" == "false" ]]; then
+      rm -rf "$path"
+    fi
+  done
+  if systemctl start "$SYSTEMD_UNIT"; then
+    echo "[gmha-restore][INFO] original instance restarted after rollback" >&2
+  else
+    echo "[gmha-restore][ERROR] original directories were restored but $SYSTEMD_UNIT could not be restarted" >&2
+  fi
+}
+
+on_exit() {
+  local rc=$?
+  trap - EXIT
+  [[ -n "$AUTH_FILE" ]] && rm -f "$AUTH_FILE"
+  if [[ "$ROLLBACK_REQUIRED" == "true" ]]; then rollback_original; fi
+  rm -rf "$STAGING" "$INCREMENTAL_STAGING_ROOT"
+  exit "$rc"
+}
+trap on_exit EXIT
+
+echo "[gmha-restore][INFO] copying full backup into restore staging: $STAGING"
+mkdir -p "$STAGING"
+if command -v rsync >/dev/null 2>&1; then rsync -a --exclude gmha-binlog "$FULL_DIR/" "$STAGING/"; else cp -a "$FULL_DIR/." "$STAGING/"; rm -rf "$STAGING/gmha-binlog"; fi
+rm -f "$STAGING/.gmha-backup-complete" "$STAGING/gmha-backup.meta"
+
+if (( incremental_count == 0 )); then
   "$XTRABACKUP_BIN" --prepare "--target-dir=$STAGING"
 else
-  "$XTRABACKUP_BIN" --prepare --apply-log-only "--target-dir=$STAGING"
-  last=$(( ${#INCREMENTAL_DIRS[@]} - 1 ))
+  # XtraBackup mutates an incremental directory while applying it. Work from
+  # disposable copies so one backup chain remains reusable for later restores.
+  STAGED_INCREMENTAL_DIRS=()
+  mkdir -p "$INCREMENTAL_STAGING_ROOT"
   for i in "${!INCREMENTAL_DIRS[@]}"; do
-    if (( i == last )); then "$XTRABACKUP_BIN" --prepare "--target-dir=$STAGING" "--incremental-dir=${INCREMENTAL_DIRS[$i]}"
-    else "$XTRABACKUP_BIN" --prepare --apply-log-only "--target-dir=$STAGING" "--incremental-dir=${INCREMENTAL_DIRS[$i]}"; fi
+    staged_incremental="$INCREMENTAL_STAGING_ROOT/$i"
+    mkdir -p "$staged_incremental"
+    if command -v rsync >/dev/null 2>&1; then
+      rsync -a --exclude gmha-binlog "${INCREMENTAL_DIRS[$i]}/" "$staged_incremental/"
+    else
+      cp -a "${INCREMENTAL_DIRS[$i]}/." "$staged_incremental/"; rm -rf "$staged_incremental/gmha-binlog"
+    fi
+    rm -f "$staged_incremental/.gmha-backup-complete" "$staged_incremental/gmha-backup.meta"
+    STAGED_INCREMENTAL_DIRS+=("$staged_incremental")
+  done
+  "$XTRABACKUP_BIN" --prepare --apply-log-only "--target-dir=$STAGING"
+  last=$(( incremental_count - 1 ))
+  for i in "${!STAGED_INCREMENTAL_DIRS[@]}"; do
+    if (( i == last )); then "$XTRABACKUP_BIN" --prepare "--target-dir=$STAGING" "--incremental-dir=${STAGED_INCREMENTAL_DIRS[$i]}"
+    else "$XTRABACKUP_BIN" --prepare --apply-log-only "--target-dir=$STAGING" "--incremental-dir=${STAGED_INCREMENTAL_DIRS[$i]}"; fi
   done
 fi
 
 echo "[gmha-restore][WARN] full physical restore will stop $SYSTEMD_UNIT; database access is now suspended"
+ROLLBACK_REQUIRED="true"
 systemctl stop "$SYSTEMD_UNIT"
-if [[ -d "$DATA_DIR" ]]; then mv "$DATA_DIR" "${DATA_DIR}.before_restore_${stamp}"; fi
-mkdir -p "$DATA_DIR"
-if ! "$XTRABACKUP_BIN" --copy-back "--target-dir=$STAGING" "--datadir=$DATA_DIR"; then
-  echo "[gmha-restore][ERROR] copy-back failed; rolling back original data directory" >&2
-  rm -rf "$DATA_DIR"; [[ -d "${DATA_DIR}.before_restore_${stamp}" ]] && mv "${DATA_DIR}.before_restore_${stamp}" "$DATA_DIR"; exit 1
-fi
-chown -R "$MYSQL_OS_USER:$MYSQL_OS_USER" "$DATA_DIR"; systemctl start "$SYSTEMD_UNIT"
+for path in "${MANAGED_DIRS[@]}"; do
+  saved="${path}.before_restore_${stamp}"
+  [[ ! -e "$saved" ]] || { echo "[gmha-restore][ERROR] rollback directory already exists: $saved" >&2; exit 1; }
+  ORIGINAL_DIRS+=("$path"); SAVED_DIRS+=("$saved")
+  if [[ -e "$path" ]]; then HAD_ORIGINAL+=("true"); mv "$path" "$saved"; else HAD_ORIGINAL+=("false"); fi
+  mkdir -p "$path"
+done
 
-MYSQL_PWD="$(printf '%s' "$DB_PASSWORD_B64" | base64 -d)"; export MYSQL_PWD
-mysql_args=(--batch "--user=$DB_USER" "--port=$PORT")
+copy_args=()
+[[ -n "$DEFAULTS_FILE" ]] && copy_args+=("--defaults-file=$DEFAULTS_FILE")
+copy_args+=(--copy-back "--target-dir=$STAGING" "--datadir=$DATA_DIR")
+"$XTRABACKUP_BIN" "${copy_args[@]}"
+for path in "${MANAGED_DIRS[@]}"; do chown -R "$MYSQL_OS_USER:$MYSQL_OS_USER" "$path"; done
+systemctl start "$SYSTEMD_UNIT"
+
+MYSQL_PWD="$(printf '%s' "$DB_PASSWORD_B64" | base64 -d)"
+AUTH_FILE="$(mktemp "/tmp/gmha-restore-auth-${PORT}.XXXXXX.cnf")"; chmod 600 "$AUTH_FILE"
+escaped_user="${DB_USER//\\/\\\\}"; escaped_user="${escaped_user//\"/\\\"}"
+escaped_password="${MYSQL_PWD//\\/\\\\}"; escaped_password="${escaped_password//\"/\\\"}"
+printf '[client]\nuser="%s"\npassword="%s"\n' "$escaped_user" "$escaped_password" > "$AUTH_FILE"
+mysql_args=("--defaults-extra-file=$AUTH_FILE" --batch "--port=$PORT")
 if [[ -n "$SOCKET" ]]; then mysql_args+=("--socket=$SOCKET"); else mysql_args+=(--host=127.0.0.1); fi
 for _ in $(seq 1 30); do mysql "${mysql_args[@]}" -e 'select 1' >/dev/null 2>&1 && break; sleep 1; done
 mysql "${mysql_args[@]}" -e 'select 1' >/dev/null 2>&1 || { echo "[gmha-restore][ERROR] MySQL did not become ready after restore" >&2; exit 1; }
@@ -95,4 +212,5 @@ if [[ "$REPAIR_REPLICATION" == "true" ]]; then
   echo "[gmha-restore][SUCCESS] pt-table-sync replication repair completed"
 fi
 unset MYSQL_PWD
-echo "[gmha-restore][SUCCESS] restore completed; previous data retained at ${DATA_DIR}.before_restore_${stamp}"
+ROLLBACK_REQUIRED="false"
+echo "[gmha-restore][SUCCESS] restore completed; previous instance directories retained with suffix .before_restore_${stamp}"

@@ -118,6 +118,37 @@ type MetricSnapshot struct {
 	CollectedAt time.Time
 }
 
+// MetricSample is the normalized durable form of one collected metric. Complex
+// collector payloads are retained as JSON while numeric leaf metrics also use
+// NumericValue for indexed time-series queries.
+type MetricSample struct {
+	ID           int64             `json:"id"`
+	AgentID      string            `json:"agent_id"`
+	MachineID    string            `json:"machine_id"`
+	ClusterID    string            `json:"cluster_id"`
+	Scope        string            `json:"scope"`
+	Category     string            `json:"category"`
+	MetricName   string            `json:"metric"`
+	Instance     string            `json:"instance,omitempty"`
+	Labels       map[string]string `json:"labels,omitempty"`
+	ValueType    string            `json:"value_type"`
+	NumericValue *float64          `json:"numeric_value,omitempty"`
+	Value        any               `json:"value,omitempty"`
+	Success      bool              `json:"success"`
+	Error        string            `json:"error,omitempty"`
+	CollectedAt  time.Time         `json:"collected_at"`
+}
+
+type MetricSampleQuery struct {
+	ClusterID string
+	MachineID string
+	Metric    string
+	Instance  string
+	StartAt   time.Time
+	EndAt     time.Time
+	Limit     int
+}
+
 // MetricSnapshotWriter / MetricSnapshotReader 是可选仓储能力。使用小接口可让
 // 内存测试仓储和旧的外部实现继续只实现核心 Repository。
 type MetricSnapshotWriter interface {
@@ -126,6 +157,20 @@ type MetricSnapshotWriter interface {
 
 type MetricSnapshotReader interface {
 	ListMetricSnapshots(ctx context.Context, clusterID string, since time.Time, limit int) ([]MetricSnapshot, error)
+}
+
+// MetricSnapshotRangeReader allows dashboards to query a historical window
+// that ends in the past without loading newer snapshots from the same cluster.
+type MetricSnapshotRangeReader interface {
+	ListMetricSnapshotsRange(ctx context.Context, clusterID string, start, end time.Time, limit int) ([]MetricSnapshot, error)
+}
+
+type MetricSampleWriter interface {
+	AppendMetricSamples(ctx context.Context, items []MetricSample) error
+}
+
+type MetricSampleReader interface {
+	ListMetricSamples(ctx context.Context, query MetricSampleQuery) ([]MetricSample, error)
 }
 
 // Repository 定义了心跳领域的仓储接口，用于持久化心跳状态和事件。

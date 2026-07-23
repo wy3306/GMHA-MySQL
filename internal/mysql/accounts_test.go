@@ -126,6 +126,22 @@ func TestAccountSQLStepsForMHA(t *testing.T) {
 	}
 }
 
+func TestAccountSQLStepsForMySQL57ReplaceDynamicPrivilegesWithSuper(t *testing.T) {
+	steps := accountSQLStepsForVersion(AccountSpec{Role: AccountRoleMHA, Username: "mha", Password: "secret", Host: "%", Enabled: true}, "5.7.44")
+	var sqlText strings.Builder
+	for _, step := range steps {
+		sqlText.WriteString(step.SQL)
+		sqlText.WriteByte('\n')
+		if step.Name == "grant_dynamic" {
+			t.Fatal("MySQL 5.7 must not receive a dynamic privilege grant")
+		}
+	}
+	got := sqlText.String()
+	if !strings.Contains(got, "SUPER") || strings.Contains(got, "BACKUP_ADMIN") || strings.Contains(got, "CLONE_ADMIN") {
+		t.Fatalf("unexpected MySQL 5.7 grants:\n%s", got)
+	}
+}
+
 // TestAccountInitConnectFailureResult 测试连接失败结果的构建，验证可重试标记和错误信息格式。
 func TestAccountInitConnectFailureResult(t *testing.T) {
 	result := accountInitConnectFailure(errors.New("connection refused"))

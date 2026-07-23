@@ -54,7 +54,7 @@ func TestResolvePerconaToolkitPackagePrefersNoarch(t *testing.T) {
 		}
 	}
 	service := &PackageService{storagePath: root}
-	name, err := service.ResolvePerconaToolkitPackage("aarch64")
+	name, err := service.ResolvePerconaToolkitPackage("aarch64", "Ubuntu 22.04")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,8 +73,53 @@ func TestResolvePerconaToolkitPackageRejectsMissingArchitecture(t *testing.T) {
 		t.Fatal(err)
 	}
 	service := &PackageService{storagePath: root}
-	if _, err := service.ResolvePerconaToolkitPackage("aarch64"); err == nil {
+	if _, err := service.ResolvePerconaToolkitPackage("aarch64", "Ubuntu 22.04"); err == nil {
 		t.Fatal("expected an architecture mismatch error")
+	}
+}
+
+func TestResolvePerconaToolkitPackagePrefersNativeOfflineBundle(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "percona-toolkit")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"percona-toolkit-3.7.1-noarch.tar.gz", "percona-toolkit-3.7.1-linux-offline-x86_64.tar.gz"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("package"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service := &PackageService{storagePath: root}
+	name, err := service.ResolvePerconaToolkitPackage("x86_64", "Rocky Linux 9.4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "percona-toolkit-3.7.1-linux-offline-x86_64.tar.gz" {
+		t.Fatalf("selected package %q", name)
+	}
+}
+
+func TestResolvePerconaToolkitPackageMatchesLinuxFamily(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "percona-toolkit")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{
+		"percona-toolkit-3.7.1-ubuntu22-offline-x86_64.tar.gz",
+		"percona-toolkit-3.7.1-rocky9-offline-x86_64.tar.gz",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("package"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service := &PackageService{storagePath: root}
+	name, err := service.ResolvePerconaToolkitPackage("x86_64", "Ubuntu 22.04.5 LTS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(name, "ubuntu22") {
+		t.Fatalf("selected package %q", name)
 	}
 }
 
@@ -111,6 +156,54 @@ func TestResolveXtraBackupPackageMatchesSeriesArchitectureAndGlibc(t *testing.T)
 	}
 }
 
+func TestResolveXtraBackupPackageMapsMySQL57To24(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "xtrabackup")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{
+		"percona-xtrabackup-2.4.29-Linux-x86_64.glibc2.17-minimal.tar.gz",
+		"percona-xtrabackup-8.0.35-36-Linux-x86_64.glibc2.28-minimal.tar.gz",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("package"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service := &PackageService{storagePath: root}
+	name, err := service.ResolveXtraBackupPackage("5.7.44", "x86_64", "2.17")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(name, "xtrabackup-2.4.29") {
+		t.Fatalf("expected XtraBackup 2.4 for MySQL 5.7, got %q", name)
+	}
+}
+
+func TestResolveXtraBackupPackageMatchesMySQL97Only(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "xtrabackup")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{
+		"percona-xtrabackup-8.4.0-6-Linux-x86_64.glibc2.28-minimal.tar.gz",
+		"percona-xtrabackup-9.7.1-rc1-Linux-x86_64.glibc2.28.tar.gz",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("package"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service := &PackageService{storagePath: root}
+	name, err := service.ResolveXtraBackupPackage("9.7.1", "x86_64", "2.31")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(name, "xtrabackup-9.7.1-rc1") {
+		t.Fatalf("expected XtraBackup 9.7 for MySQL 9.7, got %q", name)
+	}
+}
+
 func TestResolveXtraBackupPackageRejectsIncompatibleTarget(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "xtrabackup")
@@ -127,6 +220,39 @@ func TestResolveXtraBackupPackageRejectsIncompatibleTarget(t *testing.T) {
 	}
 	if _, err := service.ResolveXtraBackupPackage("8.4.10", "x86_64", "2.17"); err == nil {
 		t.Fatal("expected glibc mismatch")
+	}
+}
+
+func TestResolveXtraBackupPackageRequiresHistoricalBuildForEarlyMySQL80(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "xtrabackup")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	current := "percona-xtrabackup-8.0.35-36-Linux-x86_64.glibc2.28-minimal.tar.gz"
+	if err := os.WriteFile(filepath.Join(dir, current), []byte("package"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	service := &PackageService{storagePath: root}
+	if _, err := service.ResolveXtraBackupPackage("8.0.29", "x86_64", "2.31"); err == nil || !strings.Contains(err.Error(), "XtraBackup 8.0") {
+		t.Fatalf("early MySQL 8.0 should reject current-only PXB repository, got %v", err)
+	}
+	historical := "percona-xtrabackup-8.0.32-25-Linux-x86_64.glibc2.28-minimal.tar.gz"
+	if err := os.WriteFile(filepath.Join(dir, historical), []byte("package"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	name, err := service.ResolveXtraBackupPackage("8.0.29", "x86_64", "2.31")
+	if err != nil || name != historical {
+		t.Fatalf("expected historical PXB for MySQL 8.0.29, got %q, %v", name, err)
+	}
+}
+
+func TestComparePackageReleaseUsesNumericOrdering(t *testing.T) {
+	if comparePackageRelease("8.0.35-36", "8.0.9-10") <= 0 {
+		t.Fatal("8.0.35-36 must sort after 8.0.9-10")
+	}
+	if comparePackageRelease("9.7.1", "9.7.1-rc1") <= 0 {
+		t.Fatal("GA release must sort after an otherwise equivalent RC")
 	}
 }
 
@@ -187,7 +313,7 @@ func TestOfficialCatalogCoversMySQLTools(t *testing.T) {
 	}
 }
 
-func TestDefaultPackageBundleUsesMySQL8044X86AndResolvableCatalog(t *testing.T) {
+func TestDefaultPackageBundleUsesCurrentMySQL80X86AndResolvableCatalog(t *testing.T) {
 	catalog := map[string]bool{}
 	for _, item := range officialPackageCatalog() {
 		catalog[item.ID] = true
@@ -196,7 +322,7 @@ func TestDefaultPackageBundleUsesMySQL8044X86AndResolvableCatalog(t *testing.T) 
 	for _, bundle := range officialPackageBundles() {
 		if bundle.Default {
 			defaults++
-			if bundle.MySQLVersion != "8.0.44" || bundle.Arch != "x86_64" {
+			if bundle.MySQLVersion != "8.0.46" || bundle.Arch != "x86_64" {
 				t.Fatalf("unexpected default bundle: %#v", bundle)
 			}
 		}
@@ -222,11 +348,11 @@ func TestFetchPackageBundleDownloadsRecommendedOfficialItems(t *testing.T) {
 			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("official-package")), Header: make(http.Header), Request: req}, nil
 		})},
 	}
-	result, err := service.FetchPackageBundle(context.Background(), "mysql-8.0.44-x86_64")
+	result, err := service.FetchPackageBundle(context.Background(), "mysql-8.0.46-x86_64")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.Complete || len(result.Results) != 5 {
+	if !result.Complete || len(result.Results) != 4 {
 		t.Fatalf("unexpected bundle result: %#v", result)
 	}
 	for _, item := range result.Results {
@@ -234,7 +360,7 @@ func TestFetchPackageBundleDownloadsRecommendedOfficialItems(t *testing.T) {
 			t.Fatalf("unexpected downloaded item: %#v", item)
 		}
 	}
-	result, err = service.FetchPackageBundle(context.Background(), "mysql-8.0.44-x86_64")
+	result, err = service.FetchPackageBundle(context.Background(), "mysql-8.0.46-x86_64")
 	if err != nil {
 		t.Fatal(err)
 	}

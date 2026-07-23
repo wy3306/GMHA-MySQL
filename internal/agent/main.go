@@ -36,6 +36,7 @@ func Run(ctx context.Context, cfg Config) error {
 		agenthandler.NewMySQLInstallHandler(cfg.ManagerHTTPAddr, cfg.InstallDir),
 		agenthandler.NewMySQLUninstallHandler(cfg.InstallDir),
 		agenthandler.NewMySQLTopologyHandler(),
+		agenthandler.NewFlameGraphHandler(),
 	)
 	receiver := agentcore.NewReceiver(strings.Join(cfg.ManagerHTTPAddrs, ","), cfg.AgentID, cfg.MachineID, dispatcher)
 	go func() {

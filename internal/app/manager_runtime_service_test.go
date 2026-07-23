@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -91,7 +92,7 @@ func TestManagerDatabaseConfigValidationAndAliases(t *testing.T) {
 		{name: "sqlite path", cfg: ManagerRuntimeConfig{DatabaseDriver: "sqlite", DBPath: "manager.db"}, driver: "sqlite"},
 		{name: "mysql dsn required", cfg: ManagerRuntimeConfig{DatabaseDriver: "mysql"}, wantErr: true, driver: "mysql"},
 		{name: "mysql", cfg: ManagerRuntimeConfig{DatabaseDriver: "MYSQL", DatabaseDSN: "user:pass@tcp(localhost:3306)/gmha"}, driver: "mysql"},
-		{name: "postgres alias", cfg: ManagerRuntimeConfig{DatabaseDriver: "postgresql", DatabaseDSN: "postgres://localhost/gmha"}, driver: "postgres"},
+		{name: "postgres alias", cfg: ManagerRuntimeConfig{DatabaseDriver: "postgresql", DatabaseDSN: "postgres://gmha:secret@localhost/gmha"}, driver: "postgres"},
 		{name: "unsupported", cfg: ManagerRuntimeConfig{DatabaseDriver: "oracle", DatabaseDSN: "unused"}, wantErr: true, driver: "oracle"},
 	}
 	for _, tt := range tests {
@@ -105,5 +106,60 @@ func TestManagerDatabaseConfigValidationAndAliases(t *testing.T) {
 				t.Fatalf("error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestManagerDatabaseDSNIsBuiltFromRegularFieldsAndRedacted(t *testing.T) {
+	cfg := normalizeManagerRuntimeConfig(ManagerRuntimeConfig{
+		DatabaseDriver: "mysql", DatabaseHost: "db.internal", DatabasePort: 3306,
+		DatabaseName: "gmha", DatabaseUsername: "manager", DatabasePassword: "p@ss word",
+	})
+	if cfg.DatabaseDSN == "" || !strings.Contains(cfg.DatabaseDSN, "db.internal:3306") {
+		t.Fatalf("mysql DSN was not generated: %q", cfg.DatabaseDSN)
+	}
+	public := cfg.Redacted()
+	if public.DatabaseDSN != "" || public.DatabasePassword != "" || !public.DatabasePasswordSet {
+		t.Fatalf("database secret was not redacted: %+v", public)
+	}
+}
+
+func TestSaveConfigRequiresSuccessfulDatabaseTestWhenDatabaseChanges(t *testing.T) {
+	service := newTestManagerRuntimeService(t, ManagerRuntimeConfig{
+		DatabaseDriver: "sqlite", DBPath: filepath.Join(t.TempDir(), "old.db"),
+		ManagerHTTPAddr: "http://192.0.2.10:8080", ManagerGRPCAddr: "192.0.2.10:9100",
+	})
+	next := normalizeManagerRuntimeConfig(ManagerRuntimeConfig{
+		DatabaseDriver: "sqlite", DBPath: filepath.Join(t.TempDir(), "new.db"),
+		ManagerHTTPAddr: "http://192.0.2.10:8080", ManagerGRPCAddr: "192.0.2.10:9100",
+	})
+	if err := service.SaveConfigVerified(context.Background(), next, ""); err == nil {
+		t.Fatal("expected untested database change to be rejected")
+	}
+	result, err := service.TestDatabase(context.Background(), next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.SaveConfigVerified(context.Background(), next, result.TestToken); err != nil {
+		t.Fatalf("verified database config was rejected: %v", err)
+	}
+}
+
+func TestSaveConfigRejectsDirectDatabaseSwitchAfterPlatformUse(t *testing.T) {
+	service := newTestManagerRuntimeService(t, ManagerRuntimeConfig{
+		DatabaseDriver: "sqlite", DBPath: filepath.Join(t.TempDir(), "old.db"),
+		ManagerHTTPAddr: "http://192.0.2.10:8080", ManagerGRPCAddr: "192.0.2.10:9100",
+	})
+	service.SetPlatformUsageChecker(func(context.Context) (bool, error) { return true, nil })
+	next := normalizeManagerRuntimeConfig(ManagerRuntimeConfig{
+		DatabaseDriver: "sqlite", DBPath: filepath.Join(t.TempDir(), "new.db"),
+		ManagerHTTPAddr: "http://192.0.2.10:8080", ManagerGRPCAddr: "192.0.2.10:9100",
+	})
+	result, err := service.TestDatabase(context.Background(), next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = service.SaveConfigVerified(context.Background(), next, result.TestToken)
+	if err == nil || !strings.Contains(err.Error(), "平台已产生业务数据") {
+		t.Fatalf("expected platform-use guard, got %v", err)
 	}
 }

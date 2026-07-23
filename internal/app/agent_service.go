@@ -16,6 +16,7 @@ import (
 	"gmha/internal/agent/mysqlcheck"
 	"gmha/internal/buildinfo"
 	agentdomain "gmha/internal/domain/agent"
+	credentialdomain "gmha/internal/domain/credential"
 	dynamicdomain "gmha/internal/domain/dynamic"
 	hbdomain "gmha/internal/domain/heartbeat"
 	machinedomain "gmha/internal/domain/machine"
@@ -27,6 +28,7 @@ import (
 type AgentService struct {
 	repo            agentdomain.Repository
 	machineRepo     machinedomain.Repository
+	credentialRepo  credentialdomain.Repository
 	sshClient       agentusecase.SSHClient
 	heartbeat       *HeartbeatService
 	recovery        *RecoveryService
@@ -40,6 +42,35 @@ type AgentService struct {
 	managerGRPCAddr string
 	upgradeMu       sync.Mutex
 	upgrading       map[string]struct{}
+}
+
+// SetCredentialRepository configures the SSH credential source used by Agent
+// lifecycle operations. It is kept as a setter to preserve the constructor's
+// compatibility with existing callers and tests.
+func (s *AgentService) SetCredentialRepository(repo credentialdomain.Repository) {
+	s.credentialRepo = repo
+}
+
+func (s *AgentService) machineSSHAuth(ctx context.Context, machine machinedomain.Machine) (machinedomain.SSHAuth, error) {
+	auth := machinedomain.SSHAuth{User: strings.TrimSpace(machine.SSHUser)}
+	if strings.TrimSpace(machine.CredentialID) != "" && s.credentialRepo != nil {
+		credential, found, err := s.credentialRepo.GetByID(ctx, machine.CredentialID)
+		if err != nil {
+			return auth, fmt.Errorf("load SSH credential: %w", err)
+		}
+		if found {
+			auth = machinedomain.SSHAuth{
+				User:       credential.SSHUser,
+				Password:   credential.SSHPassword,
+				PrivateKey: credential.PrivateKey,
+				Passphrase: credential.Passphrase,
+			}
+		}
+	}
+	if strings.TrimSpace(auth.User) == "" {
+		auth.User = "root"
+	}
+	return auth, nil
 }
 
 // NewAgentService 创建 Agent 管理服务实例。
@@ -322,7 +353,10 @@ func (s *AgentService) DetectVersionByIP(ctx context.Context, ip string) (AgentV
 	}
 	agent.InstallDir = agentdomain.ResolveInstallDir(machine.SSHUser, firstNonEmpty(agent.InstallDir, machine.AgentInstallDir))
 	endpoint := machinedomain.Endpoint{IP: machine.IP, SSHPort: machine.SSHPort}
-	auth := machinedomain.SSHAuth{User: machine.SSHUser}
+	auth, err := s.machineSSHAuth(ctx, machine)
+	if err != nil {
+		return AgentView{}, err
+	}
 	output, err := s.sshClient.RunOutput(ctx, endpoint, auth, shellQuote(strings.TrimSuffix(agent.InstallDir, "/")+"/agentd")+" --version")
 	if err != nil {
 		return AgentView{}, fmt.Errorf("检测 Agent 版本失败: %w", err)
@@ -744,7 +778,10 @@ func (s *AgentService) detectRemotePlatform(ctx context.Context, machine machine
 		return "", "", errors.New("ssh client not configured")
 	}
 	endpoint := machinedomain.Endpoint{IP: machine.IP, SSHPort: machine.SSHPort}
-	auth := machinedomain.SSHAuth{User: machine.SSHUser}
+	auth, err := s.machineSSHAuth(ctx, machine)
+	if err != nil {
+		return "", "", err
+	}
 	output, err := s.sshClient.RunOutput(ctx, endpoint, auth, `sh -lc 'printf "%s %s" "$(uname -s)" "$(uname -m)"'`)
 	if err != nil {
 		return "", "", err

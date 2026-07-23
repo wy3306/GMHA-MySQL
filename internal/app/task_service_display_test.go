@@ -183,14 +183,14 @@ func TestMySQLUpgradePrecheckGateRequiresMatchingFreshSuccessfulReport(t *testin
 		Status: taskdomain.StatusSuccess, SpecJSON: spec, CreatedAt: time.Now().UTC(),
 	}}
 	service := NewTaskService(repo, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
-	if err := service.validateMySQLUpgradePrecheck(context.Background(), "precheck-1", "db-1", 3306, "mysql-8.4.6-linux-glibc2.17-x86_64.tar.xz"); err != nil {
+	if err := service.validateMySQLUpgradePrecheck(context.Background(), "precheck-1", "db-1", 3306, "mysql-8.4.6-linux-glibc2.17-x86_64.tar.xz", ""); err != nil {
 		t.Fatalf("matching successful precheck should pass: %v", err)
 	}
-	if err := service.validateMySQLUpgradePrecheck(context.Background(), "precheck-1", "db-2", 3306, "mysql-8.4.6-linux-glibc2.17-x86_64.tar.xz"); err == nil {
+	if err := service.validateMySQLUpgradePrecheck(context.Background(), "precheck-1", "db-2", 3306, "mysql-8.4.6-linux-glibc2.17-x86_64.tar.xz", ""); err == nil {
 		t.Fatal("report for another machine must not pass")
 	}
 	repo.parent.CreatedAt = time.Now().Add(-31 * time.Minute)
-	if err := service.validateMySQLUpgradePrecheck(context.Background(), "precheck-1", "db-1", 3306, "mysql-8.4.6-linux-glibc2.17-x86_64.tar.xz"); err == nil || !strings.Contains(err.Error(), "30") {
+	if err := service.validateMySQLUpgradePrecheck(context.Background(), "precheck-1", "db-1", 3306, "mysql-8.4.6-linux-glibc2.17-x86_64.tar.xz", ""); err == nil || !strings.Contains(err.Error(), "30") {
 		t.Fatalf("stale report should be rejected, got %v", err)
 	}
 }

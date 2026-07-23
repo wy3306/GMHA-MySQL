@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -10,6 +11,7 @@ import (
 
 	"gmha/internal/app"
 	alertdomain "gmha/internal/domain/alert"
+	dynamicdomain "gmha/internal/domain/dynamic"
 )
 
 type AlertHandler struct {
@@ -103,7 +105,8 @@ func (h *AlertHandler) events(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	items, err := h.alerts.ListEvents(r.Context(), alertdomain.EventFilter{Status: r.URL.Query().Get("status"), Severity: r.URL.Query().Get("severity"), ClusterID: r.URL.Query().Get("cluster_id"), Keyword: r.URL.Query().Get("keyword"), Limit: limit})
+	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+	items, err := h.alerts.ListEvents(r.Context(), alertdomain.EventFilter{Status: r.URL.Query().Get("status"), Severity: r.URL.Query().Get("severity"), ClusterID: r.URL.Query().Get("cluster_id"), Keyword: r.URL.Query().Get("keyword"), Limit: limit, Offset: offset})
 	writeAlert(w, items, err)
 }
 func (h *AlertHandler) eventAction(w http.ResponseWriter, r *http.Request) {
@@ -121,7 +124,7 @@ func (h *AlertHandler) eventAction(w http.ResponseWriter, r *http.Request) {
 	if x.Action == "silence" {
 		allowed := map[int]bool{3600: true, 7200: true, 10800: true, 18000: true, 43200: true, 86400: true}
 		if !allowed[x.SilenceSeconds] {
-			writeAlert(w, nil, fmt.Errorf("静默时长仅支持 1、2、3、5、12 或 24 小时"))
+			writeAlert(w, nil, alertdomain.Invalid("静默时长仅支持 1、2、3、5、12 或 24 小时"))
 			return
 		}
 	}
@@ -138,13 +141,14 @@ func (h *AlertHandler) automationState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var x struct {
-		ID    string `json:"id"`
-		State string `json:"state"`
+		ID            string `json:"id"`
+		State         string `json:"state"`
+		ExpectedState string `json:"expected_state"`
 	}
 	if !decodeAlert(w, r, &x) {
 		return
 	}
-	writeAlert(w, map[string]bool{"updated": true}, h.alerts.UpdateAutomationState(r.Context(), x.ID, x.State))
+	writeAlert(w, map[string]bool{"updated": true}, h.alerts.UpdateAutomationState(r.Context(), x.ID, x.State, x.ExpectedState))
 }
 func (h *AlertHandler) channels(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -165,9 +169,9 @@ func (h *AlertHandler) channels(w http.ResponseWriter, r *http.Request) {
 			items, _ := h.alerts.ListChannels(r.Context())
 			for _, old := range items {
 				if old.ID == x.ID {
-					for _, key := range []string{"password", "token", "secret"} {
+					for key, value := range old.Config {
 						if x.Config[key] == "******" {
-							x.Config[key] = old.Config[key]
+							x.Config[key] = value
 						}
 					}
 				}
@@ -210,24 +214,40 @@ func (h *AlertHandler) metrics(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	writeAlert(w, map[string]any{"host": h.heartbeat.GetDynamicCollectConfig(), "mysql": h.heartbeat.GetMySQLDynamicCollectConfig(), "virtual": []map[string]string{{"name": "agent_heartbeat_alive", "display_name": "Agent 心跳存活"}, {"name": "agent_overall_health", "display_name": "Agent 整体健康"}, {"name": "agent_health_check_failed", "display_name": "Agent 健康检查失败"}}}, nil)
+	catalog := dynamicdomain.BuildPerformanceMetricCatalog()
+	catalog = append(catalog,
+		dynamicdomain.PerformanceMetricDefinition{Name: "agent_heartbeat_alive", DisplayName: "Agent 心跳存活", Scope: "agent", Category: "health", Unit: "0/1", ValueKind: "state", Aggregation: "min", IntervalSeconds: 5, Available: true, Description: "1 表示心跳正常，0 表示心跳中断"},
+		dynamicdomain.PerformanceMetricDefinition{Name: "agent_overall_health", DisplayName: "Agent 整体健康", Scope: "agent", Category: "health", Unit: "0/1", ValueKind: "state", Aggregation: "max", IntervalSeconds: 5, Available: true, Description: "0 表示健康，1 表示存在异常健康检查"},
+		dynamicdomain.PerformanceMetricDefinition{Name: "agent_health_check_failed", DisplayName: "Agent 健康检查失败", Scope: "agent", Category: "health", Unit: "0/1", ValueKind: "state", Aggregation: "max", IntervalSeconds: 5, Available: true, Description: "按 check_name 标签区分具体健康检查"},
+	)
+	writeAlert(w, map[string]any{
+		"host": h.heartbeat.GetDynamicCollectConfig(), "mysql": h.heartbeat.GetMySQLDynamicCollectConfig(),
+		"catalog": catalog, "runtime": h.alerts.RuntimeStatus(),
+	}, nil)
 }
 func (h *AlertHandler) summary(w http.ResponseWriter, r *http.Request) {
-	items, err := h.alerts.ListEvents(r.Context(), alertdomain.EventFilter{Limit: 1000})
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	summary, err := h.alerts.Summary(r.Context())
 	if err != nil {
 		writeAlert(w, nil, err)
 		return
 	}
-	counts := map[string]int{"firing": 0, "resolved": 0, "notice": 0, "warning": 0, "critical": 0, "fatal": 0}
-	for _, x := range items {
-		counts[x.Status]++
-		if x.Status == "firing" {
-			counts[string(x.Severity)]++
-		}
-	}
-	writeAlert(w, map[string]any{"counts": counts, "total": len(items)}, nil)
+	writeAlert(w, map[string]any{
+		"counts": summary.Counts, "total": summary.Total,
+		"active_acknowledged": summary.ActiveAcknowledged,
+		"active_silenced":     summary.ActiveSilenced,
+		"last_24_hours":       summary.Last24Hours,
+		"runtime":             h.alerts.RuntimeStatus(),
+	}, nil)
 }
 func (h *AlertHandler) prometheus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
 	items, err := h.alerts.ListEvents(r.Context(), alertdomain.EventFilter{Status: "firing", Limit: 1000})
 	if err != nil {
 		http.Error(w, err.Error(), 500)
@@ -242,8 +262,28 @@ func (h *AlertHandler) prometheus(w http.ResponseWriter, r *http.Request) {
 	for _, x := range items {
 		fmt.Fprintf(w, "gmha_alert_value{event_id=%q,metric=%q,machine_id=%q} %v\n", x.ID, x.Metric, x.MachineID, x.Value)
 	}
+	runtime := h.alerts.RuntimeStatus()
+	fmt.Fprintln(w, "# HELP gmha_alert_evaluation_queue_depth Pending heartbeat evaluations\n# TYPE gmha_alert_evaluation_queue_depth gauge")
+	fmt.Fprintf(w, "gmha_alert_evaluation_queue_depth %d\n", runtime.EvaluationQueue.Depth)
+	fmt.Fprintln(w, "# HELP gmha_alert_evaluation_overflow Coalesced latest heartbeat evaluations waiting outside the queue\n# TYPE gmha_alert_evaluation_overflow gauge")
+	fmt.Fprintf(w, "gmha_alert_evaluation_overflow %d\n", runtime.EvaluationQueue.Overflow)
+	fmt.Fprintln(w, "# HELP gmha_alert_notification_queue_depth Pending alert notification events\n# TYPE gmha_alert_notification_queue_depth gauge")
+	fmt.Fprintf(w, "gmha_alert_notification_queue_depth %d\n", runtime.NotificationQueue.Depth)
+	fmt.Fprintln(w, "# HELP gmha_alert_notification_outbox_pending Durable notification jobs awaiting completion\n# TYPE gmha_alert_notification_outbox_pending gauge")
+	fmt.Fprintf(w, "gmha_alert_notification_outbox_pending %d\n", runtime.NotificationQueue.DurablePending)
+	fmt.Fprintln(w, "# HELP gmha_alert_notifications_dropped_total Notification events rejected because the queue was full\n# TYPE gmha_alert_notifications_dropped_total counter")
+	fmt.Fprintf(w, "gmha_alert_notifications_dropped_total %d\n", runtime.NotificationsDropped)
+	fmt.Fprintln(w, "# HELP gmha_alert_notifications_deferred_total Notification events durably deferred for later delivery\n# TYPE gmha_alert_notifications_deferred_total counter")
+	fmt.Fprintf(w, "gmha_alert_notifications_deferred_total %d\n", runtime.NotificationsDeferred)
+	fmt.Fprintln(w, "# HELP gmha_alert_deliveries_total Third-party delivery attempts by result\n# TYPE gmha_alert_deliveries_total counter")
+	fmt.Fprintf(w, "gmha_alert_deliveries_total{result=\"success\"} %d\n", runtime.DeliveriesSucceeded)
+	fmt.Fprintf(w, "gmha_alert_deliveries_total{result=\"failed\"} %d\n", runtime.DeliveriesFailed)
 }
 func (h *AlertHandler) zabbix(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
 	items, err := h.alerts.ListEvents(r.Context(), alertdomain.EventFilter{Status: "firing", Limit: 1000})
 	if err != nil {
 		writeAlert(w, nil, err)
@@ -265,7 +305,18 @@ func decodeAlert(w http.ResponseWriter, r *http.Request, v any) bool {
 func writeAlert(w http.ResponseWriter, v any, err error) {
 	w.Header().Set("Content-Type", "application/json")
 	if err != nil {
-		w.WriteHeader(400)
+		status := http.StatusInternalServerError
+		var validation alertdomain.ValidationError
+		if errors.As(err, &validation) {
+			status = http.StatusBadRequest
+		}
+		if errors.Is(err, alertdomain.ErrNotFound) {
+			status = http.StatusNotFound
+		}
+		if errors.Is(err, alertdomain.ErrConflict) {
+			status = http.StatusConflict
+		}
+		w.WriteHeader(status)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
@@ -274,11 +325,19 @@ func writeAlert(w http.ResponseWriter, v any, err error) {
 func maskAlertSecrets(cfg map[string]string) map[string]string {
 	out := map[string]string{}
 	for k, v := range cfg {
-		if (k == "password" || k == "token" || k == "secret") && v != "" {
+		if isAlertSecretKey(k) && v != "" {
 			out[k] = "******"
 		} else {
 			out[k] = v
 		}
 	}
 	return out
+}
+func isAlertSecretKey(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "password", "token", "secret", "webhook", "url":
+		return true
+	default:
+		return false
+	}
 }

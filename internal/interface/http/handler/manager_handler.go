@@ -2,7 +2,6 @@ package handler
 
 import (
 	"encoding/json"
-	"errors"
 	"net/http"
 
 	"gmha/internal/app"
@@ -25,6 +24,7 @@ func (h *ManagerHandler) HandleStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	status.Config = status.Config.Redacted()
 	writeJSON(w, http.StatusOK, status)
 }
 
@@ -38,11 +38,12 @@ func (h *ManagerHandler) HandleDatabaseTest(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := h.runtime.TestDatabase(r.Context(), cfg); err != nil {
+	result, err := h.runtime.TestDatabase(r.Context(), cfg)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "数据库连接成功"})
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (h *ManagerHandler) HandleConfig(w http.ResponseWriter, r *http.Request) {
@@ -53,14 +54,17 @@ func (h *ManagerHandler) HandleConfig(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, status.Config)
+		writeJSON(w, http.StatusOK, status.Config.Redacted())
 	case http.MethodPut:
-		var cfg app.ManagerRuntimeConfig
-		if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		var req struct {
+			app.ManagerRuntimeConfig
+			TestToken string `json:"test_token"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		if err := h.runtime.SaveConfig(r.Context(), cfg); err != nil {
+		if err := h.runtime.SaveConfigVerified(r.Context(), req.ManagerRuntimeConfig, req.TestToken); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -69,7 +73,7 @@ func (h *ManagerHandler) HandleConfig(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, status.Config)
+		writeJSON(w, http.StatusOK, status.Config.Redacted())
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
@@ -105,7 +109,7 @@ func (h *ManagerHandler) HandleAction(w http.ResponseWriter, r *http.Request) {
 		}
 	case "/api/v1/manager/stop":
 		if h.runtime.IsCurrentProcess() {
-			err = errors.New("Web 控制台不能停止承载自身页面的 Manager；请在主机上使用 CLI 或系统服务停止")
+			status, err = h.runtime.StopCurrentProcess()
 		} else {
 			err = h.runtime.Stop(r.Context())
 			if err == nil {

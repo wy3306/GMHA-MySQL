@@ -1,11 +1,16 @@
 {
   "name": "gmha-console",
   "private": true,
-  "version": "0.0.1",
+  "type": "module",
+  "version": "0.0.2",
   "scripts": {
     "dev": "vite",
     "dev:gmha": "vite --host 127.0.0.1 --port 5173",
-    "build": "vite build"
+    "build": "vite build",
+    "test": "node --test src/*.test.mjs",
+    "test:indexes": "node --test src/index-management.test.mjs",
+    "test:archive": "node --test src/archive-management.test.mjs",
+    "test:histograms": "node --test src/histogram-management.test.mjs"
   },
   "dependencies": {
     "vue": "^3.5.13"

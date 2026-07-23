@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	agentcore "gmha/internal/agent/core"
@@ -85,16 +86,57 @@ func (h *ExecHandler) Handle(ctx context.Context, task taskdomain.DispatchTask, 
 		startedAt := time.Now().UTC()
 		progress := i * 100 / len(commands)
 		_ = reporter.Report(taskdomain.ReportEnvelope{TaskID: task.ID, Status: taskdomain.StatusRunning, Progress: progress, CurrentStep: step.StepName, Step: &taskdomain.StepReport{StepID: step.ID, StepNo: step.StepNo, StepName: step.StepName, Status: taskdomain.StepRunning, Message: "执行命令", StartedAt: &startedAt}})
-		command := strings.ReplaceAll(item.Command, "__GMHA_MANAGER_URL__", h.managerHTTPAddr)
-		if credentialPath != "" {
-			command = strings.ReplaceAll(command, mysqlDefaultsFilePlaceholder, shellSingleQuote(credentialPath))
+		command := replaceExecCommandPlaceholders(item.Command, h.managerHTTPAddr, credentialPath)
+		lastOnlinePercent := -1
+		lastArchiveRows := int64(-1)
+		var onlineProgressMu sync.Mutex
+		onOutput := func(line string) {
+			if strings.Contains(item.Command, "pt-archiver") && !strings.Contains(item.Command, "--dry-run") {
+				rows, ok := ptArchiverProgress(line)
+				if !ok {
+					return
+				}
+				onlineProgressMu.Lock()
+				defer onlineProgressMu.Unlock()
+				if rows == lastArchiveRows {
+					return
+				}
+				lastArchiveRows = rows
+				message := fmt.Sprintf("PT 已处理 %d 行归档数据", rows)
+				_ = reporter.Report(taskdomain.ReportEnvelope{
+					TaskID: task.ID, Status: taskdomain.StatusRunning, Progress: i * 100 / len(commands), CurrentStep: step.StepName + " · " + message,
+					Step:  &taskdomain.StepReport{StepID: step.ID, StepNo: step.StepNo, StepName: step.StepName, Status: taskdomain.StepRunning, Message: message, StartedAt: &startedAt},
+					Event: &taskdomain.Event{TaskID: task.ID, StepID: step.ID, EventType: taskdomain.EventInfo, Content: message},
+				})
+				return
+			}
+			if !strings.Contains(item.Command, "pt-online-schema-change") || !strings.Contains(item.Command, "--execute") {
+				return
+			}
+			percent, ok := ptOnlineProgress(line)
+			if !ok {
+				return
+			}
+			onlineProgressMu.Lock()
+			defer onlineProgressMu.Unlock()
+			if percent == lastOnlinePercent {
+				return
+			}
+			lastOnlinePercent = percent
+			overall := (i*100 + percent) / len(commands)
+			message := fmt.Sprintf("PT 在线复制进度 %d%%", percent)
+			_ = reporter.Report(taskdomain.ReportEnvelope{
+				TaskID: task.ID, Status: taskdomain.StatusRunning, Progress: overall, CurrentStep: step.StepName + " · " + message,
+				Step:  &taskdomain.StepReport{StepID: step.ID, StepNo: step.StepNo, StepName: step.StepName, Status: taskdomain.StepRunning, Message: message, StartedAt: &startedAt},
+				Event: &taskdomain.Event{TaskID: task.ID, StepID: step.ID, EventType: taskdomain.EventInfo, Content: message},
+			})
 		}
-		output, runErr := runner.RunShell(ctx, task.ID, step.StepName, command)
+		output, runErr := runner.RunShellWithOutput(ctx, task.ID, step.StepName, command, onOutput)
 		finishedAt := time.Now().UTC()
 		content := joinOutput(output, "")
 		if runErr != nil {
 			if rollback := strings.TrimSpace(spec.RollbackCommand); rollback != "" {
-				rollback = strings.ReplaceAll(rollback, "__GMHA_MANAGER_URL__", h.managerHTTPAddr)
+				rollback = replaceExecCommandPlaceholders(rollback, h.managerHTTPAddr, credentialPath)
 				rollbackOutput, rollbackErr := runner.RunShell(ctx, task.ID, "自动回滚", rollback)
 				content += "\n\n自动回滚:\n" + joinOutput(rollbackOutput, "")
 				if rollbackErr != nil {
@@ -112,6 +154,35 @@ func (h *ExecHandler) Handle(ctx context.Context, task taskdomain.DispatchTask, 
 		}
 	}
 	return nil
+}
+
+var ptOnlineProgressPattern = regexp.MustCompile(`(?:^|[^0-9])([0-9]{1,3})%`)
+var ptArchiverProgressPattern = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9:.-]+[[:space:]]+[0-9]+[[:space:]]+([0-9]+)[[:space:]]*$`)
+
+func ptOnlineProgress(line string) (int, bool) {
+	match := ptOnlineProgressPattern.FindStringSubmatch(line)
+	if len(match) != 2 {
+		return 0, false
+	}
+	percent, err := strconv.Atoi(match[1])
+	return percent, err == nil && percent >= 0 && percent <= 100
+}
+
+func ptArchiverProgress(line string) (int64, bool) {
+	match := ptArchiverProgressPattern.FindStringSubmatch(strings.TrimSpace(line))
+	if len(match) != 2 {
+		return 0, false
+	}
+	rows, err := strconv.ParseInt(match[1], 10, 64)
+	return rows, err == nil && rows >= 0
+}
+
+func replaceExecCommandPlaceholders(command, managerHTTPAddr, credentialPath string) string {
+	command = strings.ReplaceAll(command, "__GMHA_MANAGER_URL__", managerHTTPAddr)
+	if credentialPath != "" {
+		command = strings.ReplaceAll(command, mysqlDefaultsFilePlaceholder, shellSingleQuote(credentialPath))
+	}
+	return command
 }
 
 func mysqlPortFromCommand(command string) int {

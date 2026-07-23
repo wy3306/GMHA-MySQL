@@ -1,4 +1,13 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue/dist/vue.esm-bundler.js'
+import IndexManagement from './index-management.js'
+import HistogramManagement from './histogram-management.js'
+import ExecutionPlan from './execution-plan.js'
+import { createParameterWorkbook } from './parameter-export.js'
+import OnlineDDLManagement from './online-ddl-management.js'
+import DatabaseInspection from './database-inspection.js'
+import ArchiveManagement from './archive-management.js'
+import ClusterRollingUpgrade from './cluster-rolling-upgrade.js'
+import BinlogAnalysis from './binlog-analysis.js'
 
 const request = async (path, options = {}) => {
   const response = await fetch(`/api/v1${path}`, { headers: { 'Content-Type': 'application/json' }, ...options })
@@ -23,10 +32,43 @@ const compareMySQLVersions = (left, right) => {
   }
   return 0
 }
+const mysql57UpgradeBridgeVersion = '5.7.44'
+const parseMySQLVersion = raw => {
+  const parts = String(raw || '').trim().split('.')
+  if (parts.length < 2 || parts.length > 3 || parts.some(part => !/^\d+$/.test(part))) return null
+  return { major: Number(parts[0]), minor: Number(parts[1]), patch: Number(parts[2] || 0) }
+}
+// Mirrors the API's direct-upgrade gate so the selector only offers a safe
+// next hop. The API remains authoritative and validates the same rule again.
+const mysqlDirectUpgradeDecision = (current, target) => {
+  const from = parseMySQLVersion(current), to = parseMySQLVersion(target)
+  if (!from || !to) return { allowed: false, reason: '版本格式无法识别' }
+  if (compareMySQLVersions(target, current) <= 0) return { allowed: false, reason: '目标版本必须高于当前版本' }
+  if (from.major === 5) {
+    if (to.major === 5) return { allowed: true }
+    if (compareMySQLVersions(current, mysql57UpgradeBridgeVersion) < 0) return { allowed: false, bridge: mysql57UpgradeBridgeVersion, reason: `必须先升级到 MySQL ${mysql57UpgradeBridgeVersion}` }
+    if (to.major !== 8 || to.minor !== 0) return { allowed: false, bridge: '8.0', reason: 'MySQL 5.7 只能先升级到 MySQL 8.0' }
+    return { allowed: true }
+  }
+  if (from.major === 8 && from.minor < 4 && to.major > 8) return { allowed: false, bridge: '8.4', reason: '必须先升级到最新 MySQL 8.4 LTS' }
+  return { allowed: true }
+}
 const mysqlPrivilegeOptions = [
   'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'CREATE USER', 'ALTER', 'DROP', 'SHOW VIEW', 'TRIGGER', 'EVENT',
-  'PROCESS', 'RELOAD', 'LOCK TABLES', 'REPLICATION CLIENT', 'REPLICATION SLAVE', 'CONNECTION_ADMIN', 'SYSTEM_VARIABLES_ADMIN', 'REPLICATION_SLAVE_ADMIN', 'BACKUP_ADMIN', 'CLONE_ADMIN'
+  'PROCESS', 'RELOAD', 'LOCK TABLES', 'REPLICATION CLIENT', 'REPLICATION SLAVE', 'SUPER', 'CONNECTION_ADMIN', 'SYSTEM_VARIABLES_ADMIN', 'REPLICATION_SLAVE_ADMIN', 'BACKUP_ADMIN', 'CLONE_ADMIN'
 ]
+const mysqlDynamicPrivileges = new Set(['CONNECTION_ADMIN', 'SYSTEM_VARIABLES_ADMIN', 'REPLICATION_SLAVE_ADMIN', 'BACKUP_ADMIN', 'CLONE_ADMIN'])
+const isMySQL57Version = version => /(?:^|[^0-9])5\.7(?:\.|[^0-9]|$)/.test(String(version || ''))
+const mysqlVersionCapabilities = version => {
+  const match = String(version || '').match(/(?:^|[^0-9])(5\.7|8\.[0-4]|9\.[0-7])(?:\.([0-9]+))?/)
+  if (!match) return { legacy57: false, legacyTransactionVariable: false, legacyReplication: false, legacyRedo: false, dynamicPrivileges: true, clone: true }
+  const [major, minor] = match[1].split('.').map(Number), patch = Number(match[2] || 0)
+  const number = major * 10000 + minor * 100 + patch
+  return { legacy57: major === 5, legacyTransactionVariable: major === 5 && patch < 20, legacyReplication: number < 80026, legacyRedo: number < 80030, dynamicPrivileges: number >= 80017, clone: number >= 80017 }
+}
+const privilegesForMySQLVersion = version => !mysqlVersionCapabilities(version).dynamicPrivileges
+  ? mysqlPrivilegeOptions.filter(privilege => !mysqlDynamicPrivileges.has(privilege))
+  : mysqlPrivilegeOptions.filter(privilege => privilege !== 'SUPER')
 const mysqlRuntimeParameterGroups = [
   { name: '连接、字符集与缓存', fields: [
     { key: 'character_set_server', label: 'character_set_server', default: 'utf8mb4' }, { key: 'collation_server', label: 'collation_server', default: 'utf8mb4_0900_ai_ci' },
@@ -91,6 +133,7 @@ const summary = (input, limit = 180) => {
 
 export default {
   name: 'InstanceManagement',
+  components: { IndexManagement, HistogramManagement, ExecutionPlan, OnlineDDLManagement, DatabaseInspection, ArchiveManagement, ClusterRollingUpgrade, BinlogAnalysis },
   props: {
     cluster: { type: Object, required: true }, machines: { type: Array, default: () => [] },
     instances: { type: Array, default: () => [] }, packages: { type: Array, default: () => [] },
@@ -100,11 +143,12 @@ export default {
   },
   emits: ['close', 'refresh', 'open-task', 'view-change'],
   setup(props, { emit }) {
-    const allowedViews = new Set(['instances', 'install', 'users', 'params', 'agent-collect', 'upgrade'])
+    const allowedViews = new Set(['instances', 'inspection', 'execution-plan', 'online-ddl', 'indexes', 'histograms', 'archive', 'binlog-analysis', 'install', 'users', 'accounts', 'params', 'agent-collect', 'upgrade'])
     const view = ref(allowedViews.has(props.initialView) ? props.initialView : 'instances'), busy = ref(false), error = ref(''), notice = ref('')
     const liveInstances = ref(props.instances), instancesRefreshing = ref(false), instancesUpdatedAt = ref('')
     const instanceKeyword = ref(''), instanceStatus = ref('all'), instancePage = ref(1), instancePageSize = ref(20), expandedInstance = ref('')
     const selectedMachines = ref([]), targetConfigs = ref({}), accountsInitialized = ref(false)
+    const presetAccounts = ref([]), presetAccountsDirty = ref(false)
     const vipInterfaceOptions = ref([]), vipInterfaceLoading = ref(false), vipInterfaceError = ref('')
     const install = ref({
       mysql_user: 'mysql', root_password: '', profile: 'default', install_pt_tools: false, install_xtrabackup: false, memory_allocator: 'system', base_dir: '/usr/local/mysql', accounts: [], independent_base_config: false,
@@ -120,6 +164,7 @@ export default {
     const parameterAuth = ref({ instance: '' })
     const parameterChanges = ref([]), parameterApplyScope = ref('instance')
     const parameterRestartDialog = ref({ open: false, scope: 'instance' })
+    const lifecycleDialog = ref({ open: false, item: null, action: 'restart', riskAcknowledged: false, primaryAcknowledged: false, deepDataCheck: true, confirmation: '' })
     const upgrade = ref({ instance: '', version: '', architecture: '', force: false, risk_acknowledged: false })
     const upgradePrecheck = ref({ status: 'idle', taskID: '', report: '', checker: '', checkedAt: '' })
     const mysqlUsers = ref([]), usersLoaded = ref(false), userKeyword = ref(''), userPage = ref(1), userPageSize = 8
@@ -152,11 +197,12 @@ export default {
     const instanceHealthCode = item => {
       const heartbeat = lower(value(item, 'HeartbeatStatus', 'heartbeat_status'))
       const status = lower(value(item, 'Status', 'status'))
+      if (['stopped', 'shutdown'].includes(status)) return 'stopped'
       if (/(fail|error|offline|critical)/.test(`${heartbeat} ${status}`)) return 'error'
       if (['ok', 'success', 'healthy', 'online', 'running'].includes(heartbeat) || ['ok', 'success', 'healthy', 'online', 'running'].includes(status)) return 'healthy'
       return 'unknown'
     }
-    const instanceHealthLabel = item => ({ healthy: '运行正常', error: '状态异常', unknown: '等待上报' })[instanceHealthCode(item)]
+    const instanceHealthLabel = item => ({ healthy: '运行正常', stopped: '已安全关闭', error: '状态异常', unknown: '等待上报' })[instanceHealthCode(item)]
     const failures = computed(() => clusterInstances.value.filter(item => instanceHealthCode(item) === 'error'))
     const filteredInstances = computed(() => {
       const keyword = lower(instanceKeyword.value).trim()
@@ -264,6 +310,10 @@ export default {
       const config = ensureTarget(machine, index)
       return { machine, config, pkg: installPackageFor(machine, config) }
     }))
+    const mysqlInstallPrivilegeOptions = computed(() => {
+	  const legacy = selectedInstallTargets.value.some(target => !mysqlVersionCapabilities(target.pkg?.version || target.config.version).dynamicPrivileges)
+	  return privilegesForMySQLVersion(legacy ? '8.0.11' : '8.0.17')
+    })
     const selectedTopologyMachines = computed(() => props.machines.filter(machine => selectedMachines.value.includes(value(machine, 'ID', 'id'))))
     const ipv4Subnet = (input, fallbackPrefix = 24) => {
       const [rawIP, rawPrefix] = String(input || '').split('/'), parts = rawIP.split('.').map(Number), prefix = Math.min(32, Math.max(1, Number(rawPrefix || fallbackPrefix || 24)))
@@ -314,16 +364,31 @@ export default {
       if (install.value.enable_vip) scanVIPInterfaces(false)
     }, { deep: true })
     watch(() => install.value.enable_vip, enabled => { if (enabled) scanVIPInterfaces(false); else vipInterfaceError.value = '' })
+    const cloneAccounts = accounts => (accounts || []).map(item => ({ ...item, privileges: [...(item.privileges || [])] }))
     watch(() => props.accountPresets, presets => {
+      if (!presetAccountsDirty.value) presetAccounts.value = cloneAccounts(presets)
       if (accountsInitialized.value) return
       if ((presets || []).length) {
-        install.value.accounts = presets.map(item => ({ ...item, privileges: [...(item.privileges || [])] }))
+        install.value.accounts = cloneAccounts(presets)
         accountsInitialized.value = true
         return
       }
       install.value.accounts = ['monitor','mha','backup'].map(role => ({ role, username: '', password: '', host: '', enabled: true, privileges: [] }))
     }, { immediate: true, deep: true })
-    const parameterGroupsFor = target => [...mysqlRuntimeParameterGroups, ...(target.pkg?.runtime_parameter_groups || [])]
+    const parameterGroupsFor = target => {
+	  const capabilities = mysqlVersionCapabilities(target.pkg?.version || target.config.version)
+      const aliases = {
+        collation_server: { label: 'collation_server（5.7）', default: 'utf8mb4_unicode_ci' },
+        transaction_isolation: { label: 'tx_isolation（平台自动映射）' },
+        log_slow_replica_statements: { label: 'log_slow_slave_statements（平台自动映射）' },
+        binlog_expire_logs_seconds: { label: 'binlog 保留秒数（自动换算 expire_logs_days）' },
+        log_replica_updates: { label: 'log_slave_updates（平台自动映射）' },
+        innodb_redo_log_capacity: { label: 'Redo 总容量（自动拆分为 2 个 innodb_log_file_size）' }
+      }
+	  const useAlias = key => (capabilities.legacy57 && ['collation_server','binlog_expire_logs_seconds'].includes(key)) || (capabilities.legacyTransactionVariable && key === 'transaction_isolation') || (capabilities.legacyReplication && ['log_slow_replica_statements','log_replica_updates'].includes(key)) || (capabilities.legacyRedo && key === 'innodb_redo_log_capacity')
+	  const universal = mysqlRuntimeParameterGroups.map(group => ({ ...group, fields: group.fields.map(field => useAlias(field.key) && aliases[field.key] ? { ...field, ...aliases[field.key] } : field) }))
+      return [...universal, ...(target.pkg?.runtime_parameter_groups || [])]
+    }
     const addCustomAccount = () => install.value.accounts.push({ role: `custom-${Date.now()}`, username: '', password: '', host: '%', enabled: true, privileges: [] })
     const removeCustomAccount = index => install.value.accounts.splice(index, 1)
     const isCustomAccount = account => String(account.role || '').startsWith('custom-')
@@ -365,9 +430,11 @@ export default {
       const pkg = installPackageFor(machine, cfg)
       const allowed = new Set([...mysqlRuntimeParameterGroups, ...(pkg?.runtime_parameter_groups || [])].flatMap(group => group.fields || []).map(field => field.key))
       const runtimeParameters = Object.fromEntries(Object.entries(cfg.runtime_parameters || {}).filter(([key, parameterValue]) => allowed.has(key) && String(parameterValue || '').trim() !== ''))
+      const allowedPrivileges = new Set(privilegesForMySQLVersion(pkg?.version || cfg.version))
       const base = install.value.independent_base_config ? targetBaseConfig(machine, index) : commonBaseConfig()
       const paths = Object.fromEntries(directoryFields.map(([key]) => [key, base[key] || '']))
-      return { machine: value(machine, 'IP', 'ip'), machine_id: value(machine, 'ID', 'id'), version: cfg.version, architecture: cfg.architecture, port: Number(cfg.port), server_id: Number(cfg.server_id), mysql_user: base.mysql_user, root_password: install.value.independent_base_config ? base.root_password : install.value.root_password, profile: base.profile, ...paths, install_pt_tools: (!pkg || pkg.pt_tools_supported) && install.value.install_pt_tools, install_xtrabackup: install.value.install_xtrabackup, memory_allocator: install.value.memory_allocator || 'system', runtime_parameters: runtimeParameters, accounts: install.value.accounts }
+      const accounts = install.value.accounts.map(account => ({ ...account, privileges: (account.privileges || []).filter(privilege => allowedPrivileges.has(privilege)) }))
+      return { machine: value(machine, 'IP', 'ip'), machine_id: value(machine, 'ID', 'id'), version: cfg.version, architecture: cfg.architecture, port: Number(cfg.port), server_id: Number(cfg.server_id), mysql_user: base.mysql_user, root_password: install.value.independent_base_config ? base.root_password : install.value.root_password, profile: base.profile, ...paths, install_pt_tools: (!pkg || pkg.pt_tools_supported) && install.value.install_pt_tools, install_xtrabackup: install.value.install_xtrabackup, memory_allocator: install.value.memory_allocator || 'system', runtime_parameters: runtimeParameters, accounts }
     }
     const createInstallTasks = () => run(async () => {
       if (selectedTargetIssues.value.length) throw new Error(selectedTargetIssues.value[0])
@@ -413,6 +480,31 @@ export default {
       }
       collectConfig.value = await request('/mysql-dynamic-collect/config', { method: 'PUT', body: JSON.stringify(collectConfig.value) })
       notice.value = 'Agent 采集配置已保存，并将通过心跳下发到集群内 Agent'
+    })
+    const markPresetAccountsDirty = () => { presetAccountsDirty.value = true }
+    const saveAccountPresets = () => run(async () => {
+      for (const account of presetAccounts.value) {
+        if (!account.enabled) continue
+        if (!String(account.username || '').trim()) throw new Error(`${account.role} 的账号名称不能为空`)
+        if (!String(account.password || '').trim()) throw new Error(`${account.role} 的密码不能为空`)
+        if (!String(account.host || '').trim()) throw new Error(`${account.role} 的允许来源 Host 不能为空`)
+        if (!(account.privileges || []).length) throw new Error(`${account.role} 至少需要选择一项权限`)
+      }
+      const allowedPrivileges = new Set(mysqlPrivilegeOptions)
+      const payload = presetAccounts.value.map(account => ({
+        ...account,
+        username: String(account.username || '').trim(),
+        host: String(account.host || '').trim(),
+        privileges: (account.privileges || []).filter(privilege => allowedPrivileges.has(privilege))
+      }))
+      const items = await request('/mysql/account-presets', { method: 'PUT', body: JSON.stringify(payload) })
+      presetAccounts.value = cloneAccounts(items)
+      presetAccountsDirty.value = false
+      const customAccounts = install.value.accounts.filter(isCustomAccount)
+      install.value.accounts = [...cloneAccounts(items), ...customAccounts]
+      accountsInitialized.value = true
+      notice.value = '预设账号已保存，后续创建 MySQL 实例时会自动带入'
+      emit('refresh')
     })
     const selectedParameterInstance = computed(() => clusterInstances.value.find(item => `${value(item,'MachineIP','machine_ip')}:${value(item,'Port','port')}` === parameterAuth.value.instance))
     watch(() => parameterAuth.value.instance, resetParameterCatalog)
@@ -468,6 +560,27 @@ export default {
       parameterChanges.value = []
       notice.value = `已采集 ${rows.length} 个 MySQL 运行参数，当前管理目录匹配 ${stableRows.filter(item=>item.collected).length} 项`
     })
+    const exportParameters = () => {
+      if (!parametersCollected.value) { error.value = '请先采集实例参数，再导出 Excel'; return }
+      if (!filteredParams.value.length) { error.value = '当前筛选条件下没有可导出的参数'; return }
+      const selected = selectedParameterInstance.value
+      const workbook = createParameterWorkbook({
+        parameters: filteredParams.value,
+        changes: parameterChanges.value,
+        cluster: clusterName.value,
+        instance: parameterAuth.value.instance,
+        version: value(selected, 'Version', 'version')
+      })
+      const url = URL.createObjectURL(new Blob([workbook.bytes], { type: workbook.mimeType }))
+      const link = document.createElement('a')
+      link.href = url
+      link.download = workbook.filename
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      window.setTimeout(() => URL.revokeObjectURL(url), 0)
+      notice.value = `已导出 ${filteredParams.value.length} 项运行参数：${workbook.filename}`
+    }
     const stageParameter = (item, action = 'update') => {
       if (!item.collected || item.compatible === false) { error.value = `${item.name} 在当前实例版本中不可修改`; return }
       const next = { action, name: item.name, value: action === 'delete' ? '' : String(item.editValue ?? '').trim(), dynamic: item.dynamic }
@@ -516,6 +629,26 @@ export default {
       const ip = value(instance, 'MachineIP', 'machine_ip'), port = Number(value(instance, 'Port', 'port'))
       return props.topology.nodes?.find(node => node.ip === ip && Number(node.port) === port)?.role || value(instance, 'Role', 'role') || '独立实例'
     }
+    const lifecycleEndpoint = computed(() => lifecycleDialog.value.item ? `${value(lifecycleDialog.value.item,'MachineIP','machine_ip')}:${value(lifecycleDialog.value.item,'Port','port')}` : '')
+    const lifecycleConfirmation = computed(() => `${lifecycleDialog.value.action.toUpperCase()} ${lifecycleEndpoint.value}`)
+    const lifecycleIsPrimary = computed(() => lifecycleDialog.value.item && /(^m$|m\/s|master|primary|主)/i.test(String(roleFor(lifecycleDialog.value.item))))
+    const lifecycleCanSubmit = computed(() => lifecycleDialog.value.riskAcknowledged && (!lifecycleIsPrimary.value || lifecycleDialog.value.primaryAcknowledged) && lifecycleDialog.value.confirmation === lifecycleConfirmation.value)
+    const openLifecycle = (item, action) => {
+      lifecycleDialog.value = { open: true, item, action, riskAcknowledged: false, primaryAcknowledged: false, deepDataCheck: true, confirmation: '' }
+    }
+    const submitLifecycle = () => run(async () => {
+      if (!lifecycleCanSubmit.value) throw new Error('请完成风险确认并准确输入确认短语')
+      const dialog = lifecycleDialog.value
+      const result = await request('/tasks/mysql-lifecycle', { method: 'POST', body: JSON.stringify({
+        machine: value(dialog.item,'MachineIP','machine_ip') || value(dialog.item,'MachineID','machine_id'),
+        port: Number(value(dialog.item,'Port','port')), action: dialog.action,
+        confirmation: dialog.confirmation, risk_acknowledged: dialog.riskAcknowledged,
+        primary_acknowledged: dialog.primaryAcknowledged, deep_data_check: dialog.deepDataCheck
+      }) })
+      lifecycleDialog.value.open = false
+      notice.value = dialog.action === 'restart' ? '安全重启任务已创建；将校验原拓扑、复制状态与主从数据一致性' : '安全关闭任务已创建；校验通过后只关闭 MySQL 实例，不关闭宿主机'
+      emit('open-task', result)
+    })
     const primaryInstance = computed(() => {
       const nodes = props.topology.nodes || []
       const primaries = nodes.filter(node => ['m', 'm/s', 'master', 'primary'].includes(lower(node.role)))
@@ -524,6 +657,7 @@ export default {
         (node.ip === value(item, 'MachineIP', 'machine_ip') && Number(node.port) === Number(value(item, 'Port', 'port')))
       )) || clusterInstances.value.find(item => /(^m$|m\/s|master|primary|主)/i.test(String(roleFor(item)))) || clusterInstances.value[0] || null
     })
+    const mysqlUserPrivilegeOptions = computed(() => privilegesForMySQLVersion(value(primaryInstance.value, 'Version', 'version') || value(primaryInstance.value, 'PackageName', 'package_name')))
     const filteredMySQLUsers = computed(() => {
       const keyword = lower(userKeyword.value).trim()
       return mysqlUsers.value.filter(item => !keyword || [item.username, item.host, ...(item.privileges || [])].some(field => lower(field).includes(keyword)))
@@ -616,9 +750,30 @@ export default {
       return instance
     })
     const upgradeArchitectures = computed(() => [...new Set(props.packages.map(pkg => normalizeArchitecture(pkg.arch || pkg.Arch)).filter(Boolean))])
-    const upgradeVersions = computed(() => {
+    const upgradeCandidateVersions = computed(() => {
       const current = value(selectedUpgradeInstance.value, 'Version', 'version')
       return [...new Map(props.packages.filter(pkg => (!upgrade.value.architecture || normalizeArchitecture(pkg.arch || pkg.Arch) === normalizeArchitecture(upgrade.value.architecture)) && (!current || compareMySQLVersions(pkg.version || pkg.Version, current) > 0)).map(pkg => [pkg.version || pkg.Version, pkg])).values()]
+    })
+    const upgradeVersions = computed(() => {
+      const current = value(selectedUpgradeInstance.value, 'Version', 'version')
+      if (!current) return upgradeCandidateVersions.value
+      const parsed = parseMySQLVersion(current)
+      if (parsed?.major === 5 && parsed.minor === 7 && compareMySQLVersions(current, mysql57UpgradeBridgeVersion) < 0) {
+        return upgradeCandidateVersions.value.filter(pkg => (pkg.version || pkg.Version) === mysql57UpgradeBridgeVersion)
+      }
+      return upgradeCandidateVersions.value.filter(pkg => mysqlDirectUpgradeDecision(current, pkg.version || pkg.Version).allowed)
+    })
+    const upgradeRoute = computed(() => {
+      const current = value(selectedUpgradeInstance.value, 'Version', 'version')
+      const parsed = parseMySQLVersion(current)
+      if (!parsed) return null
+      const blocked = upgradeCandidateVersions.value.filter(pkg => !mysqlDirectUpgradeDecision(current, pkg.version || pkg.Version).allowed)
+      if (parsed.major === 5 && parsed.minor === 7 && compareMySQLVersions(current, mysql57UpgradeBridgeVersion) < 0) {
+        const bridgeAvailable = upgradeVersions.value.some(pkg => (pkg.version || pkg.Version) === mysql57UpgradeBridgeVersion)
+        return { kind: bridgeAvailable ? 'bridge' : 'missing', title: `必须先升级到 MySQL ${mysql57UpgradeBridgeVersion}`, detail: bridgeAvailable ? `当前 MySQL ${current} 不能直接进入 8.0。请先完成 ${current} → ${mysql57UpgradeBridgeVersion}，成功并刷新实例版本后，再创建 5.7.44 → 8.0 升级。` : `当前 MySQL ${current} 不能直接进入 8.0，且软件包仓库中缺少 ${mysql57UpgradeBridgeVersion} 的同架构安装包。请先上传桥接版本。`, blocked: blocked.length }
+      }
+      if (parsed.major === 5 && parsed.minor === 7) return { kind: 'next', title: '5.7 高版本检查已满足', detail: '当前可选择 MySQL 8.0 作为下一阶段；8.4 和 9.x 会继续被拦截，避免跨过必要的数据字典升级。', blocked: blocked.length }
+      return blocked.length ? { kind: 'next', title: '已按安全升级路径筛选', detail: `${blocked.length} 个不能直接到达的高版本已隐藏，请完成当前阶段后再选择后续版本。`, blocked: blocked.length } : null
     })
     const upgradePreview = computed(() => {
       const instance = selectedUpgradeInstance.value
@@ -670,18 +825,18 @@ export default {
       refreshTimer = setInterval(() => { if (!busy.value) refreshInstances(false) }, 5000)
     })
     onUnmounted(() => { clearInterval(refreshTimer); clearInstallRootPasswords(); userDialog.value.password = '' })
-    return { view, busy, error, notice, clusterName, clusterInstances, failures, instancesRefreshing, instancesUpdatedAt, refreshInstances, instanceKeyword, instanceStatus, instancePage, instancePageSize, instancePageCount, filteredInstances, pagedInstances, expandedInstance, instanceKey, instanceHealthCode, instanceHealthLabel, toggleInstanceDetails, selectedMachines, selectedTopologyMachines, targetConfigs, install, showInstallRootPassword, targetRootPasswordVisibility, targetBaseConfig, isTargetRootPasswordVisible, toggleTargetRootPassword, toggleIndependentBaseConfig, vipInterfaceOptions, vipInterfaceLoading, vipInterfaceError, vipInterfaceLabel, scanVIPInterfaces, directoryFields, installStages, mysqlPrivilegeOptions, selectedTargetIssues, collectConfig, paramKeyword, paramCategory, paramCategories, parameterGroups, filteredParams, liveParameters, parametersCollected, collectedParameterCount, parameterAuth, parameterTask, selectedParameterInstance, parameterChanges, parameterApplyScope, parameterRestartDialog, parameterDynamicCount, parameterRestartCount, stagedDynamicCount, stagedRestartCount, collectParameters, stageParameter, isParameterChanged, removeParameterChange, applyParameterChanges, confirmParameterRestart, mysqlUsers, usersLoaded, userKeyword, userPage, userPageCount, pagedMySQLUsers, userDialog, deleteUserDialog, primaryInstance, filteredMySQLUsers, refreshMySQLUsers, openCreateUser, openUserPrivileges, closeUserDialog, saveMySQLUser, toggleMySQLUserLock, requestDeleteUser, confirmDeleteUser, upgrade, upgradePrecheck, upgradeCanStart, upgradePreview, upgradeArchitectures, upgradeVersions, upgradeInstanceChanged, upgradeArchitectureChanged, upgradeStages, runUpgradePrecheck, startUpgrade, compatiblePackages, architecturesFor, versionsFor, targetArchitectureChanged, ensureTarget, parameterGroupsFor, addCustomAccount, removeCustomAccount, isCustomAccount, createInstallTasks, uninstall, forget, loadParams, saveParams, roleFor, emit, value, summary }
+    return { view, busy, error, notice, clusterName, clusterInstances, failures, instancesRefreshing, instancesUpdatedAt, refreshInstances, instanceKeyword, instanceStatus, instancePage, instancePageSize, instancePageCount, filteredInstances, pagedInstances, expandedInstance, instanceKey, instanceHealthCode, instanceHealthLabel, toggleInstanceDetails, lifecycleDialog, lifecycleEndpoint, lifecycleConfirmation, lifecycleIsPrimary, lifecycleCanSubmit, openLifecycle, submitLifecycle, selectedMachines, selectedTopologyMachines, targetConfigs, install, showInstallRootPassword, targetRootPasswordVisibility, targetBaseConfig, isTargetRootPasswordVisible, toggleTargetRootPassword, toggleIndependentBaseConfig, vipInterfaceOptions, vipInterfaceLoading, vipInterfaceError, vipInterfaceLabel, scanVIPInterfaces, directoryFields, installStages, mysqlPrivilegeOptions, mysqlInstallPrivilegeOptions, mysqlUserPrivilegeOptions, presetAccounts, presetAccountsDirty, markPresetAccountsDirty, saveAccountPresets, selectedTargetIssues, collectConfig, paramKeyword, paramCategory, paramCategories, parameterGroups, filteredParams, liveParameters, parametersCollected, collectedParameterCount, parameterAuth, parameterTask, selectedParameterInstance, parameterChanges, parameterApplyScope, parameterRestartDialog, parameterDynamicCount, parameterRestartCount, stagedDynamicCount, stagedRestartCount, collectParameters, exportParameters, stageParameter, isParameterChanged, removeParameterChange, applyParameterChanges, confirmParameterRestart, mysqlUsers, usersLoaded, userKeyword, userPage, userPageCount, pagedMySQLUsers, userDialog, deleteUserDialog, primaryInstance, filteredMySQLUsers, refreshMySQLUsers, openCreateUser, openUserPrivileges, closeUserDialog, saveMySQLUser, toggleMySQLUserLock, requestDeleteUser, confirmDeleteUser, upgrade, upgradePrecheck, upgradeCanStart, upgradePreview, upgradeRoute, upgradeArchitectures, upgradeVersions, upgradeInstanceChanged, upgradeArchitectureChanged, upgradeStages, runUpgradePrecheck, startUpgrade, compatiblePackages, architecturesFor, versionsFor, targetArchitectureChanged, ensureTarget, parameterGroupsFor, addCustomAccount, removeCustomAccount, isCustomAccount, createInstallTasks, uninstall, forget, loadParams, saveParams, roleFor, emit, value, summary }
   },
   template: `
     <section class="instance-management-page">
-      <header class="instance-page-head"><div><p>INSTANCE MANAGEMENT</p><h2>{{ clusterName }} · 实例管理</h2><span>统一管理 MySQL 实例生命周期、运行参数与版本升级。</span></div><button class="secondary" @click="emit('close')">返回集群概览</button></header>
-      <nav class="instance-tabs"><button v-for="item in [['instances','实例'],['install','创建安装'],['users','用户管理'],['params','参数管理'],['agent-collect','Agent采集'],['upgrade','版本升级']]" :key="item[0]" :class="{active:view===item[0]}" @click="view=item[0]; item[0]==='agent-collect'&&loadParams()">{{ item[1] }}</button></nav>
+      <header class="instance-page-head"><div><p>INSTANCE MANAGEMENT</p><h2>{{ clusterName }} · 实例管理</h2><span>统一管理 MySQL 实例生命周期、用户账号、运行参数与版本升级。</span></div><button class="secondary" @click="emit('close')">返回集群概览</button></header>
+      <nav class="instance-tabs"><button v-for="item in [['instances','实例'],['inspection','数据库巡检'],['execution-plan','执行计划'],['online-ddl','在线 DDL'],['indexes','索引管理'],['histograms','直方图'],['archive','数据归档'],['binlog-analysis','binlog分析'],['install','创建安装'],['users','用户管理'],['accounts','预设账号'],['params','参数管理'],['agent-collect','Agent采集'],['upgrade','版本升级']]" :key="item[0]" :class="{active:view===item[0]}" @click="view=item[0]; item[0]==='agent-collect'&&loadParams()">{{ item[1] }}</button></nav>
       <div v-if="error" class="alert error"><b>操作未完成</b><span>{{ summary(error) }}</span><small>完整执行日志请在任务中心对应任务详情中查看。</small></div><div v-if="notice" class="alert success"><span>{{ summary(notice,240) }}</span></div>
       <main v-if="view==='instances'" class="instance-panel instance-catalog">
         <div class="panel-head instance-catalog-head"><div><h3>实例列表</h3><p>集中查看实例状态与关键配置；展开详情可检查目录、运行文件和最近任务。</p></div><div class="instance-list-actions"><small>更新于 {{ instancesUpdatedAt || '—' }}</small><button class="secondary" :disabled="instancesRefreshing" @click="refreshInstances(true)">{{ instancesRefreshing ? '刷新中…' : '刷新' }}</button><button class="primary" @click="view='install'">＋ 创建实例</button></div></div>
         <div class="instance-catalog-toolbar">
           <label class="instance-search"><span>⌕</span><input v-model.trim="instanceKeyword" placeholder="搜索机器、IP、端口、server_id、版本或 Profile"></label>
-          <label>运行状态<select v-model="instanceStatus"><option value="all">全部状态</option><option value="healthy">运行正常</option><option value="error">状态异常</option><option value="unknown">等待上报</option></select></label>
+          <label>运行状态<select v-model="instanceStatus"><option value="all">全部状态</option><option value="healthy">运行正常</option><option value="stopped">已安全关闭</option><option value="error">状态异常</option><option value="unknown">等待上报</option></select></label>
           <label>每页<select v-model.number="instancePageSize"><option :value="10">10 条</option><option :value="20">20 条</option><option :value="50">50 条</option></select></label>
           <span class="instance-result-count">显示 {{ pagedInstances.length }} / {{ filteredInstances.length }} 个实例</span>
         </div>
@@ -694,7 +849,7 @@ export default {
               <td><b>{{ value(item,'Profile','profile') || 'default' }}</b><small>用户 {{ value(item,'MySQLUser','mysql_user') || 'mysql' }}</small></td>
               <td><span :class="['instance-health-badge',instanceHealthCode(item)]"><i></i>{{ instanceHealthLabel(item) }}</span><small :title="value(item,'HeartbeatDetail','heartbeat_detail')">{{ summary(value(item,'HeartbeatDetail','heartbeat_detail') || value(item,'Status','status') || '尚无心跳详情', 36) }}</small></td>
               <td><b>{{ value(item,'HeartbeatCheckedAt','heartbeat_checked_at') || '—' }}</b><small>登记 {{ value(item,'UpdatedAt','updated_at') ? new Date(value(item,'UpdatedAt','updated_at')).toLocaleString('zh-CN',{hour12:false}) : '—' }}</small></td>
-              <td class="instance-row-actions" @click.stop><button class="text-button" @click="toggleInstanceDetails(item)">{{ expandedInstance===instanceKey(item) ? '收起' : '详情' }}</button><button class="danger-link" @click="uninstall(item)">卸载</button><button class="text-button muted" @click="forget(item)">遗忘</button></td>
+              <td class="instance-row-actions" @click.stop><button class="text-button" @click="toggleInstanceDetails(item)">{{ expandedInstance===instanceKey(item) ? '收起' : '详情' }}</button><button class="text-button lifecycle-restart" @click="openLifecycle(item,'restart')">重启</button><button class="danger-link lifecycle-shutdown" @click="openLifecycle(item,'shutdown')">关机</button><button class="danger-link" @click="uninstall(item)">卸载</button><button class="text-button muted" @click="forget(item)">遗忘</button></td>
             </tr>
             <tr v-if="expandedInstance===instanceKey(item)" class="instance-detail-row"><td colspan="7"><div class="instance-detail-shell">
               <section><header><b>实例标识</b><span>{{ instanceHealthLabel(item) }}</span></header><dl><div><dt>集群</dt><dd>{{ value(item,'Cluster','cluster') || clusterName }}</dd></div><div><dt>机器名称</dt><dd>{{ value(item,'MachineName','machine_name') || '—' }}</dd></div><div><dt>机器 ID</dt><dd>{{ value(item,'MachineID','machine_id') || '—' }}</dd></div><div><dt>访问地址</dt><dd>{{ value(item,'MachineIP','machine_ip') || '—' }}:{{ value(item,'Port','port') || '—' }}</dd></div><div><dt>server_id</dt><dd>{{ value(item,'ServerID','server_id') || '—' }}</dd></div><div><dt>MySQL 用户</dt><dd>{{ value(item,'MySQLUser','mysql_user') || 'mysql' }}</dd></div></dl></section>
@@ -707,12 +862,19 @@ export default {
         </tbody></table></div>
         <footer v-if="filteredInstances.length" class="instance-pager"><span>第 {{ instancePage }} / {{ instancePageCount }} 页</span><div><button class="secondary" :disabled="instancePage<=1" @click="instancePage--">上一页</button><button class="secondary" :disabled="instancePage>=instancePageCount" @click="instancePage++">下一页</button></div></footer>
       </main>
+      <DatabaseInspection v-else-if="view==='inspection'" :instances="clusterInstances" :cluster-name="clusterName" @open-task="emit('open-task',$event)" />
+      <ExecutionPlan v-else-if="view==='execution-plan'" :instances="clusterInstances" :cluster-name="clusterName" />
+      <OnlineDDLManagement v-else-if="view==='online-ddl'" :instances="clusterInstances" @open-task="emit('open-task',$event)" />
+      <IndexManagement v-else-if="view==='indexes'" :instances="clusterInstances" @open-task="emit('open-task',$event)" />
+      <HistogramManagement v-else-if="view==='histograms'" :instances="clusterInstances" />
+      <ArchiveManagement v-else-if="view==='archive'" :instances="clusterInstances" @open-task="emit('open-task',$event)" />
+      <BinlogAnalysis v-else-if="view==='binlog-analysis'" :instances="clusterInstances" :cluster-name="clusterName" />
       <main v-else-if="view==='install'" class="instance-install-page">
         <section class="instance-panel install-target-panel"><div class="panel-head"><div><h3>1. 目标机器、版本与架构</h3><p>版本和 CPU 架构独立选择；后端再按目标机器 glibc 自动确定具体安装包。</p></div><span class="count">已选 {{ selectedMachines.length }} 台</span></div><div class="install-table-wrap"><table><thead><tr><th>选择</th><th>机器</th><th>目标架构</th><th>MySQL 版本</th><th>端口</th><th>server_id</th></tr></thead><tbody><tr v-for="(machine,index) in machines" :key="value(machine,'ID','id')"><td><input v-model="selectedMachines" type="checkbox" :value="value(machine,'ID','id')"></td><td><b>{{ value(machine,'Name','name') }}</b><small>{{ value(machine,'IP','ip') }}</small></td><td><select v-model="ensureTarget(machine,index).architecture" @change="targetArchitectureChanged(machine,index)"><option v-for="arch in architecturesFor(machine)" :key="arch" :value="arch">{{ arch }}</option></select></td><td><select v-model="ensureTarget(machine,index).version"><option v-for="pkg in versionsFor(machine,ensureTarget(machine,index))" :key="pkg.version" :value="pkg.version">{{ pkg.version }} · {{ pkg.release_track }}</option></select><small>具体制品按 glibc 自动匹配</small></td><td><input v-model.number="ensureTarget(machine,index).port" type="number" min="1" max="65535"></td><td><input v-model.number="ensureTarget(machine,index).server_id" type="number" min="1"></td></tr><tr v-if="!machines.length"><td colspan="6" class="empty">当前集群没有可用机器，请先在机器管理中添加并部署 Agent。</td></tr></tbody></table></div></section>
         <section class="instance-panel install-common-panel"><div class="panel-head"><div><h3>2. 基础配置与目录</h3><p>{{ install.independent_base_config ? '每台目标机器分别设置 root 密码、运行用户、Profile 与目录。' : '默认所有目标共用一套配置；目录留空时由 Profile 按端口自动生成。' }}</p></div><label class="independent-base-switch"><input v-model="install.independent_base_config" type="checkbox" @change="toggleIndependentBaseConfig"><span>每台机器独立配置</span></label></div><div v-if="!install.independent_base_config" class="shared-root-auth"><label>公共 root 密码<div class="password-input-control"><input v-model="install.root_password" :type="showInstallRootPassword ? 'text' : 'password'" autocomplete="new-password" required><button type="button" class="password-visibility-toggle" :aria-label="showInstallRootPassword ? '隐藏 root 密码' : '查看 root 密码'" :aria-pressed="showInstallRootPassword" @click="showInstallRootPassword=!showInstallRootPassword">{{ showInstallRootPassword ? '隐藏' : '查看' }}</button></div><small>共享配置模式下，所有目标实例统一使用该密码，且不会写入任务日志。</small></label></div><div v-if="!install.independent_base_config" class="instance-install-fields"><label>MySQL 运行用户<input v-model.trim="install.mysql_user" required></label><label>参数 Profile<input v-model.trim="install.profile" required></label><label v-for="field in directoryFields" :key="field[0]">{{ field[1] }}<input v-model.trim="install[field[0]]" :placeholder="field[2]"></label></div><div v-else class="independent-base-list"><p v-if="!selectedTopologyMachines.length" class="install-empty-hint">请先选择目标机器，再分别配置 root 密码、基础信息与目录。</p><article v-for="(machine,index) in selectedTopologyMachines" :key="value(machine,'ID','id')"><header><div><b>{{ value(machine,'Name','name') }}</b><small>{{ value(machine,'IP','ip') }}</small></div><span>独立配置</span></header><div class="instance-install-fields"><label class="independent-root-password">root 密码<div class="password-input-control"><input v-model="targetBaseConfig(machine,index).root_password" :type="isTargetRootPasswordVisible(machine) ? 'text' : 'password'" autocomplete="new-password" required><button type="button" class="password-visibility-toggle" :aria-label="isTargetRootPasswordVisible(machine) ? '隐藏 '+value(machine,'Name','name')+' 的 root 密码' : '查看 '+value(machine,'Name','name')+' 的 root 密码'" :aria-pressed="isTargetRootPasswordVisible(machine)" @click="toggleTargetRootPassword(machine)">{{ isTargetRootPasswordVisible(machine) ? '隐藏' : '查看' }}</button></div></label><label>MySQL 运行用户<input v-model.trim="targetBaseConfig(machine,index).mysql_user" required></label><label>参数 Profile<input v-model.trim="targetBaseConfig(machine,index).profile" required></label><label v-for="field in directoryFields" :key="field[0]">{{ field[1] }}<input v-model.trim="targetBaseConfig(machine,index)[field[0]]" :placeholder="field[2]"></label></div></article></div></section>
         <details class="instance-panel install-runtime-panel"><summary class="install-runtime-summary"><div><h3>3. MySQL 运行参数</h3><p>默认折叠；展开后可按目标实例覆盖 Profile 自动计算结果。</p></div><span>运行参数</span></summary><div class="install-runtime-content"><p v-if="!targetConfigs._selected_install_targets.length" class="install-empty-hint">选择机器后可配置各目标实例参数。</p><div class="target-version-parameters"><article v-for="target in targetConfigs._selected_install_targets" :key="value(target.machine,'ID','id')"><header><b>{{ value(target.machine,'Name','name') }} · MySQL {{ target.pkg?.version || '未选择版本' }}</b><small>{{ target.pkg?.release_track || value(target.machine,'IP','ip') }}</small></header><section v-for="group in parameterGroupsFor(target)" :key="group.name"><h4>{{ group.name }}</h4><div><label v-for="field in group.fields" :key="field.key">{{ field.label }}<select v-if="field.options" v-model="target.config.runtime_parameters[field.key]"><option value="">自动</option><option v-for="option in field.options" :key="option" :value="option">{{ option }}</option></select><input v-else v-model.trim="target.config.runtime_parameters[field.key]" :placeholder="field.placeholder || (field.default ? '默认 '+field.default : '自动计算')"><small v-if="field.description || field.default">{{ field.description || ('建议值 '+field.default) }}</small></label></div></section></article></div></div></details>
         <section class="instance-panel install-topology-panel"><div class="panel-head"><div><h3>4. 安装后架构初始化</h3><p>Manager 会等待全部实例安装成功，再使用下方 MHA 管理账号配置复制关系与 VIP；完整流程统一进入任务中心。</p></div><label class="topology-master-switch"><input v-model="install.configure_topology" type="checkbox"><span>安装完成后自动配置</span></label></div><template v-if="install.configure_topology"><div :class="['topology-choice-grid',{'dual-master':install.architecture==='dual_master'}]"><label>目标架构<select v-model="install.architecture"><option value="master_slave">一主多从</option><option value="dual_master">双主架构</option></select><small>其余选中机器自动作为从库跟随首选主库</small></label><label>首选主库<select v-model="install.primary_machine_id"><option value="">选择主库机器</option><option v-for="machine in selectedTopologyMachines" :key="value(machine,'ID','id')" :value="value(machine,'ID','id')">{{ value(machine,'Name','name') }} · {{ value(machine,'IP','ip') }}</option></select><small>复制链路默认使用 MHA 管理账号</small></label><label v-if="install.architecture==='dual_master'">第二主库<select v-model="install.secondary_master_machine_id"><option value="">选择第二主库</option><option v-for="machine in selectedTopologyMachines.filter(item=>value(item,'ID','id')!==install.primary_machine_id)" :key="value(machine,'ID','id')" :value="value(machine,'ID','id')">{{ value(machine,'Name','name') }} · {{ value(machine,'IP','ip') }}</option></select><small>与首选主库建立双向复制</small></label></div><label class="install-vip-switch"><input v-model="install.enable_vip" type="checkbox"><span><b>开启业务 VIP</b><small>系统自动完成 ARP 或集群 BGP 宣告，用户无需选择模式</small></span></label><div v-if="install.enable_vip" class="vip-install-grid"><label>VIP 名称<input v-model.trim="install.vip.vip_name"></label><label>VIP 地址<input v-model.trim="install.vip.vip_address" placeholder="例如 10.0.0.100"></label><label>网络前缀<input v-model.number="install.vip.vip_prefix" type="number" min="1" max="32"></label><label class="vip-interface-field">目标业务网卡<div><select v-model="install.vip.default_interface"><option value="">{{ vipInterfaceLoading ? '正在扫描目标主机…' : '选择目标网卡' }}</option><option v-for="item in vipInterfaceOptions" :key="item.name" :value="item.name">{{ vipInterfaceLabel(item) }}</option></select><button type="button" class="secondary" :disabled="vipInterfaceLoading || !selectedTopologyMachines.length" @click="scanVIPInterfaces(true)">{{ vipInterfaceLoading ? '扫描中…' : '重新扫描' }}</button></div><small v-if="vipInterfaceError" class="vip-interface-error">{{ vipInterfaceError }}</small><small v-else>推荐项优先覆盖全部目标机器，并匹配主机管理地址所在网段</small></label><div class="vip-auto-mode"><b>宣告策略由系统自动完成</b><span>同网段自动使用免费 ARP；集群配置为三层网络时自动复用 BGP 邻居策略。</span></div></div></template></section>
-        <section class="instance-panel install-account-panel"><div class="panel-head"><div><h3>5. 初始化账号与权限</h3><p>沿用数据库管理中的账号预设，也可为本次批量安装添加自定义用户。</p></div><button type="button" class="secondary" @click="addCustomAccount">＋ 自定义用户</button></div><div class="cluster-install-accounts"><article v-for="(account,index) in install.accounts" :key="account.role"><header><div><b>{{ isCustomAccount(account) ? '自定义数据库用户' : ({monitor:'监控账号',mha:'MHA 管理账号',backup:'备份账号'})[account.role] || account.role }}</b><small>{{ account.role }}</small></div><button v-if="isCustomAccount(account)" type="button" class="danger-link" @click="removeCustomAccount(index)">删除</button><label v-else><input v-model="account.enabled" type="checkbox"> 启用</label></header><div class="account-inputs"><label>用户名<input v-model.trim="account.username" :placeholder="account.role"></label><label>密码<input v-model="account.password" type="password" autocomplete="new-password" placeholder="使用预设或输入密码"></label><label>访问白名单<input v-model.trim="account.host" placeholder="默认 %"></label></div><div class="cluster-privileges"><label v-for="privilege in mysqlPrivilegeOptions" :key="privilege"><input v-model="account.privileges" type="checkbox" :value="privilege"><span>{{ privilege }}</span></label></div></article></div></section>
+        <section class="instance-panel install-account-panel"><div class="panel-head"><div><h3>5. 初始化账号与权限</h3><p>权限会按每台目标的 MySQL 版本过滤；5.7 与早期 8.0 使用 SUPER 等静态权限，其余版本使用对应动态权限。</p></div><button type="button" class="secondary" @click="addCustomAccount">＋ 自定义用户</button></div><div class="cluster-install-accounts"><article v-for="(account,index) in install.accounts" :key="account.role"><header><div><b>{{ isCustomAccount(account) ? '自定义数据库用户' : ({monitor:'监控账号',mha:'MHA 管理账号',backup:'备份账号'})[account.role] || account.role }}</b><small>{{ account.role }}</small></div><button v-if="isCustomAccount(account)" type="button" class="danger-link" @click="removeCustomAccount(index)">删除</button><label v-else><input v-model="account.enabled" type="checkbox"> 启用</label></header><div class="account-inputs"><label>用户名<input v-model.trim="account.username" :placeholder="account.role"></label><label>密码<input v-model="account.password" type="password" autocomplete="new-password" placeholder="使用预设或输入密码"></label><label>访问白名单<input v-model.trim="account.host" placeholder="默认 %"></label></div><div class="cluster-privileges"><label v-for="privilege in mysqlInstallPrivilegeOptions" :key="privilege"><input v-model="account.privileges" type="checkbox" :value="privilege"><span>{{ privilege }}</span></label></div></article></div></section>
         <aside class="instance-panel install-submit-panel">
           <header class="install-confirm-head">
             <i>06</i>
@@ -764,20 +926,35 @@ export default {
         <section class="user-hero"><div><p>MYSQL ACCESS CONTROL</p><h3>用户管理</h3><span>进入页面后自动读取主节点用户；查询和变更都不会发送到从节点。</span></div><div class="user-hero-node"><small>当前主节点</small><b>{{ primaryInstance ? value(primaryInstance,'MachineName','machine_name') || value(primaryInstance,'MachineIP','machine_ip') : '未识别' }}</b><code v-if="primaryInstance">{{ value(primaryInstance,'MachineIP','machine_ip') }}:{{ value(primaryInstance,'Port','port') }}</code><em>{{ usersLoaded ? mysqlUsers.length+' 个用户已同步' : busy ? '正在同步用户' : '等待主节点就绪' }}</em><button class="text-button user-hero-refresh" :disabled="busy || !primaryInstance" @click="refreshMySQLUsers">{{ busy ? '同步中…' : '刷新' }}</button></div></section>
         <section class="instance-panel user-catalog"><div class="panel-head user-catalog-head"><div><h3>主节点用户与权限</h3><p>每页最多显示 8 个用户；点击用户名可编辑权限，Host 列表示允许访问的来源地址。</p></div><button class="primary" :disabled="busy || !usersLoaded" @click="openCreateUser">＋ 新增用户</button></div><div class="user-toolbar"><label><span>⌕</span><input v-model.trim="userKeyword" placeholder="搜索用户名、Host 或权限"></label><span>{{ filteredMySQLUsers.length }} / {{ mysqlUsers.length }} 个用户</span></div><div class="user-table-wrap"><table class="user-table"><thead><tr><th>用户</th><th>允许访问来源（Host）</th><th>登录状态</th><th>拥有的全局权限</th><th>操作</th></tr></thead><tbody><tr v-for="user in pagedMySQLUsers" :key="user.username+'@'+user.host"><td class="user-name-cell" :class="{protected:user.management}" tabindex="0" @click="openUserPrivileges(user)" @keyup.enter="openUserPrivileges(user)"><span class="user-avatar">{{ (user.username || '?').slice(0,1).toUpperCase() }}</span><span><b>{{ user.username }}</b><small>{{ user.management ? '当前 MHA 管理账号' : '点击编辑权限' }}</small></span></td><td><code>{{ user.host }}</code></td><td><div class="user-lock-control"><span :class="['user-state',user.locked?'locked':'active']"><i></i>{{ user.locked ? '已锁定' : '允许登录' }}</span><button class="text-button" :disabled="busy || user.management" @click="toggleMySQLUserLock(user)">{{ user.locked ? '解除锁定' : '锁定账号' }}</button></div></td><td><div class="user-privileges"><span v-for="privilege in user.privileges.slice(0,6)" :key="privilege">{{ privilege }}</span><em v-if="user.privileges.length>6">+{{ user.privileges.length-6 }}</em><small v-if="!user.privileges.length">暂未授予全局权限</small></div></td><td><button class="text-button" :disabled="user.management" @click="openUserPrivileges(user)">编辑权限</button><button class="danger-link" :disabled="user.management" @click="requestDeleteUser(user)">删除用户</button></td></tr><tr v-if="usersLoaded&&!filteredMySQLUsers.length"><td colspan="5" class="empty">没有找到符合条件的 MySQL 用户。</td></tr></tbody></table><div v-if="!usersLoaded" class="user-empty"><span>⌾</span><b>{{ busy ? '正在读取主节点用户' : '等待主节点连接' }}</b><p>页面将自动同步主节点用户，无需输入数据库管理员账号或密码。</p></div></div><footer v-if="usersLoaded&&filteredMySQLUsers.length" class="instance-pager user-pager"><span>第 {{ userPage }} / {{ userPageCount }} 页</span><div><button class="secondary" :disabled="userPage<=1" @click="userPage--">上一页</button><button class="secondary" :disabled="userPage>=userPageCount" @click="userPage++">下一页</button></div></footer></section>
       </main>
+      <main v-else-if="view==='accounts'" class="preset-account-page">
+        <section class="instance-panel mysql-preset-panel instance-preset-panel">
+          <div class="panel-head"><div><h3>预设账号</h3><p>维护监控、MHA 管理和备份账号；保存后，当前及其他集群创建 MySQL 实例时都会自动带入。</p></div><div class="preset-save-actions"><span v-if="presetAccountsDirty">有未保存修改</span><button class="primary" :disabled="busy || !presetAccounts.length" @click="saveAccountPresets">{{ busy ? '保存中…' : '保存预设' }}</button></div></div>
+          <div class="mysql-preset-list"><article v-for="account in presetAccounts" :key="account.role"><header><div><b>{{ ({monitor:'监控账号',mha:'MHA 管理账号',backup:'备份账号'})[account.role] || account.role }}</b><small>{{ account.role }}</small></div><label class="switch"><input v-model="account.enabled" type="checkbox" @change="markPresetAccountsDirty"><span>启用</span></label></header><p>{{ account.role === 'monitor' ? '用于监控和健康检查。' : account.role === 'mha' ? '用于 MHA 拓扑管理和切换。' : '用于备份任务。' }}</p><div class="form-row"><label>账号名称<input v-model.trim="account.username" required @input="markPresetAccountsDirty"></label><label>密码<input v-model="account.password" type="password" required autocomplete="new-password" @input="markPresetAccountsDirty"></label></div><label>允许来源 Host<input v-model.trim="account.host" required @input="markPresetAccountsDirty"></label><div class="privilege-picker"><b>授权权限</b><small>只允许选择 GMHA 支持的全局权限；保存后安装任务会生成对应 GRANT 语句。</small><div><label v-for="privilege in mysqlPrivilegeOptions" :key="privilege"><input v-model="account.privileges" type="checkbox" :value="privilege" @change="markPresetAccountsDirty"> {{ privilege }}</label></div></div></article></div>
+          <div v-if="!presetAccounts.length" class="preset-account-empty">尚未加载预设账号，请刷新页面后重试。</div>
+        </section>
+      </main>
       <main v-else-if="view==='params'" class="mysql-parameter-page">
         <section class="parameter-hero"><div><p>MYSQL CONFIGURATION</p><h3>运行参数管理</h3><span>参数目录预先稳定展示；采集后原位填充当前值并识别版本兼容性。</span></div><div class="parameter-summary"><article><b>{{ collectedParameterCount }}</b><small>已采集参数</small></article><article class="dynamic"><b>{{ parameterDynamicCount }}</b><small>动态生效</small></article><article class="restart"><b>{{ parameterRestartCount }}</b><small>重启生效</small></article></div></section>
-        <section class="instance-panel parameter-runtime-panel"><div class="parameter-target-bar"><label><span>基准实例</span><select v-model="parameterAuth.instance"><option value="">请选择 MySQL 实例</option><option v-for="item in clusterInstances" :value="value(item,'MachineIP','machine_ip')+':'+value(item,'Port','port')">{{ value(item,'MachineName','machine_name') || value(item,'MachineIP','machine_ip') }} · {{ value(item,'MachineIP','machine_ip') }}:{{ value(item,'Port','port') }}</option></select></label><div class="parameter-scope"><span>应用范围</span><label :class="{active:parameterApplyScope==='instance'}"><input v-model="parameterApplyScope" type="radio" value="instance">当前实例</label><label :class="{active:parameterApplyScope==='cluster'}"><input v-model="parameterApplyScope" type="radio" value="cluster">整个集群（{{ clusterInstances.length }} 个实例）</label></div><button class="primary" :disabled="busy || !parameterAuth.instance" @click="collectParameters">{{ busy ? '正在采集…' : '采集最新参数' }}</button></div><div class="parameter-catalog-note"><span>{{ parametersCollected ? '已完成版本兼容性检查' : '参数名称已预载，当前值将在采集后原位显示' }}</span><b v-if="parametersCollected">{{ liveParameters.filter(item=>item.compatible===false).length }} 项版本不兼容</b></div><div class="param-toolbar"><label class="parameter-search"><span>⌕</span><input v-model.trim="paramKeyword" placeholder="搜索参数名称、当前值或分类"></label><select v-model="paramCategory"><option value="all">全部分类</option><option v-for="category in paramCategories" :key="category" :value="category">{{ category }}</option></select><span>显示 {{ filteredParams.length }} / {{ liveParameters.length }} 项</span></div><div class="parameter-workspace"><div class="parameter-group-lists"><section v-for="group in parameterGroups" :key="group.category" class="parameter-group"><header><div><b>{{ group.category }}</b><small>{{ group.items.length }} 个参数</small></div><span>{{ group.items.filter(item=>item.dynamic).length }} 动态 · {{ group.items.filter(item=>!item.dynamic).length }} 重启</span></header><div class="param-table-wrap"><table><thead><tr><th>参数名称</th><th>当前值</th><th>修改后的值</th><th>生效方式</th><th>操作</th></tr></thead><tbody><tr v-for="item in group.items" :key="item.name" :class="{'parameter-incompatible-row':item.compatible===false}"><td><b>{{ item.name }}</b><small v-if="parameterChanges.some(change=>change.name===item.name)">已加入待应用</small></td><td class="parameter-value" :title="item.collected ? item.value : ''"><span v-if="item.collected">{{ item.value }}</span><em v-else-if="item.compatible===false" class="parameter-unavailable">版本不兼容</em><em v-else class="parameter-awaiting">采集后显示</em></td><td><input v-model="item.editValue" class="parameter-inline-input" :aria-label="'修改 '+item.name" :placeholder="item.compatible===false ? '当前版本不支持' : (item.collected ? '输入新值' : '等待采集')" :disabled="!item.collected || item.compatible===false" @keyup.enter="stageParameter(item)"></td><td><span v-if="item.compatible===false" class="parameter-mode incompatible">版本不兼容</span><span v-else-if="!item.collected" class="parameter-mode pending">待采集确认</span><span v-else :class="['parameter-mode', item.dynamic ? 'dynamic' : 'restart']">{{ item.dynamic ? '动态生效' : '重启生效' }}</span></td><td class="parameter-inline-actions"><button class="text-button" :disabled="!item.collected || item.compatible===false || !isParameterChanged(item)" @click="stageParameter(item)">保存修改</button><button class="danger-link" :disabled="!item.collected || item.compatible===false" @click="stageParameter(item,'delete')">删除</button></td></tr></tbody></table></div></section><div v-if="!parameterGroups.length" class="parameter-empty">没有匹配的运行参数。</div></div><aside class="parameter-change-panel"><header><div><b>待应用修改</b><small>一次提交，只执行一次必要的重启</small></div><span>{{ parameterChanges.length }}</span></header><div class="parameter-change-counts"><span class="dynamic">动态 {{ stagedDynamicCount }}</span><span class="restart">重启 {{ stagedRestartCount }}</span></div><div class="parameter-change-list"><p v-if="!parameterChanges.length">采集完成后，可直接在左侧参数后输入新值并保存。</p><article v-for="change in parameterChanges" :key="change.name"><div><b>{{ change.name }}</b><small>{{ change.action==='delete' ? '删除配置' : change.value }}</small></div><span :class="['parameter-mode',change.dynamic?'dynamic':'restart']">{{ change.dynamic ? '动态' : '重启' }}</span><button type="button" aria-label="移除待应用修改" @click="removeParameterChange(change.name)">×</button></article></div><footer><small v-if="stagedRestartCount">包含 {{ stagedRestartCount }} 项重启参数，提交后需要二次确认重启范围。</small><small v-else>动态参数会立即下发，同时持久化到配置文件。</small><button class="primary" :disabled="busy || !parameterChanges.length" @click="applyParameterChanges">应用 {{ parameterChanges.length || '' }} 项修改</button></footer></aside></div></section>
+        <section class="instance-panel parameter-runtime-panel"><div class="parameter-target-bar"><label><span>基准实例</span><select v-model="parameterAuth.instance"><option value="">请选择 MySQL 实例</option><option v-for="item in clusterInstances" :value="value(item,'MachineIP','machine_ip')+':'+value(item,'Port','port')">{{ value(item,'MachineName','machine_name') || value(item,'MachineIP','machine_ip') }} · {{ value(item,'MachineIP','machine_ip') }}:{{ value(item,'Port','port') }}</option></select></label><div class="parameter-scope"><span>应用范围</span><label :class="{active:parameterApplyScope==='instance'}"><input v-model="parameterApplyScope" type="radio" value="instance">当前实例</label><label :class="{active:parameterApplyScope==='cluster'}"><input v-model="parameterApplyScope" type="radio" value="cluster">整个集群（{{ clusterInstances.length }} 个实例）</label></div><div class="parameter-target-actions"><button class="primary" :disabled="busy || !parameterAuth.instance" @click="collectParameters">{{ busy ? '正在采集…' : '采集最新参数' }}</button><button class="secondary parameter-export-button" :disabled="busy || !parametersCollected || !filteredParams.length" title="按当前搜索和分类筛选结果导出" @click="exportParameters">⇩ 导出 Excel</button></div></div><div class="parameter-catalog-note"><span>{{ parametersCollected ? '已完成版本兼容性检查；Excel 将按当前筛选结果导出' : '参数名称已预载，当前值将在采集后原位显示' }}</span><b v-if="parametersCollected">{{ liveParameters.filter(item=>item.compatible===false).length }} 项版本不兼容</b></div><div class="param-toolbar"><label class="parameter-search"><span>⌕</span><input v-model.trim="paramKeyword" placeholder="搜索参数名称、当前值或分类"></label><select v-model="paramCategory"><option value="all">全部分类</option><option v-for="category in paramCategories" :key="category" :value="category">{{ category }}</option></select><span>显示 {{ filteredParams.length }} / {{ liveParameters.length }} 项</span></div><div class="parameter-workspace"><div class="parameter-group-lists"><section v-for="group in parameterGroups" :key="group.category" class="parameter-group"><header><div><b>{{ group.category }}</b><small>{{ group.items.length }} 个参数</small></div><span>{{ group.items.filter(item=>item.dynamic).length }} 动态 · {{ group.items.filter(item=>!item.dynamic).length }} 重启</span></header><div class="param-table-wrap"><table><thead><tr><th>参数名称</th><th>当前值</th><th>修改后的值</th><th>生效方式</th><th>操作</th></tr></thead><tbody><tr v-for="item in group.items" :key="item.name" :class="{'parameter-incompatible-row':item.compatible===false}"><td><b>{{ item.name }}</b><small v-if="parameterChanges.some(change=>change.name===item.name)">已加入待应用</small></td><td class="parameter-value" :title="item.collected ? item.value : ''"><span v-if="item.collected">{{ item.value }}</span><em v-else-if="item.compatible===false" class="parameter-unavailable">版本不兼容</em><em v-else class="parameter-awaiting">采集后显示</em></td><td><input v-model="item.editValue" class="parameter-inline-input" :aria-label="'修改 '+item.name" :placeholder="item.compatible===false ? '当前版本不支持' : (item.collected ? '输入新值' : '等待采集')" :disabled="!item.collected || item.compatible===false" @keyup.enter="stageParameter(item)"></td><td><span v-if="item.compatible===false" class="parameter-mode incompatible">版本不兼容</span><span v-else-if="!item.collected" class="parameter-mode pending">待采集确认</span><span v-else :class="['parameter-mode', item.dynamic ? 'dynamic' : 'restart']">{{ item.dynamic ? '动态生效' : '重启生效' }}</span></td><td class="parameter-inline-actions"><button class="text-button" :disabled="!item.collected || item.compatible===false || !isParameterChanged(item)" @click="stageParameter(item)">保存修改</button><button class="danger-link" :disabled="!item.collected || item.compatible===false" @click="stageParameter(item,'delete')">删除</button></td></tr></tbody></table></div></section><div v-if="!parameterGroups.length" class="parameter-empty">没有匹配的运行参数。</div></div><aside class="parameter-change-panel"><header><div><b>待应用修改</b><small>一次提交，只执行一次必要的重启</small></div><span>{{ parameterChanges.length }}</span></header><div class="parameter-change-counts"><span class="dynamic">动态 {{ stagedDynamicCount }}</span><span class="restart">重启 {{ stagedRestartCount }}</span></div><div class="parameter-change-list"><p v-if="!parameterChanges.length">采集完成后，可直接在左侧参数后输入新值并保存。</p><article v-for="change in parameterChanges" :key="change.name"><div><b>{{ change.name }}</b><small>{{ change.action==='delete' ? '删除配置' : change.value }}</small></div><span :class="['parameter-mode',change.dynamic?'dynamic':'restart']">{{ change.dynamic ? '动态' : '重启' }}</span><button type="button" aria-label="移除待应用修改" @click="removeParameterChange(change.name)">×</button></article></div><footer><small v-if="stagedRestartCount">包含 {{ stagedRestartCount }} 项重启参数，提交后需要二次确认重启范围。</small><small v-else>动态参数会立即下发，同时持久化到配置文件。</small><button class="primary" :disabled="busy || !parameterChanges.length" @click="applyParameterChanges">应用 {{ parameterChanges.length || '' }} 项修改</button></footer></aside></div></section>
       </main>
       <main v-else-if="view==='agent-collect'" class="agent-collect-page">
         <section class="parameter-hero agent-collect-hero"><div><p>AGENT COLLECTION</p><h3>Agent采集</h3><span>统一管理 Agent 需要采集的 MySQL 实例状态指标及执行频率。</span></div><div class="parameter-summary"><article><b>{{ collectConfig.tasks.length }}</b><small>采集指标</small></article><article class="dynamic"><b>{{ collectConfig.tasks.filter(task=>task.enabled).length }}</b><small>已启用</small></article><article class="restart"><b>{{ collectConfig.tasks.filter(task=>!task.enabled).length }}</b><small>已停用</small></article></div></section>
         <section class="instance-panel agent-collect-panel"><div class="panel-head"><div><h3>MySQL 实例状态采集参数</h3><p>策略通过心跳下发到集群内 Agent；采集间隔最小 5 秒，超时最长 10 秒且不能超过采集间隔。</p></div><div class="agent-collect-actions"><label><input v-model="collectConfig.enabled" type="checkbox"> 启用 MySQL 动态采集</label><button class="primary" :disabled="busy" @click="saveParams">{{ busy ? '保存中…' : '保存 Agent 采集配置' }}</button></div></div><div class="agent-collect-meta"><span>配置版本</span><b>{{ collectConfig.version || '未生成' }}</b><span>作用范围</span><b>{{ clusterInstances.length }} 个 MySQL 实例 / {{ clusterName }}</b></div><div class="collect-policy-table"><table><thead><tr><th>指标名称</th><th>内部标识</th><th>分类</th><th>采集</th><th>间隔（秒）</th><th>超时（秒）</th></tr></thead><tbody><tr v-for="task in collectConfig.tasks" :key="task.name"><td><b>{{ task.labels?.display_name || task.name }}</b></td><td><code>{{ task.name }}</code></td><td><span class="agent-category">{{ task.category || '其他' }}</span></td><td><label class="agent-task-switch"><input v-model="task.enabled" type="checkbox"><span>{{ task.enabled ? '启用' : '停用' }}</span></label></td><td><input v-model.number="task.interval_seconds" type="number" min="5"></td><td><input v-model.number="task.timeout_seconds" type="number" min="1" max="10"></td></tr><tr v-if="!collectConfig.tasks.length"><td colspan="6" class="empty">暂无可配置的 MySQL 采集指标，请刷新页面或检查 Manager 配置。</td></tr></tbody></table></div></section>
       </main>
       <main v-else class="mysql-upgrade-page">
+        <ClusterRollingUpgrade
+          :cluster-name="clusterName"
+          :instances="clusterInstances"
+          :packages="packages"
+          @open-task="emit('open-task',$event)"
+          @refresh="emit('refresh')"
+        />
         <section class="instance-panel upgrade-page-hero"><div><p>MYSQL LIFECYCLE</p><h3>MySQL 版本升级</h3><span>独立预检报告通过后才允许升级；页面和 API 不接收数据库用户名或密码。</span></div><div class="upgrade-hero-version"><small>当前 → 目标</small><b>{{ upgradePreview.instance ? (value(upgradePreview.instance,'Version','version') || '未知') : '—' }} <i>→</i> {{ upgradePreview.pkg ? (upgradePreview.pkg.version || upgradePreview.pkg.Version) : '—' }}</b></div></section>
         <div class="mysql-upgrade-layout">
           <section class="instance-panel upgrade-config-card">
             <header><span>01</span><div><h4>选择升级目标</h4><p>目标包仅展示与实例机器架构匹配的版本。</p></div></header>
             <div class="upgrade-form-grid"><label>目标实例<select v-model="upgrade.instance" @change="upgradeInstanceChanged"><option value="">选择实例</option><option v-for="item in clusterInstances" :value="value(item,'MachineIP','machine_ip')+':'+value(item,'Port','port')">{{ value(item,'MachineIP','machine_ip') }}:{{ value(item,'Port','port') }} · MySQL {{ value(item,'Version','version') || '版本未知' }}</option></select></label><label>目标架构<select v-model="upgrade.architecture" @change="upgradeArchitectureChanged"><option v-for="arch in upgradeArchitectures" :key="arch" :value="arch">{{ arch }}</option></select></label><label>升级版本<select v-model="upgrade.version"><option value="">{{ upgrade.instance && !upgradeVersions.length ? '暂无更高版本安装包' : '选择版本' }}</option><option v-for="pkg in upgradeVersions" :key="pkg.version || pkg.Version" :value="pkg.version || pkg.Version">MySQL {{ pkg.version || pkg.Version }} · {{ pkg.release_track || pkg.ReleaseTrack }}</option></select></label></div>
+            <div v-if="upgradeRoute" :class="['upgrade-route-notice',upgradeRoute.kind]"><i>{{ upgradeRoute.kind==='missing' ? '!' : '↗' }}</i><div><b>{{ upgradeRoute.title }}</b><p>{{ upgradeRoute.detail }}</p></div><span v-if="upgradeRoute.blocked">已隐藏 {{ upgradeRoute.blocked }} 个非推荐目标</span></div>
             <div v-if="upgradePreview.ready" class="upgrade-version-card"><div><small>当前运行版本</small><b>MySQL {{ value(upgradePreview.instance,'Version','version') || '未知' }}</b><span>{{ value(upgradePreview.instance,'MachineIP','machine_ip') }}:{{ value(upgradePreview.instance,'Port','port') }}</span></div><i>→</i><div><small>计划升级版本</small><b>MySQL {{ upgradePreview.pkg.version || upgradePreview.pkg.Version }}</b><span>{{ upgradePreview.pkg.arch || upgradePreview.pkg.Arch }} · {{ upgradePreview.pkg.release_track || upgradePreview.pkg.ReleaseTrack }}</span></div></div>
           </section>
           <section class="instance-panel upgrade-precheck-card">
@@ -795,8 +972,18 @@ export default {
         </section>
         <section class="instance-panel upgrade-flow"><h4>升级执行流程</h4><ol><li v-for="(stage,index) in upgradeStages" :key="stage"><i>{{ index+1 }}</i><span>{{ stage }}</span></li></ol><p>软链接切换前的失败会自动恢复旧链接；新版本启动后为避免旧二进制打开已升级数据，系统保留新版本并要求人工检查或从备份恢复。</p></section>
       </main>
+      <div v-if="lifecycleDialog.open" class="modal-mask lifecycle-mask" @click.self="!busy&&(lifecycleDialog.open=false)"><form class="modal lifecycle-dialog" @submit.prevent="submitLifecycle">
+        <header><span>!</span><div><p>MYSQL LIFECYCLE SAFETY GATE</p><h2>{{ lifecycleDialog.action==='restart' ? '安全重启 MySQL 实例' : '安全关闭 MySQL 实例' }}</h2><small>{{ lifecycleEndpoint }} · {{ roleFor(lifecycleDialog.item) }}</small></div><button type="button" :disabled="busy" @click="lifecycleDialog.open=false">×</button></header>
+        <div class="lifecycle-risk-banner" :class="{critical:lifecycleIsPrimary}"><b>{{ lifecycleIsPrimary ? '当前拓扑将该实例识别为主库或双主节点' : '该操作会中断当前实例上的数据库连接' }}</b><p>{{ lifecycleDialog.action==='restart' ? '任务会在重启前记录全量主从拓扑，等待活动事务结束，并在恢复后比对 server_uuid、server_id、只读状态、复制源、复制线程、延迟和 GTID。' : '校验通过后只停止该 MySQL systemd 服务，不会关闭宿主机；关闭后不会自动校验在线拓扑，请确认集群仍有可用节点。' }}</p></div>
+        <ol class="lifecycle-checklist"><li><i>1</i><span><b>实时拓扑基线</b><small>连接集群所有登记实例，留存角色与复制源关系。</small></span></li><li><i>2</i><span><b>复制与 GTID 门禁</b><small>复制线程必须正常、延迟归零，GTID 集合不得分叉。</small></span></li><li><i>3</i><span><b>重启后原架构复核</b><small>{{ lifecycleDialog.action==='restart' ? '任一节点拓扑变化或数据检查失败，任务即失败并保留审计日志。' : '关机任务不执行此项；重新启动应使用安全重启流程复核。' }}</small></span></li></ol>
+        <label class="lifecycle-choice"><input v-model="lifecycleDialog.deepDataCheck" type="checkbox"><span><b>执行深度数据一致性校验（推荐）</b><small>重启前后运行 pt-table-checksum，并检查所有副本的校验结果；大型库耗时较长且会增加有限负载。取消后仍强制校验复制线程、延迟与 GTID。</small></span></label>
+        <label class="lifecycle-choice"><input v-model="lifecycleDialog.riskAcknowledged" type="checkbox"><span><b>我确认已安排维护窗口并验证可恢复备份</b><small>长事务超过 60 秒、复制异常或拓扑无法完整读取时，任务会拒绝执行。</small></span></label>
+        <label v-if="lifecycleIsPrimary" class="lifecycle-choice critical"><input v-model="lifecycleDialog.primaryAcknowledged" type="checkbox"><span><b>我确认业务流量/VIP 已切走，或接受主库短时不可用</b><small>任务执行时还会实时检查目标是否可写；缺少此项确认将阻止操作。</small></span></label>
+        <label class="lifecycle-confirm">输入 <code>{{ lifecycleConfirmation }}</code> 确认<input v-model.trim="lifecycleDialog.confirmation" autocomplete="off" :placeholder="lifecycleConfirmation"></label>
+        <footer><button type="button" class="secondary" :disabled="busy" @click="lifecycleDialog.open=false">取消</button><button class="danger-button" :disabled="busy || !lifecycleCanSubmit">{{ busy ? '正在创建任务…' : lifecycleDialog.action==='restart' ? '确认安全重启' : '确认关闭实例' }}</button></footer>
+      </form></div>
       <div v-if="parameterRestartDialog.open" class="modal-mask parameter-restart-mask" @click.self="parameterRestartDialog.open=false"><section class="modal parameter-restart-dialog"><header><span>!</span><div><p>RESTART CONFIRMATION</p><h2>参数修改需要重启才能生效</h2></div><button type="button" @click="parameterRestartDialog.open=false">×</button></header><div class="parameter-restart-summary"><b>{{ stagedRestartCount }} 项参数需要重启</b><span>另有 {{ stagedDynamicCount }} 项动态参数会在任务执行时立即生效</span></div><div class="parameter-restart-options"><label :class="{active:parameterRestartDialog.scope==='instance'}"><input v-model="parameterRestartDialog.scope" type="radio" value="instance"><span><b>重启当前实例</b><small>{{ parameterAuth.instance }}，连接会短暂中断</small></span></label><label :class="{active:parameterRestartDialog.scope==='cluster'}"><input v-model="parameterRestartDialog.scope" type="radio" value="cluster"><span><b>滚动重启整个集群</b><small>按任务顺序重启 {{ clusterInstances.length }} 个实例并逐一验证</small></span></label></div><div class="parameter-restart-warning"><b>请确认当前处于可重启维护窗口</b><p>任务会先备份 my.cnf，再应用全部修改；每个实例重启后必须通过 systemd 和数据库连接验证。</p></div><footer><button type="button" class="secondary" @click="parameterRestartDialog.open=false">返回检查</button><button type="button" class="danger-button" :disabled="busy" @click="confirmParameterRestart">确认修改并执行重启</button></footer></section></div>
-      <div v-if="userDialog.open" class="modal-mask user-modal-mask" @click.self="closeUserDialog"><form class="modal user-editor" @submit.prevent="saveMySQLUser"><header><div><p>{{ userDialog.mode==='create' ? 'CREATE MYSQL USER' : 'MANAGE PRIVILEGES' }}</p><h2>{{ userDialog.mode==='create' ? '新增数据库用户' : userDialog.username+'@'+userDialog.host }}</h2><span>{{ userDialog.mode==='create' ? '账号将在主节点创建，并由 MySQL 复制策略决定后续同步。' : '勾选期望权限，系统会自动计算 GRANT 与 REVOKE 差异。' }}</span></div><button type="button" @click="closeUserDialog">×</button></header><div v-if="userDialog.mode==='create'" class="user-editor-fields"><label>用户名<input v-model.trim="userDialog.username" required autofocus placeholder="例如 app_reader"></label><label>来源 Host<input v-model.trim="userDialog.host" required placeholder="例如 10.0.0.%"></label><label class="wide">登录密码<input v-model="userDialog.password" type="password" required autocomplete="new-password" placeholder="设置高强度密码"></label></div><section class="user-permission-picker"><header><div><b>全局权限</b><small>作用域为 *.*；选择最小必要权限可降低误操作风险。</small></div><span>已选 {{ userDialog.privileges.length }} 项</span></header><div><label v-for="privilege in mysqlPrivilegeOptions" :key="privilege" :class="{selected:userDialog.privileges.includes(privilege)}"><input v-model="userDialog.privileges" type="checkbox" :value="privilege"><span><i>✓</i>{{ privilege }}</span></label></div></section><footer><span><i>i</i>提交后等待 Agent 执行完成，并自动重新同步用户列表。</span><div><button type="button" class="secondary" @click="closeUserDialog">取消</button><button class="primary" :disabled="busy">{{ busy ? '正在执行…' : userDialog.mode==='create' ? '创建用户' : '保存权限' }}</button></div></footer></form></div>
+      <div v-if="userDialog.open" class="modal-mask user-modal-mask" @click.self="closeUserDialog"><form class="modal user-editor" @submit.prevent="saveMySQLUser"><header><div><p>{{ userDialog.mode==='create' ? 'CREATE MYSQL USER' : 'MANAGE PRIVILEGES' }}</p><h2>{{ userDialog.mode==='create' ? '新增数据库用户' : userDialog.username+'@'+userDialog.host }}</h2><span>{{ userDialog.mode==='create' ? '账号将在主节点创建，并由 MySQL 复制策略决定后续同步。' : '勾选期望权限，系统会自动计算 GRANT 与 REVOKE 差异。' }}</span></div><button type="button" @click="closeUserDialog">×</button></header><div v-if="userDialog.mode==='create'" class="user-editor-fields"><label>用户名<input v-model.trim="userDialog.username" required autofocus placeholder="例如 app_reader"></label><label>来源 Host<input v-model.trim="userDialog.host" required placeholder="例如 10.0.0.%"></label><label class="wide">登录密码<input v-model="userDialog.password" type="password" required autocomplete="new-password" placeholder="设置高强度密码"></label></div><section class="user-permission-picker"><header><div><b>全局权限</b><small>权限列表已按主节点版本过滤；5.7 与早期 8.0 不会显示不兼容的动态权限。</small></div><span>已选 {{ userDialog.privileges.length }} 项</span></header><div><label v-for="privilege in mysqlUserPrivilegeOptions" :key="privilege" :class="{selected:userDialog.privileges.includes(privilege)}"><input v-model="userDialog.privileges" type="checkbox" :value="privilege"><span><i>✓</i>{{ privilege }}</span></label></div></section><footer><span><i>i</i>提交后等待 Agent 执行完成，并自动重新同步用户列表。</span><div><button type="button" class="secondary" @click="closeUserDialog">取消</button><button class="primary" :disabled="busy">{{ busy ? '正在执行…' : userDialog.mode==='create' ? '创建用户' : '保存权限' }}</button></div></footer></form></div>
       <div v-if="deleteUserDialog.open" class="modal-mask user-modal-mask" @click.self="deleteUserDialog.open=false"><form class="modal user-delete-dialog" @submit.prevent="confirmDeleteUser"><header><span>!</span><div><p>DESTRUCTIVE ACTION</p><h2>删除数据库用户</h2></div><button type="button" @click="deleteUserDialog.open=false">×</button></header><div><p>删除后，该账号的登录能力和全部授权会立即失效。此操作仅在主节点执行，无法从 GMHA 页面撤销。</p><label>输入 <b>{{ deleteUserDialog.user?.username }}@{{ deleteUserDialog.user?.host }}</b> 确认<input v-model.trim="deleteUserDialog.confirmation" autocomplete="off"></label></div><footer><button type="button" class="secondary" @click="deleteUserDialog.open=false">取消</button><button class="danger-button" :disabled="busy || deleteUserDialog.confirmation!==(deleteUserDialog.user?.username+'@'+deleteUserDialog.user?.host)">{{ busy ? '正在删除…' : '确认删除用户' }}</button></footer></form></div>
     </section>`
 }

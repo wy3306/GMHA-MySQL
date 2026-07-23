@@ -8,6 +8,7 @@ import (
 	"time"
 
 	agentdomain "gmha/internal/domain/agent"
+	credentialdomain "gmha/internal/domain/credential"
 	machinedomain "gmha/internal/domain/machine"
 )
 
@@ -31,11 +32,12 @@ type HeartbeatReader interface {
 
 // UpgradeDependencies 是升级 Agent 用例所需的外部依赖集合。
 type UpgradeDependencies struct {
-	MachineRepo UpgradeMachineRepository
-	AgentRepo   UpgradeAgentRepository
-	SSHClient   SSHClient
-	Renderer    Renderer
-	Heartbeat   HeartbeatReader
+	MachineRepo    UpgradeMachineRepository
+	AgentRepo      UpgradeAgentRepository
+	CredentialRepo credentialdomain.Repository
+	SSHClient      SSHClient
+	Renderer       Renderer
+	Heartbeat      HeartbeatReader
 }
 
 // UpgradeAgentRequest 是升级 Agent 的请求参数。
@@ -58,21 +60,23 @@ type UpgradeAgentResponse struct {
 
 // UpgradeAgentUsecase 是升级 Agent 的用例，负责通过 SSH 将新版本 Agent 部署到目标机器。
 type UpgradeAgentUsecase struct {
-	machineRepo UpgradeMachineRepository
-	agentRepo   UpgradeAgentRepository
-	sshClient   SSHClient
-	renderer    Renderer
-	heartbeat   HeartbeatReader
+	machineRepo    UpgradeMachineRepository
+	agentRepo      UpgradeAgentRepository
+	credentialRepo credentialdomain.Repository
+	sshClient      SSHClient
+	renderer       Renderer
+	heartbeat      HeartbeatReader
 }
 
 // NewUpgradeAgentUsecase 创建一个新的升级 Agent 用例实例。
 func NewUpgradeAgentUsecase(dep UpgradeDependencies) *UpgradeAgentUsecase {
 	return &UpgradeAgentUsecase{
-		machineRepo: dep.MachineRepo,
-		agentRepo:   dep.AgentRepo,
-		sshClient:   dep.SSHClient,
-		renderer:    dep.Renderer,
-		heartbeat:   dep.Heartbeat,
+		machineRepo:    dep.MachineRepo,
+		agentRepo:      dep.AgentRepo,
+		credentialRepo: dep.CredentialRepo,
+		sshClient:      dep.SSHClient,
+		renderer:       dep.Renderer,
+		heartbeat:      dep.Heartbeat,
 	}
 }
 
@@ -135,6 +139,23 @@ func (u *UpgradeAgentUsecase) Execute(ctx context.Context, req UpgradeAgentReque
 
 	endpoint := machinedomain.Endpoint{IP: machine.IP, SSHPort: machine.SSHPort}
 	auth := machinedomain.SSHAuth{User: machine.SSHUser}
+	if strings.TrimSpace(machine.CredentialID) != "" && u.credentialRepo != nil {
+		credential, found, credentialErr := u.credentialRepo.GetByID(ctx, machine.CredentialID)
+		if credentialErr != nil {
+			return u.fail(ctx, machine.ID, installDir, agent.ID, fmt.Errorf("load SSH credential: %w", credentialErr))
+		}
+		if found {
+			auth = machinedomain.SSHAuth{
+				User:       credential.SSHUser,
+				Password:   credential.SSHPassword,
+				PrivateKey: credential.PrivateKey,
+				Passphrase: credential.Passphrase,
+			}
+		}
+	}
+	if strings.TrimSpace(auth.User) == "" {
+		auth.User = "root"
+	}
 
 	_ = u.machineRepo.UpdateStatus(ctx, machine.ID, machinedomain.StatusAgentInstalling, "")
 	_, _ = u.agentRepo.Save(ctx, agentdomain.Agent{

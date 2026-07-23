@@ -1,0 +1,553 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#07111f" />
+    <meta
+      name="description"
+      content="GMHA 是一套 Go 原生的 MySQL 高可用管理平台，覆盖机器纳管、实例生命周期、性能诊断、备份恢复与自动故障转移。"
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:site_name" content="GMHA" />
+    <meta property="og:title" content="GMHA — Go 原生的 MySQL 高可用管理平台" />
+    <meta
+      property="og:description"
+      content="把纳管、监控、诊断、恢复与高可用，收拢到一个清晰的控制面。"
+    />
+    <meta property="og:url" content="http://gmha.weiyaonas.club/" />
+    <meta property="og:image" content="http://gmha.weiyaonas.club/og.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="GMHA — Go 原生的 MySQL 高可用管理平台" />
+    <meta
+      name="twitter:description"
+      content="把纳管、监控、诊断、恢复与高可用，收拢到一个清晰的控制面。"
+    />
+    <meta name="twitter:image" content="http://gmha.weiyaonas.club/og.png" />
+    <link rel="canonical" href="http://gmha.weiyaonas.club/" />
+    <link rel="icon" href="/gmha-mark.svg" type="image/svg+xml" />
+    <link rel="manifest" href="/site.webmanifest" />
+    <link rel="stylesheet" href="/styles.css" />
+    <title>GMHA — Go 原生的 MySQL 高可用管理平台</title>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">跳到主要内容</a>
+
+    <header class="site-header" data-header>
+      <div class="nav-shell">
+        <a class="brand" href="#top" aria-label="GMHA 首页">
+          <img src="/gmha-mark.svg" alt="" width="32" height="32" />
+          <span>GMHA</span>
+          <span class="brand-tag">MySQL Control Plane</span>
+        </a>
+        <button
+          class="menu-button"
+          type="button"
+          aria-expanded="false"
+          aria-controls="site-nav"
+          data-menu-button
+        >
+          <span></span><span></span><span></span>
+          <span class="sr-only">打开导航</span>
+        </button>
+        <nav class="site-nav" id="site-nav" aria-label="主导航" data-nav>
+          <a href="#capabilities">核心能力</a>
+          <a href="#architecture">系统架构</a>
+          <a href="#scenarios">适用场景</a>
+          <a href="https://github.com/wy3306/GMHA-MySQL" target="_blank" rel="noreferrer">
+            GitHub
+          </a>
+          <a class="nav-cta" href="#start">开始了解</a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main">
+      <section class="hero" id="top">
+        <div class="hero-glow hero-glow-one"></div>
+        <div class="hero-glow hero-glow-two"></div>
+        <div class="grid-haze"></div>
+        <div class="shell hero-grid">
+          <div class="hero-copy">
+            <div class="eyebrow reveal">
+              <span class="status-dot"></span>
+              Go-native · MySQL High Availability
+            </div>
+            <h1 class="reveal">
+              把 MySQL 高可用，
+              <span>收拢到一个控制面。</span>
+            </h1>
+            <p class="hero-lead reveal">
+              GMHA 连接管理节点与数据库主机，让机器纳管、实例生命周期、性能诊断、备份恢复和故障转移在同一套工作流里自然发生。
+            </p>
+            <div class="hero-actions reveal">
+              <a class="button button-primary" href="#capabilities">
+                探索核心能力
+                <span aria-hidden="true">↗</span>
+              </a>
+              <a
+                class="button button-secondary"
+                href="https://github.com/wy3306/GMHA-MySQL"
+                target="_blank"
+                rel="noreferrer"
+              >
+                <span class="github-mark" aria-hidden="true">⌘</span>
+                查看 GitHub
+              </a>
+            </div>
+            <div class="hero-proof reveal" aria-label="技术概览">
+              <div>
+                <strong>Manager + Agent</strong>
+                <span>双进程协同</span>
+              </div>
+              <div>
+                <strong>gRPC · WS · SSH</strong>
+                <span>多通道执行</span>
+              </div>
+              <div>
+                <strong>Go Native</strong>
+                <span>轻量部署</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="hero-console reveal" aria-label="GMHA 集群状态示意">
+            <div class="console-chrome">
+              <div class="console-title">
+                <img src="/gmha-mark.svg" alt="" width="22" height="22" />
+                <div>
+                  <strong>生产集群</strong>
+                  <span>cluster-prod-01</span>
+                </div>
+              </div>
+              <div class="live-badge"><span></span> LIVE</div>
+            </div>
+            <div class="health-row">
+              <div>
+                <span class="metric-label">集群健康</span>
+                <strong class="health-value">稳定</strong>
+              </div>
+              <div>
+                <span class="metric-label">复制延迟</span>
+                <strong>12 <small>ms</small></strong>
+              </div>
+              <div>
+                <span class="metric-label">在线节点</span>
+                <strong>3 <small>/ 3</small></strong>
+              </div>
+            </div>
+            <div class="topology">
+              <div class="topology-head">
+                <span>实时拓扑</span>
+                <span class="refresh-time">刚刚更新</span>
+              </div>
+              <div class="nodes">
+                <div class="db-node primary-node">
+                  <div class="db-icon">
+                    <span></span><i></i><b></b>
+                  </div>
+                  <div>
+                    <span class="node-role">PRIMARY</span>
+                    <strong>mysql-01</strong>
+                    <small>10.0.1.11:3306</small>
+                  </div>
+                  <span class="node-online"></span>
+                </div>
+                <div class="replication-lines" aria-hidden="true">
+                  <span></span><span></span>
+                </div>
+                <div class="replica-row">
+                  <div class="db-node">
+                    <div class="db-icon secondary">
+                      <span></span><i></i><b></b>
+                    </div>
+                    <div>
+                      <span class="node-role replica">REPLICA</span>
+                      <strong>mysql-02</strong>
+                      <small>延迟 12 ms</small>
+                    </div>
+                    <span class="node-online"></span>
+                  </div>
+                  <div class="db-node">
+                    <div class="db-icon secondary">
+                      <span></span><i></i><b></b>
+                    </div>
+                    <div>
+                      <span class="node-role replica">REPLICA</span>
+                      <strong>mysql-03</strong>
+                      <small>延迟 18 ms</small>
+                    </div>
+                    <span class="node-online"></span>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="event-stream">
+              <div class="event-head">
+                <span>事件流</span>
+                <span>过去 5 分钟</span>
+              </div>
+              <div class="event-item">
+                <span class="event-check">✓</span>
+                <div><strong>巡检完成</strong><small>所有复制链路正常</small></div>
+                <time>10:42:16</time>
+              </div>
+              <div class="event-item">
+                <span class="event-pulse"></span>
+                <div><strong>心跳已同步</strong><small>3 个 Agent 在线</small></div>
+                <time>10:42:12</time>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="signal-strip" aria-label="平台能力范围">
+        <div class="shell signal-inner">
+          <span>从部署到恢复，覆盖数据库运行全链路</span>
+          <div class="signal-items">
+            <span>机器纳管</span><i></i><span>实例管理</span><i></i><span>实时观测</span
+            ><i></i><span>智能诊断</span><i></i><span>高可用切换</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="section product-tour" id="product">
+        <div class="shell">
+          <div class="section-heading reveal">
+            <div>
+              <span class="kicker">01 · Product experience</span>
+              <h2>复杂系统，<br />也应该一眼看懂。</h2>
+            </div>
+            <p>
+              GMHA 用一致的控制台承载运行状态、多集群自动化与 AI
+              辅助运维。信息密度足够高，但每一步都有清晰的上下文。
+            </p>
+          </div>
+
+          <div class="product-tabs reveal" role="tablist" aria-label="GMHA 产品界面">
+            <button
+              class="product-tab active"
+              type="button"
+              role="tab"
+              aria-selected="true"
+              data-screenshot="/screenshots/overview.png"
+              data-title="运行概览"
+              data-description="Manager、资源、Agent 与任务状态集中呈现，异常入口始终可见。"
+            >
+              <span>01</span>
+              <strong>运行概览</strong>
+            </button>
+            <button
+              class="product-tab"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              data-screenshot="/screenshots/automation.png"
+              data-title="集群自动化"
+              data-description="批量巡检、升级、参数变更、备份和脚本任务在同一个工作流中配置。"
+            >
+              <span>02</span>
+              <strong>集群自动化</strong>
+            </button>
+            <button
+              class="product-tab"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              data-screenshot="/screenshots/ai-operations.png"
+              data-title="AI 运维中心"
+              data-description="AI 提出计划，安全闸门与人工审批决定执行，建议不会直接越权。"
+            >
+              <span>03</span>
+              <strong>AI 运维中心</strong>
+            </button>
+          </div>
+
+          <div class="product-frame reveal">
+            <div class="frame-bar" aria-hidden="true">
+              <div><i></i><i></i><i></i></div>
+              <span>gmha / console</span>
+              <b>LIVE PREVIEW</b>
+            </div>
+            <div class="screenshot-stage">
+              <img
+                src="/screenshots/overview.png"
+                alt="GMHA 运行概览控制台"
+                width="1280"
+                height="720"
+                loading="lazy"
+                data-product-image
+              />
+            </div>
+            <div class="product-caption" aria-live="polite">
+              <div>
+                <span>当前界面</span>
+                <strong data-product-title>运行概览</strong>
+              </div>
+              <p data-product-description>
+                Manager、资源、Agent 与任务状态集中呈现，异常入口始终可见。
+              </p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section capabilities" id="capabilities">
+        <div class="shell">
+          <div class="section-heading reveal">
+            <div>
+              <span class="kicker">02 · Core capabilities</span>
+              <h2>把复杂留在平台里，<br />把清晰交给运维。</h2>
+            </div>
+            <p>
+              围绕 MySQL 的日常运行与关键变更，GMHA 将分散的脚本、命令和检查项组合成可观察、可追踪的标准流程。
+            </p>
+          </div>
+
+          <div class="feature-grid">
+            <article class="feature-card feature-card-wide reveal">
+              <div class="feature-index">01</div>
+              <div class="feature-icon icon-topology">
+                <span></span><span></span><span></span>
+              </div>
+              <h3>集群拓扑与高可用</h3>
+              <p>统一查看主从关系、节点状态与复制延迟，结合候选评分、Relay 回放、VIP 漂移和旧主隔离完成故障处置。</p>
+              <div class="mini-topology" aria-hidden="true">
+                <div>P</div><span></span><div>R</div><span></span><div>R</div>
+              </div>
+            </article>
+
+            <article class="feature-card reveal">
+              <div class="feature-index">02</div>
+              <div class="feature-icon icon-lifecycle"><span></span></div>
+              <h3>实例全生命周期</h3>
+              <p>从机器纳管、Agent 部署，到 MySQL 安装、参数生成、拓扑搭建、升级与卸载，一条链路闭环管理。</p>
+              <ul class="tag-list" aria-label="实例生命周期能力">
+                <li>安装</li><li>配置</li><li>升级</li><li>卸载</li>
+              </ul>
+            </article>
+
+            <article class="feature-card reveal">
+              <div class="feature-index">03</div>
+              <div class="feature-icon icon-observe"><span></span><i></i><b></b></div>
+              <h3>性能观测与诊断</h3>
+              <p>面向 SQL、执行计划、索引、直方图、Binlog 与内存的诊断入口，让性能问题有迹可循。</p>
+              <div class="sparkline" aria-hidden="true">
+                <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+              </div>
+            </article>
+
+            <article class="feature-card reveal">
+              <div class="feature-index">04</div>
+              <div class="feature-icon icon-recovery"><span>↻</span></div>
+              <h3>自动恢复</h3>
+              <p>持续感知 Agent 状态，在离线时通过 SSH 执行检查、启动或重启，并以冷却机制抑制重复恢复。</p>
+              <div class="status-line"><span></span>Recovery policy active</div>
+            </article>
+
+            <article class="feature-card reveal">
+              <div class="feature-index">05</div>
+              <div class="feature-icon icon-backup"><span></span><i></i></div>
+              <h3>备份与恢复</h3>
+              <p>支持备份策略、批量任务、物理恢复、时间点恢复与数据闪回，让恢复路径预先可见。</p>
+              <div class="progress-bar"><span></span></div>
+            </article>
+
+            <article class="feature-card feature-card-wide reveal">
+              <div class="feature-index">06</div>
+              <div class="feature-icon icon-change"><span></span><i></i><b></b></div>
+              <h3>变更治理</h3>
+              <p>将在线 DDL、滚动升级、参数导出、数据库巡检与告警管理沉淀为可追踪任务，降低人工操作的不确定性。</p>
+              <div class="change-flow" aria-hidden="true">
+                <span>PLAN</span><i>→</i><span>CHECK</span><i>→</i><span>EXECUTE</span><i>→</i
+                ><span>VERIFY</span>
+              </div>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="section architecture" id="architecture">
+        <div class="shell architecture-grid">
+          <div class="architecture-copy reveal">
+            <span class="kicker">03 · Architecture</span>
+            <h2>控制面集中，<br />执行面贴近实例。</h2>
+            <p>
+              Manager 负责任务编排、状态管理与 Web 控制台；Agent 部署在受管主机，贴近 MySQL 执行采集与变更。两者通过多种通道协同，在可达性与实时性之间取得平衡。
+            </p>
+            <ul class="architecture-list">
+              <li>
+                <span>01</span>
+                <div><strong>gRPC 双向流</strong><small>承载低延迟心跳与动态采集配置</small></div>
+              </li>
+              <li>
+                <span>02</span>
+                <div><strong>WebSocket 任务通道</strong><small>执行过程持续回传，状态实时可见</small></div>
+              </li>
+              <li>
+                <span>03</span>
+                <div><strong>SSH 兜底恢复</strong><small>用于主机纳管、Agent 部署与离线恢复</small></div>
+              </li>
+            </ul>
+          </div>
+
+          <div class="architecture-map reveal" aria-label="GMHA 系统架构示意图">
+            <div class="map-label">CONTROL PLANE</div>
+            <div class="manager-node">
+              <div class="node-title">
+                <img src="/gmha-mark.svg" alt="" width="34" height="34" />
+                <div><strong>GMHA Manager</strong><span>HTTP API · Task Orchestration</span></div>
+                <i></i>
+              </div>
+              <div class="manager-modules">
+                <span>Web Console</span><span>HA Engine</span><span>Task Center</span>
+              </div>
+            </div>
+            <div class="connection-bus">
+              <span>gRPC</span><span>WebSocket</span><span>SSH</span>
+            </div>
+            <div class="agents">
+              <div class="agent-node">
+                <div class="agent-head"><span>A</span><strong>Agent 01</strong><i></i></div>
+                <small>PRIMARY</small>
+                <div class="agent-db">MySQL 8.0</div>
+              </div>
+              <div class="agent-node">
+                <div class="agent-head"><span>A</span><strong>Agent 02</strong><i></i></div>
+                <small>REPLICA</small>
+                <div class="agent-db">MySQL 8.0</div>
+              </div>
+              <div class="agent-node">
+                <div class="agent-head"><span>A</span><strong>Agent 03</strong><i></i></div>
+                <small>REPLICA</small>
+                <div class="agent-db">MySQL 5.7</div>
+              </div>
+            </div>
+            <div class="map-caption">
+              <span>MANAGED NODES</span>
+              <small>配置、监控与执行在一张拓扑上汇合</small>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section workflow">
+        <div class="shell">
+          <div class="section-heading compact reveal">
+            <div>
+              <span class="kicker">04 · One workflow</span>
+              <h2>从发现问题，到安全闭环。</h2>
+            </div>
+          </div>
+          <div class="workflow-line">
+            <article class="workflow-step reveal">
+              <span>01</span>
+              <div class="workflow-icon">⌁</div>
+              <h3>持续感知</h3>
+              <p>采集心跳、主机与 MySQL 指标，汇聚集群运行状态。</p>
+            </article>
+            <article class="workflow-step reveal">
+              <span>02</span>
+              <div class="workflow-icon">◎</div>
+              <h3>定位风险</h3>
+              <p>结合告警、SQL 诊断与拓扑状态发现异常影响面。</p>
+            </article>
+            <article class="workflow-step reveal">
+              <span>03</span>
+              <div class="workflow-icon">⌘</div>
+              <h3>编排执行</h3>
+              <p>将操作拆成任务与步骤，在 Agent 端安全执行。</p>
+            </article>
+            <article class="workflow-step reveal">
+              <span>04</span>
+              <div class="workflow-icon">✓</div>
+              <h3>验证恢复</h3>
+              <p>追踪每一步结果，确认服务与复制链路恢复健康。</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="section scenarios" id="scenarios">
+        <div class="shell">
+          <div class="section-heading reveal">
+            <div>
+              <span class="kicker">05 · Built for operations</span>
+              <h2>面向真正发生的<br />数据库运维现场。</h2>
+            </div>
+            <p>GMHA 既能作为轻量的单点管理入口，也能承载多主机、多集群环境中的标准化运维流程。</p>
+          </div>
+          <div class="scenario-grid">
+            <article class="scenario-card reveal">
+              <div class="scenario-number">A</div>
+              <div>
+                <h3>多环境统一纳管</h3>
+                <p>将分散主机与实例组织为清晰集群，统一凭据、Agent、状态与任务视图。</p>
+              </div>
+              <span class="scenario-arrow">↗</span>
+            </article>
+            <article class="scenario-card reveal">
+              <div class="scenario-number">B</div>
+              <div>
+                <h3>故障快速处置</h3>
+                <p>在心跳异常后串联检查、恢复、候选评估、流量漂移与旧主隔离。</p>
+              </div>
+              <span class="scenario-arrow">↗</span>
+            </article>
+            <article class="scenario-card reveal">
+              <div class="scenario-number">C</div>
+              <div>
+                <h3>变更风险收敛</h3>
+                <p>把升级、DDL、参数调整和备份恢复放入可观察、可验证的任务流程。</p>
+              </div>
+              <span class="scenario-arrow">↗</span>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="section start" id="start">
+        <div class="shell">
+          <div class="start-panel reveal">
+            <div class="start-grid"></div>
+            <div class="start-copy">
+              <span class="kicker">OPEN SOURCE · BUILT WITH GO</span>
+              <h2>让 MySQL 高可用，<br />从可控开始。</h2>
+              <p>查看项目源码、架构说明与部署方式，开始了解 GMHA。</p>
+            </div>
+            <a
+              class="button button-light"
+              href="https://github.com/wy3306/GMHA-MySQL"
+              target="_blank"
+              rel="noreferrer"
+            >
+              前往 GitHub
+              <span aria-hidden="true">↗</span>
+            </a>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="shell footer-inner">
+        <div class="footer-brand">
+          <img src="/gmha-mark.svg" alt="" width="28" height="28" />
+          <div><strong>GMHA</strong><span>Go MySQL High Availability</span></div>
+        </div>
+        <p>为稳定、清晰、可追踪的 MySQL 运维而构建。</p>
+        <div class="footer-links">
+          <a href="#capabilities">核心能力</a>
+          <a href="#architecture">架构</a>
+          <a href="https://github.com/wy3306/GMHA-MySQL" target="_blank" rel="noreferrer"
+            >GitHub</a
+          >
+        </div>
+      </div>
+    </footer>
+
+    <script src="/script.js" defer></script>
+  </body>
+</html>

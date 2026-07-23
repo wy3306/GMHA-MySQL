@@ -75,6 +75,7 @@ type AccountInitItemResult struct {
 type AccountInitializer struct {
 	Socket       string
 	RootPassword string
+	Version      string
 	Timeout      time.Duration
 }
 
@@ -95,7 +96,7 @@ func DefaultAccountSpecs() []AccountSpec {
 
 // AvailablePrivileges 返回 Web 可选择的受控 MySQL 权限白名单，避免任意 SQL 权限拼接。
 func AvailablePrivileges() []string {
-	return []string{"SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "CREATE USER", "ALTER", "DROP", "SHOW VIEW", "TRIGGER", "EVENT", "PROCESS", "RELOAD", "LOCK TABLES", "REPLICATION CLIENT", "REPLICATION SLAVE", "CONNECTION_ADMIN", "SYSTEM_VARIABLES_ADMIN", "REPLICATION_SLAVE_ADMIN", "BACKUP_ADMIN", "CLONE_ADMIN"}
+	return []string{"SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "CREATE USER", "ALTER", "DROP", "SHOW VIEW", "TRIGGER", "EVENT", "PROCESS", "RELOAD", "LOCK TABLES", "REPLICATION CLIENT", "REPLICATION SLAVE", "SUPER", "CONNECTION_ADMIN", "SYSTEM_VARIABLES_ADMIN", "REPLICATION_SLAVE_ADMIN", "BACKUP_ADMIN", "CLONE_ADMIN"}
 }
 
 // DefaultPrivileges 返回各预设角色的默认授权集合。
@@ -310,7 +311,7 @@ func (i AccountInitializer) initializeOne(ctx context.Context, db *sql.DB, spec 
 		item.ExecutedSteps = append(item.ExecutedSteps, "skipped")
 		return item
 	}
-	steps := accountSQLSteps(spec)
+	steps := accountSQLStepsForVersion(spec, i.Version)
 	for _, step := range steps {
 		execCtx, cancel := context.WithTimeout(ctx, i.timeout())
 		_, err := db.ExecContext(execCtx, step.SQL)
@@ -363,18 +364,39 @@ type accountSQLStep struct {
 
 // accountSQLSteps 根据账号规格生成完整的 SQL 步骤列表，包括创建用户、修改密码、授权等。
 func accountSQLSteps(spec AccountSpec) []accountSQLStep {
+	return accountSQLStepsForVersion(spec, "8.0.35")
+}
+
+func accountSQLStepsForVersion(spec AccountSpec, version string) []accountSQLStep {
 	user := accountIdent(spec.Username, spec.Host)
 	steps := []accountSQLStep{
 		{Name: "create_user", SQL: fmt.Sprintf("CREATE USER IF NOT EXISTS %s IDENTIFIED BY %s", user, sqlString(spec.Password))},
 		{Name: "alter_user", SQL: fmt.Sprintf("ALTER USER %s IDENTIFIED BY %s", user, sqlString(spec.Password))},
 	}
-	steps = append(steps, accountSQLStep{Name: "grant_base", SQL: grantSQL(spec, basePrivileges(spec))})
-	if dynamic := dynamicPrivileges(spec); len(dynamic) > 0 {
+	base := basePrivileges(spec)
+	capabilities, _ := CapabilitiesForVersion(version)
+	legacyAdmin := !capabilities.SupportsDynamicPrivileges
+	if legacyAdmin && normalizeRole(spec.Role) == AccountRoleMHA && !containsPrivilege(base, "SUPER") {
+		base = append(base, "SUPER")
+	}
+	if len(base) > 0 {
+		steps = append(steps, accountSQLStep{Name: "grant_base", SQL: grantSQL(spec, base)})
+	}
+	if dynamic := dynamicPrivilegesForVersion(spec, version); len(dynamic) > 0 {
 		// MySQL 8.0 dynamic privileges vary by distribution/edition. Keep this as
 		// a separate step so failures clearly point to privilege compatibility.
 		steps = append(steps, accountSQLStep{Name: "grant_dynamic", SQL: grantSQL(spec, dynamic)})
 	}
 	return append(steps, accountSQLStep{Name: "flush_privileges", SQL: "FLUSH PRIVILEGES"})
+}
+
+func containsPrivilege(items []string, wanted string) bool {
+	for _, item := range items {
+		if strings.EqualFold(strings.TrimSpace(item), wanted) {
+			return true
+		}
+	}
+	return false
 }
 
 // basePrivileges 根据账号角色返回基础权限列表，不同角色拥有不同的数据库操作权限。
@@ -392,9 +414,20 @@ func dynamicPrivileges(spec AccountSpec) []string {
 	}
 	privileges := DefaultPrivileges(spec.Role)
 	if spec.Role == AccountRoleBackup && spec.ExtendedBackup {
-		privileges = append(privileges, "BACKUP_ADMIN", "CLONE_ADMIN")
+		privileges = append(privileges, "BACKUP_ADMIN")
 	}
 	return filterDynamicPrivileges(privileges)
+}
+
+func dynamicPrivilegesForVersion(spec AccountSpec, version string) []string {
+	items := dynamicPrivileges(spec)
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if SupportsDynamicPrivilegeForVersion(version, item) {
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 func normalizePrivileges(items []string) []string {

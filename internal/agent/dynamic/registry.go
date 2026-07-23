@@ -51,6 +51,8 @@ func (r *CollectorRegistry) Create(name string) (DynamicCollector, error) {
 func RegisterBuiltinCollectors(reg *CollectorRegistry, mysqlConfigPath string) {
 	reg.Register("cpu_usage_percent", func() DynamicCollector { return NewCPUCollector() })
 	reg.Register("mem_usage_percent", func() DynamicCollector { return builtinFunc("mem_usage_percent", "host", collectMemUsage) })
+	reg.Register("host_memory_detail", func() DynamicCollector { return builtinFunc("host_memory_detail", "memory", collectHostMemoryDetail) })
+	reg.Register("swap_usage", func() DynamicCollector { return builtinFunc("swap_usage", "host", collectSwapUsage) })
 	reg.Register("agent_cpu_usage_percent", func() DynamicCollector { return NewAgentCPUCollector() })
 	reg.Register("agent_memory_rss_mb", func() DynamicCollector { return builtinFunc("agent_memory_rss_mb", "agent", collectAgentRSS) })
 	reg.Register("io_status", func() DynamicCollector { return NewIOCollector() })

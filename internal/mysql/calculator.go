@@ -17,6 +17,9 @@ var mysqlDecimalPattern = regexp.MustCompile(`^[0-9]+(?:\.[0-9]+)?$`)
 // ConfigVars 定义 MySQL 实例的完整配置参数，包括内存分配、连接数、日志、InnoDB 等各项配置。
 type ConfigVars struct {
 	VersionSpecificOptions []MySQLConfigOption
+	Legacy57               bool
+	LegacyReplicationNames bool
+	LegacyRedoLog          bool
 	ServerID               int
 	Port                   int
 	MySQLUser              string
@@ -56,6 +59,7 @@ type ConfigVars struct {
 	BinlogFormat           string
 	SyncBinlog             int
 	BinlogExpireSeconds    int
+	BinlogExpireDays       int
 	BinlogRowsQueryEvents  int
 	LogReplicaUpdates      int
 	GTIDMode               string
@@ -82,6 +86,8 @@ type ConfigVars struct {
 	MaxConnections         int
 	RedoLogCapacity        string
 	RedoLogCapacityBytes   int64
+	InnodbLogFileSize      string
+	InnodbLogFilesInGroup  int
 	TableOpenCache         int
 	ThreadCacheSize        int
 	SortBufferSize         string
@@ -272,6 +278,7 @@ func (c *Calculator) Calculate(info collectdomain.MachineInfo, profile Profile, 
 		MaxConnections:         maxConnections,
 		RedoLogCapacity:        bytesToMySQLSize(redoLogBytes),
 		RedoLogCapacityBytes:   redoLogBytes,
+		InnodbLogFilesInGroup:  2,
 		TableOpenCache:         profile.TableOpenCache,
 		ThreadCacheSize:        profile.ThreadCacheSize,
 		SortBufferSize:         bytesToMySQLSize(sortBuffer),
@@ -314,7 +321,7 @@ func NormalizeConfigInput(input ConfigInput) ConfigInput {
 		input.TmpDir = input.InstanceDir + "/tmp"
 	}
 	if strings.TrimSpace(input.BaseDir) == "" {
-		input.BaseDir = "/usr/local/mysql"
+		input.BaseDir = fmt.Sprintf("/usr/local/mysql-%d", input.Port)
 	}
 	if strings.TrimSpace(input.MyCnfPath) == "" {
 		input.MyCnfPath = input.InstanceDir + "/my.cnf"

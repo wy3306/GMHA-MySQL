@@ -2,7 +2,9 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"time"
 
 	alertdomain "gmha/internal/domain/alert"
@@ -43,7 +45,7 @@ func (r *AlertRepository) Migrate() error {
 		create index if not exists idx_alert_event_time on alert_event(last_seen_at desc);
 		create table if not exists alert_evaluation_state (
 			fingerprint text primary key, rule_id text not null, consecutive integer not null default 0,
-			last_value real not null default 0, updated_at text not null
+			last_value real not null default 0, last_sample_at text not null default '', updated_at text not null
 		);
 		create table if not exists alert_channel (
 			id text primary key, name text not null, type text not null, enabled integer not null default 1,
@@ -57,12 +59,19 @@ func (r *AlertRepository) Migrate() error {
 			status text not null, error text not null default '', delivered_at text not null
 		);
 		create index if not exists idx_alert_delivery_time on alert_delivery(delivered_at desc);
+		create table if not exists alert_notification_outbox (
+			id text primary key, event_json text not null, status text not null default 'pending',
+			attempt_count integer not null default 0, last_error text not null default '',
+			created_at text not null, updated_at text not null
+		);
+		create index if not exists idx_alert_notification_pending on alert_notification_outbox(status, updated_at);
 		create table if not exists alert_metric_config (kind text primary key, config_json text not null, updated_at text not null);
 	`)
 	if err != nil {
 		return err
 	}
 	_, _ = r.db.Exec(`alter table alert_rule add column thresholds_json text not null default '[]'`)
+	_, _ = r.db.Exec(`alter table alert_evaluation_state add column last_sample_at text not null default ''`)
 	return nil
 }
 
@@ -99,8 +108,8 @@ func (r *AlertRepository) SaveRule(ctx context.Context, x alertdomain.Rule) erro
 	return err
 }
 func (r *AlertRepository) DeleteRule(ctx context.Context, id string) error {
-	_, err := r.db.ExecContext(ctx, `delete from alert_rule where id=?`, id)
-	return err
+	result, err := r.db.ExecContext(ctx, `delete from alert_rule where id=?`, id)
+	return alertMutationResult(result, err)
 }
 
 func (r *AlertRepository) ListFilters(ctx context.Context) ([]alertdomain.Filter, error) {
@@ -126,8 +135,8 @@ func (r *AlertRepository) SaveFilter(ctx context.Context, x alertdomain.Filter) 
 	return err
 }
 func (r *AlertRepository) DeleteFilter(ctx context.Context, id string) error {
-	_, err := r.db.ExecContext(ctx, `delete from alert_filter where id=?`, id)
-	return err
+	result, err := r.db.ExecContext(ctx, `delete from alert_filter where id=?`, id)
+	return alertMutationResult(result, err)
 }
 
 func (r *AlertRepository) ListEvents(ctx context.Context, f alertdomain.EventFilter) ([]alertdomain.Event, error) {
@@ -146,16 +155,19 @@ func (r *AlertRepository) ListEvents(ctx context.Context, f alertdomain.EventFil
 		args = append(args, f.ClusterID)
 	}
 	if f.Keyword != "" {
-		query += " and (rule_name like ? or metric like ? or machine_id like ?)"
+		query += " and (rule_name like ? or metric like ? or machine_id like ? or agent_id like ? or cluster_id like ? or labels_json like ?)"
 		q := "%" + f.Keyword + "%"
-		args = append(args, q, q, q)
+		args = append(args, q, q, q, q, q, q)
 	}
 	query += " order by last_seen_at desc"
 	if f.Limit <= 0 || f.Limit > 1000 {
 		f.Limit = 200
 	}
-	query += " limit ?"
-	args = append(args, f.Limit)
+	if f.Offset < 0 {
+		f.Offset = 0
+	}
+	query += " limit ? offset ?"
+	args = append(args, f.Limit, f.Offset)
 	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -202,45 +214,84 @@ func (r *AlertRepository) GetActiveEvent(ctx context.Context, fp string) (alertd
 	}
 	return x, true, nil
 }
+func (r *AlertRepository) ListActiveEventsForRuleTarget(ctx context.Context, ruleID, machineID string) ([]alertdomain.Event, error) {
+	rows, err := r.db.QueryContext(ctx, `select id,fingerprint,rule_id,rule_name,metric,machine_id,agent_id,cluster_id,labels_json,severity,status,value,threshold,operator,occurrence_count,notification_count,first_seen_at,last_seen_at,last_notified_at,resolved_at,acknowledged_at,acknowledged_by,silenced_until,automation_state from alert_event where rule_id=? and machine_id=? and status='firing' order by last_seen_at desc`, ruleID, machineID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]alertdomain.Event, 0)
+	for rows.Next() {
+		x, err := scanAlertEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, x)
+	}
+	return out, rows.Err()
+}
 func (r *AlertRepository) SaveEvent(ctx context.Context, x alertdomain.Event) error {
 	labels, _ := json.Marshal(x.Labels)
-	_, err := r.db.ExecContext(ctx, `insert into alert_event(id,fingerprint,rule_id,rule_name,metric,machine_id,agent_id,cluster_id,labels_json,severity,status,value,threshold,operator,occurrence_count,notification_count,first_seen_at,last_seen_at,last_notified_at,resolved_at,acknowledged_at,acknowledged_by,silenced_until,automation_state) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) on conflict(id) do update set cluster_id=excluded.cluster_id,labels_json=excluded.labels_json,severity=excluded.severity,status=excluded.status,value=excluded.value,threshold=excluded.threshold,operator=excluded.operator,occurrence_count=excluded.occurrence_count,notification_count=excluded.notification_count,last_seen_at=excluded.last_seen_at,last_notified_at=excluded.last_notified_at,resolved_at=excluded.resolved_at,acknowledged_at=excluded.acknowledged_at,acknowledged_by=excluded.acknowledged_by,silenced_until=excluded.silenced_until,automation_state=excluded.automation_state`, x.ID, x.Fingerprint, x.RuleID, x.RuleName, x.Metric, x.MachineID, x.AgentID, x.ClusterID, string(labels), string(x.Severity), x.Status, x.Value, x.Threshold, x.Operator, x.OccurrenceCount, x.NotificationCount, x.FirstSeenAt.Format(time.RFC3339Nano), x.LastSeenAt.Format(time.RFC3339Nano), formatAlertTime(x.LastNotifiedAt), formatAlertTime(x.ResolvedAt), formatAlertTime(x.AcknowledgedAt), x.AcknowledgedBy, formatAlertTime(x.SilencedUntil), x.AutomationState)
+	_, err := r.db.ExecContext(ctx, `insert into alert_event(id,fingerprint,rule_id,rule_name,metric,machine_id,agent_id,cluster_id,labels_json,severity,status,value,threshold,operator,occurrence_count,notification_count,first_seen_at,last_seen_at,last_notified_at,resolved_at,acknowledged_at,acknowledged_by,silenced_until,automation_state) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) on conflict(id) do update set fingerprint=excluded.fingerprint,cluster_id=excluded.cluster_id,labels_json=excluded.labels_json,severity=excluded.severity,status=excluded.status,value=excluded.value,threshold=excluded.threshold,operator=excluded.operator,occurrence_count=excluded.occurrence_count,notification_count=excluded.notification_count,last_seen_at=excluded.last_seen_at,last_notified_at=excluded.last_notified_at,resolved_at=excluded.resolved_at,acknowledged_at=excluded.acknowledged_at,acknowledged_by=excluded.acknowledged_by,silenced_until=excluded.silenced_until,automation_state=excluded.automation_state`, x.ID, x.Fingerprint, x.RuleID, x.RuleName, x.Metric, x.MachineID, x.AgentID, x.ClusterID, string(labels), string(x.Severity), x.Status, x.Value, x.Threshold, x.Operator, x.OccurrenceCount, x.NotificationCount, x.FirstSeenAt.Format(time.RFC3339Nano), x.LastSeenAt.Format(time.RFC3339Nano), formatAlertTime(x.LastNotifiedAt), formatAlertTime(x.ResolvedAt), formatAlertTime(x.AcknowledgedAt), x.AcknowledgedBy, formatAlertTime(x.SilencedUntil), x.AutomationState)
 	return err
 }
 func (r *AlertRepository) UpdateEventAction(ctx context.Context, id, action, actor string, until *time.Time) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	switch action {
 	case "acknowledge":
-		_, err := r.db.ExecContext(ctx, `update alert_event set acknowledged_at=?,acknowledged_by=? where id=?`, now, actor, id)
-		return err
+		result, err := r.db.ExecContext(ctx, `update alert_event set acknowledged_at=?,acknowledged_by=? where id=?`, now, actor, id)
+		return alertMutationResult(result, err)
 	case "silence":
-		_, err := r.db.ExecContext(ctx, `update alert_event set silenced_until=? where id=?`, formatAlertTime(until), id)
-		return err
+		result, err := r.db.ExecContext(ctx, `update alert_event set silenced_until=? where id=?`, formatAlertTime(until), id)
+		return alertMutationResult(result, err)
 	case "resolve":
-		_, err := r.db.ExecContext(ctx, `update alert_event set status='resolved',resolved_at=? where id=?`, now, id)
+		result, err := r.db.ExecContext(ctx, `update alert_event set status='resolved',resolved_at=? where id=?`, now, id)
+		return alertMutationResult(result, err)
+	}
+	return errors.New("invalid alert event action")
+}
+func (r *AlertRepository) UpdateAutomationState(ctx context.Context, id, state, expectedState string) error {
+	query := `update alert_event set automation_state=? where id=?`
+	args := []any{state, id}
+	if expectedState != "" {
+		query += ` and automation_state=?`
+		args = append(args, expectedState)
+	}
+	result, err := r.db.ExecContext(ctx, query, args...)
+	if err != nil {
 		return err
 	}
-	return nil
-}
-func (r *AlertRepository) UpdateAutomationState(ctx context.Context, id, state string) error {
-	_, err := r.db.ExecContext(ctx, `update alert_event set automation_state=? where id=?`, state, id)
-	return err
+	affected, err := result.RowsAffected()
+	if err != nil || affected > 0 {
+		return err
+	}
+	var current string
+	if err := r.db.QueryRowContext(ctx, `select automation_state from alert_event where id=?`, id).Scan(&current); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return alertdomain.ErrNotFound
+		}
+		return err
+	}
+	if current == state || expectedState == "" {
+		return nil
+	}
+	return alertdomain.ErrConflict
 }
 func (r *AlertRepository) GetEvaluationState(ctx context.Context, fp string) (alertdomain.EvaluationState, bool, error) {
 	var x alertdomain.EvaluationState
-	var updated string
-	err := r.db.QueryRowContext(ctx, `select fingerprint,rule_id,consecutive,last_value,updated_at from alert_evaluation_state where fingerprint=?`, fp).Scan(&x.Fingerprint, &x.RuleID, &x.Consecutive, &x.LastValue, &updated)
+	var sampled, updated string
+	err := r.db.QueryRowContext(ctx, `select fingerprint,rule_id,consecutive,last_value,last_sample_at,updated_at from alert_evaluation_state where fingerprint=?`, fp).Scan(&x.Fingerprint, &x.RuleID, &x.Consecutive, &x.LastValue, &sampled, &updated)
 	if err != nil {
 		if err.Error() == "sql: no rows in result set" {
 			return x, false, nil
 		}
 		return x, false, err
 	}
-	x.UpdatedAt = parseAlertTime(updated)
+	x.LastSampleAt, x.UpdatedAt = parseAlertTime(sampled), parseAlertTime(updated)
 	return x, true, nil
 }
 func (r *AlertRepository) SaveEvaluationState(ctx context.Context, x alertdomain.EvaluationState) error {
-	_, err := r.db.ExecContext(ctx, `insert into alert_evaluation_state(fingerprint,rule_id,consecutive,last_value,updated_at) values(?,?,?,?,?) on conflict(fingerprint) do update set consecutive=excluded.consecutive,last_value=excluded.last_value,updated_at=excluded.updated_at`, x.Fingerprint, x.RuleID, x.Consecutive, x.LastValue, x.UpdatedAt.Format(time.RFC3339Nano))
+	_, err := r.db.ExecContext(ctx, `insert into alert_evaluation_state(fingerprint,rule_id,consecutive,last_value,last_sample_at,updated_at) values(?,?,?,?,?,?) on conflict(fingerprint) do update set consecutive=excluded.consecutive,last_value=excluded.last_value,last_sample_at=excluded.last_sample_at,updated_at=excluded.updated_at`, x.Fingerprint, x.RuleID, x.Consecutive, x.LastValue, formatAlertTimeValue(x.LastSampleAt), x.UpdatedAt.Format(time.RFC3339Nano))
 	return err
 }
 
@@ -272,8 +323,8 @@ func (r *AlertRepository) SaveChannel(ctx context.Context, x alertdomain.Channel
 	return err
 }
 func (r *AlertRepository) DeleteChannel(ctx context.Context, id string) error {
-	_, err := r.db.ExecContext(ctx, `delete from alert_channel where id=?`, id)
-	return err
+	result, err := r.db.ExecContext(ctx, `delete from alert_channel where id=?`, id)
+	return alertMutationResult(result, err)
 }
 func (r *AlertRepository) ListDeliveries(ctx context.Context, limit int) ([]alertdomain.Delivery, error) {
 	if limit <= 0 || limit > 1000 {
@@ -300,6 +351,52 @@ func (r *AlertRepository) SaveDelivery(ctx context.Context, x alertdomain.Delive
 	_, err := r.db.ExecContext(ctx, `insert into alert_delivery(id,event_id,rule_name,severity,machine_id,channel_id,channel_name,channel_type,status,error,delivered_at) values(?,?,?,?,?,?,?,?,?,?,?)`, x.ID, x.EventID, x.RuleName, string(x.Severity), x.MachineID, x.ChannelID, x.ChannelName, x.ChannelType, x.Status, x.Error, x.DeliveredAt.Format(time.RFC3339Nano))
 	return err
 }
+func (r *AlertRepository) SaveNotificationJob(ctx context.Context, job alertdomain.NotificationJob) error {
+	eventJSON, err := json.Marshal(job.Event)
+	if err != nil {
+		return err
+	}
+	_, err = r.db.ExecContext(ctx, `insert into alert_notification_outbox(id,event_json,status,attempt_count,last_error,created_at,updated_at) values(?,?,'pending',0,'',?,?) on conflict(id) do nothing`,
+		job.ID, string(eventJSON), job.CreatedAt.UTC().Format(time.RFC3339Nano), job.UpdatedAt.UTC().Format(time.RFC3339Nano))
+	return err
+}
+func (r *AlertRepository) ListPendingNotificationJobs(ctx context.Context, before time.Time, limit int) ([]alertdomain.NotificationJob, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	rows, err := r.db.QueryContext(ctx, `select id,event_json,attempt_count,last_error,created_at,updated_at from alert_notification_outbox where status='pending' and updated_at<=? order by updated_at limit ?`, before.UTC().Format(time.RFC3339Nano), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]alertdomain.NotificationJob, 0)
+	for rows.Next() {
+		var job alertdomain.NotificationJob
+		var eventJSON, created, updated string
+		if err := rows.Scan(&job.ID, &eventJSON, &job.Attempts, &job.LastError, &created, &updated); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(eventJSON), &job.Event); err != nil {
+			return nil, err
+		}
+		job.CreatedAt, job.UpdatedAt = parseAlertTime(created), parseAlertTime(updated)
+		out = append(out, job)
+	}
+	return out, rows.Err()
+}
+func (r *AlertRepository) FinishNotificationJob(ctx context.Context, id string, succeeded bool, lastError string, now time.Time) error {
+	if succeeded {
+		result, err := r.db.ExecContext(ctx, `delete from alert_notification_outbox where id=?`, id)
+		return alertMutationResult(result, err)
+	}
+	result, err := r.db.ExecContext(ctx, `update alert_notification_outbox set attempt_count=attempt_count+1,last_error=?,updated_at=? where id=?`, lastError, now.UTC().Format(time.RFC3339Nano), id)
+	return alertMutationResult(result, err)
+}
+func (r *AlertRepository) CountPendingNotificationJobs(ctx context.Context) (int, error) {
+	var count int
+	err := r.db.QueryRowContext(ctx, `select count(*) from alert_notification_outbox where status='pending'`).Scan(&count)
+	return count, err
+}
 func (r *AlertRepository) LoadMetricConfig(ctx context.Context, kind string) (dynamicdomain.DynamicCollectConfig, bool, error) {
 	var raw string
 	err := r.db.QueryRowContext(ctx, `select config_json from alert_metric_config where kind=?`, kind).Scan(&raw)
@@ -323,6 +420,57 @@ func (r *AlertRepository) SaveMetricConfig(ctx context.Context, kind string, cfg
 	_, err = r.db.ExecContext(ctx, `insert into alert_metric_config(kind,config_json,updated_at) values(?,?,?) on conflict(kind) do update set config_json=excluded.config_json,updated_at=excluded.updated_at`, kind, string(raw), time.Now().UTC().Format(time.RFC3339Nano))
 	return err
 }
+
+func (r *AlertRepository) SummarizeEvents(ctx context.Context, now time.Time) (alertdomain.EventSummary, error) {
+	out := alertdomain.EventSummary{Counts: map[string]int{"firing": 0, "resolved": 0, "notice": 0, "warning": 0, "critical": 0, "fatal": 0}}
+	rows, err := r.db.QueryContext(ctx, `select status,severity,count(*) from alert_event group by status,severity`)
+	if err != nil {
+		return out, err
+	}
+	for rows.Next() {
+		var status, severity string
+		var count int
+		if err := rows.Scan(&status, &severity, &count); err != nil {
+			rows.Close()
+			return out, err
+		}
+		out.Counts[status] += count
+		out.Total += count
+		if status == "firing" {
+			out.Counts[severity] += count
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return out, err
+	}
+	if err := rows.Err(); err != nil {
+		return out, err
+	}
+	if err := r.db.QueryRowContext(ctx, `select count(*) from alert_event where status='firing' and acknowledged_at<>''`).Scan(&out.ActiveAcknowledged); err != nil {
+		return out, err
+	}
+	if err := r.db.QueryRowContext(ctx, `select count(*) from alert_event where status='firing' and silenced_until>?`, now.UTC().Format(time.RFC3339Nano)).Scan(&out.ActiveSilenced); err != nil {
+		return out, err
+	}
+	if err := r.db.QueryRowContext(ctx, `select count(*) from alert_event where last_seen_at>=?`, now.UTC().Add(-24*time.Hour).Format(time.RFC3339Nano)).Scan(&out.Last24Hours); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+func alertMutationResult(result sql.Result, err error) error {
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return alertdomain.ErrNotFound
+	}
+	return nil
+}
 func parseAlertTime(v string) time.Time { t, _ := time.Parse(time.RFC3339Nano, v); return t }
 func parseAlertTimePtr(v string) *time.Time {
 	if v == "" {
@@ -333,6 +481,12 @@ func parseAlertTimePtr(v string) *time.Time {
 }
 func formatAlertTime(v *time.Time) string {
 	if v == nil {
+		return ""
+	}
+	return v.UTC().Format(time.RFC3339Nano)
+}
+func formatAlertTimeValue(v time.Time) string {
+	if v.IsZero() {
 		return ""
 	}
 	return v.UTC().Format(time.RFC3339Nano)

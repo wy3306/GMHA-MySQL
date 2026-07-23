@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: http://gmha.weiyaonas.club/sitemap.xml

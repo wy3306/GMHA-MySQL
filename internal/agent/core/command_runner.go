@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -26,24 +27,31 @@ func NewCommandRunner() *CommandRunner {
 
 // RunShell 执行 Shell 命令，优先使用 systemd-run，不可用时回退到进程组执行方式。
 func (r *CommandRunner) RunShell(ctx context.Context, taskID, stepName, command string) (string, error) {
+	return r.RunShellWithOutput(ctx, taskID, stepName, command, nil)
+}
+
+// RunShellWithOutput executes a command and reports complete stdout/stderr
+// lines while it is running. Long workflows such as pt-online-schema-change
+// use this to publish copy percentage without waiting for the process to exit.
+func (r *CommandRunner) RunShellWithOutput(ctx context.Context, taskID, stepName, command string, onOutput func(string)) (string, error) {
 	if r != nil && r.preferSystemd {
-		output, err := r.runWithSystemd(ctx, taskID, stepName, command)
+		output, err := r.runWithSystemd(ctx, taskID, stepName, command, onOutput)
 		if err == nil {
 			return output, nil
 		}
 		// Some older distributions lack systemd-run --pipe/--wait. Fall back to
 		// process-group execution so tasks still work, but keep the real error in
 		// output for diagnostics if the fallback also fails.
-		fallbackOutput, fallbackErr := runShellInProcessGroup(ctx, command)
+		fallbackOutput, fallbackErr := runShellInProcessGroupWithOutput(ctx, command, onOutput)
 		if fallbackErr != nil && strings.TrimSpace(output) != "" {
 			return joinCommandOutput(output, fallbackOutput), fallbackErr
 		}
 		return fallbackOutput, fallbackErr
 	}
-	return runShellInProcessGroup(ctx, command)
+	return runShellInProcessGroupWithOutput(ctx, command, onOutput)
 }
 
-func (r *CommandRunner) runWithSystemd(ctx context.Context, taskID, stepName, command string) (string, error) {
+func (r *CommandRunner) runWithSystemd(ctx context.Context, taskID, stepName, command string, onOutput func(string)) (string, error) {
 	unit := systemdUnitName(taskID, stepName)
 	args := []string{
 		"--quiet",
@@ -60,8 +68,10 @@ func (r *CommandRunner) runWithSystemd(ctx context.Context, taskID, stepName, co
 	cmd := exec.Command("systemd-run", args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	onOutput = serializedOutputCallback(onOutput)
+	stdoutStream, stderrStream := newCommandOutputWriter(&stdout, onOutput), newCommandOutputWriter(&stderr, onOutput)
+	cmd.Stdout = stdoutStream
+	cmd.Stderr = stderrStream
 	if err := cmd.Start(); err != nil {
 		return joinCommandOutput(stdout.String(), stderr.String()), err
 	}
@@ -73,6 +83,8 @@ func (r *CommandRunner) runWithSystemd(ctx context.Context, taskID, stepName, co
 
 	select {
 	case err := <-done:
+		stdoutStream.Flush()
+		stderrStream.Flush()
 		return joinCommandOutput(stdout.String(), stderr.String()), err
 	case <-ctx.Done():
 		_ = exec.Command("systemctl", "kill", "--kill-who=all", unit).Run()
@@ -80,21 +92,31 @@ func (r *CommandRunner) runWithSystemd(ctx context.Context, taskID, stepName, co
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 		select {
 		case err := <-done:
+			stdoutStream.Flush()
+			stderrStream.Flush()
 			return joinCommandOutput(stdout.String(), stderr.String()), err
 		case <-time.After(5 * time.Second):
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 			err := <-done
+			stdoutStream.Flush()
+			stderrStream.Flush()
 			return joinCommandOutput(stdout.String(), stderr.String()), err
 		}
 	}
 }
 
 func runShellInProcessGroup(ctx context.Context, command string) (string, error) {
+	return runShellInProcessGroupWithOutput(ctx, command, nil)
+}
+
+func runShellInProcessGroupWithOutput(ctx context.Context, command string, onOutput func(string)) (string, error) {
 	cmd := exec.Command("sh", "-lc", command)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	onOutput = serializedOutputCallback(onOutput)
+	stdoutStream, stderrStream := newCommandOutputWriter(&stdout, onOutput), newCommandOutputWriter(&stderr, onOutput)
+	cmd.Stdout = stdoutStream
+	cmd.Stderr = stderrStream
 	if err := cmd.Start(); err != nil {
 		return joinCommandOutput(stdout.String(), stderr.String()), err
 	}
@@ -106,17 +128,80 @@ func runShellInProcessGroup(ctx context.Context, command string) (string, error)
 
 	select {
 	case err := <-done:
+		stdoutStream.Flush()
+		stderrStream.Flush()
 		return joinCommandOutput(stdout.String(), stderr.String()), err
 	case <-ctx.Done():
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 		select {
 		case err := <-done:
+			stdoutStream.Flush()
+			stderrStream.Flush()
 			return joinCommandOutput(stdout.String(), stderr.String()), err
 		case <-time.After(5 * time.Second):
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 			err := <-done
+			stdoutStream.Flush()
+			stderrStream.Flush()
 			return joinCommandOutput(stdout.String(), stderr.String()), err
 		}
+	}
+}
+
+type commandOutputWriter struct {
+	target   *bytes.Buffer
+	callback func(string)
+	pending  []byte
+	mu       sync.Mutex
+}
+
+func newCommandOutputWriter(target *bytes.Buffer, callback func(string)) *commandOutputWriter {
+	return &commandOutputWriter{target: target, callback: callback}
+}
+
+func serializedOutputCallback(callback func(string)) func(string) {
+	if callback == nil {
+		return nil
+	}
+	var mu sync.Mutex
+	return func(line string) {
+		mu.Lock()
+		defer mu.Unlock()
+		callback(line)
+	}
+}
+
+func (w *commandOutputWriter) Write(data []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n, err := w.target.Write(data)
+	w.pending = append(w.pending, data...)
+	for {
+		index := bytes.IndexByte(w.pending, '\n')
+		if index < 0 {
+			break
+		}
+		w.emit(w.pending[:index])
+		w.pending = w.pending[index+1:]
+	}
+	return n, err
+}
+
+func (w *commandOutputWriter) Flush() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.pending) > 0 {
+		w.emit(w.pending)
+		w.pending = nil
+	}
+}
+
+func (w *commandOutputWriter) emit(data []byte) {
+	if w.callback == nil {
+		return
+	}
+	if line := strings.TrimSpace(string(data)); line != "" {
+		w.callback(line)
 	}
 }
 

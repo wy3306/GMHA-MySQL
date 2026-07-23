@@ -44,10 +44,15 @@ type ArchitectureAdjustmentRequest struct {
 	RootPassword      string   `json:"root_password,omitempty"`
 	// RootPasswords is used only while executing a combined install/bootstrap
 	// flow. It is keyed by machine ID and is never serialized or persisted.
-	RootPasswords       map[string]string         `json:"-"`
-	ReplicationUser     string                    `json:"replication_user,omitempty"`
-	ReplicationPassword string                    `json:"replication_password,omitempty"`
-	Nodes               []ArchitectureNodeRequest `json:"nodes"`
+	RootPasswords map[string]string `json:"-"`
+	// MaintenanceDetachedMachineIDs keeps selected fenced nodes out of the
+	// post-promotion replication topology. It is intentionally execution-only:
+	// a higher-level maintenance workflow must reattach and verify those nodes
+	// before it can finish.
+	MaintenanceDetachedMachineIDs []string                  `json:"-"`
+	ReplicationUser               string                    `json:"replication_user,omitempty"`
+	ReplicationPassword           string                    `json:"replication_password,omitempty"`
+	Nodes                         []ArchitectureNodeRequest `json:"nodes"`
 }
 
 // ArchitecturePlanStep 是 Manager 必须按顺序执行的安全步骤。

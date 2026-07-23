@@ -2,7 +2,11 @@ package sqlite
 
 import (
 	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
 	"encoding/json"
+	"strings"
 	"time"
 
 	hbdomain "gmha/internal/domain/heartbeat"
@@ -64,6 +68,28 @@ func (r *HeartbeatRepository) Migrate() error {
 		);
 		create index if not exists idx_agent_metric_snapshot_cluster_time on agent_metric_snapshot(cluster_id, collected_at desc);
 		create index if not exists idx_agent_metric_snapshot_machine_time on agent_metric_snapshot(machine_id, collected_at desc);
+		create table if not exists performance_metric_sample (
+			id integer primary key autoincrement,
+			sample_key varchar(128) not null,
+			agent_id varchar(191) not null,
+			machine_id varchar(191) not null,
+			cluster_id varchar(191) not null default '',
+			scope varchar(32) not null,
+			category varchar(64) not null default '',
+			metric_name varchar(191) not null,
+			instance varchar(191) not null default '',
+			labels_json text not null default '{}',
+			value_type varchar(32) not null default '',
+			numeric_value real,
+			value_json text not null default 'null',
+			success integer not null default 1,
+			error text not null default '',
+			collected_at varchar(64) not null
+		);
+		create unique index if not exists idx_performance_metric_sample_key on performance_metric_sample(sample_key);
+		create index if not exists idx_performance_metric_cluster_name_time on performance_metric_sample(cluster_id, metric_name, collected_at desc);
+		create index if not exists idx_performance_metric_machine_name_time on performance_metric_sample(machine_id, metric_name, collected_at desc);
+		create index if not exists idx_performance_metric_instance_name_time on performance_metric_sample(instance, metric_name, collected_at desc);
 	`)
 	_, _ = r.db.Exec(`alter table agent_latest_status add column metrics_json text not null default '[]'`)
 	return err
@@ -88,9 +114,128 @@ func (r *HeartbeatRepository) AppendMetricSnapshot(ctx context.Context, item hbd
 		return err
 	}
 	if id, idErr := result.LastInsertId(); idErr == nil && id%128 == 0 {
-		_, _ = r.db.ExecContext(ctx, `delete from agent_metric_snapshot where collected_at < ?`, time.Now().UTC().Add(-7*24*time.Hour).Format(time.RFC3339Nano))
+		cutoff := time.Now().UTC().Add(-7 * 24 * time.Hour).Format(time.RFC3339Nano)
+		_, _ = r.db.ExecContext(ctx, `delete from agent_metric_snapshot where collected_at < ?`, cutoff)
+		_, _ = r.db.ExecContext(ctx, `delete from performance_metric_sample where collected_at < ?`, cutoff)
 	}
 	return nil
+}
+
+func (r *HeartbeatRepository) AppendMetricSamples(ctx context.Context, items []hbdomain.MetricSample) error {
+	if len(items) == 0 {
+		return nil
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, item := range items {
+		labelsJSON, marshalErr := json.Marshal(item.Labels)
+		if marshalErr != nil {
+			return marshalErr
+		}
+		valueJSON, marshalErr := json.Marshal(item.Value)
+		if marshalErr != nil {
+			return marshalErr
+		}
+		var numeric any
+		if item.NumericValue != nil {
+			numeric = *item.NumericValue
+		}
+		if _, err := tx.ExecContext(ctx, `
+			insert into performance_metric_sample (
+				sample_key, agent_id, machine_id, cluster_id, scope, category,
+				metric_name, instance, labels_json, value_type, numeric_value,
+				value_json, success, error, collected_at
+			) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			on conflict(sample_key) do nothing
+		`, metricSampleKey(item, string(labelsJSON)), item.AgentID, item.MachineID, item.ClusterID,
+			item.Scope, item.Category, item.MetricName, item.Instance, string(labelsJSON),
+			item.ValueType, numeric, string(valueJSON), boolInteger(item.Success), item.Error,
+			item.CollectedAt.UTC().Format(time.RFC3339Nano)); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (r *HeartbeatRepository) ListMetricSamples(ctx context.Context, query hbdomain.MetricSampleQuery) ([]hbdomain.MetricSample, error) {
+	limit := query.Limit
+	if limit <= 0 || limit > 200000 {
+		limit = 50000
+	}
+	var sqlText strings.Builder
+	sqlText.WriteString(`
+		select id, agent_id, machine_id, cluster_id, scope, category, metric_name,
+			instance, labels_json, value_type, numeric_value, value_json, success,
+			error, collected_at
+		from performance_metric_sample
+		where cluster_id = ? and metric_name = ? and collected_at >= ? and collected_at <= ?
+	`)
+	args := []any{query.ClusterID, query.Metric, query.StartAt.UTC().Format(time.RFC3339Nano), query.EndAt.UTC().Format(time.RFC3339Nano)}
+	if query.MachineID != "" {
+		sqlText.WriteString(" and machine_id = ?")
+		args = append(args, query.MachineID)
+	}
+	if query.Instance != "" {
+		sqlText.WriteString(" and instance = ?")
+		args = append(args, query.Instance)
+	}
+	sqlText.WriteString(" order by collected_at asc limit ?")
+	args = append(args, limit)
+	rows, err := r.db.QueryContext(ctx, sqlText.String(), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]hbdomain.MetricSample, 0)
+	for rows.Next() {
+		var item hbdomain.MetricSample
+		var labelsJSON, valueJSON, collectedAt string
+		var numeric sql.NullFloat64
+		var success int
+		if err := rows.Scan(&item.ID, &item.AgentID, &item.MachineID, &item.ClusterID,
+			&item.Scope, &item.Category, &item.MetricName, &item.Instance, &labelsJSON,
+			&item.ValueType, &numeric, &valueJSON, &success, &item.Error, &collectedAt); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal([]byte(labelsJSON), &item.Labels)
+		_ = json.Unmarshal([]byte(valueJSON), &item.Value)
+		if numeric.Valid {
+			value := numeric.Float64
+			item.NumericValue = &value
+		}
+		item.Success = success != 0
+		item.CollectedAt, _ = time.Parse(time.RFC3339Nano, collectedAt)
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func metricSampleKey(item hbdomain.MetricSample, labelsJSON string) string {
+	// Heartbeats can repeat a collector's most recent value until its own
+	// interval elapses. A stable content identity makes persistence idempotent
+	// without treating two genuinely distinct collection times as duplicates.
+	source := strings.Join([]string{
+		item.AgentID,
+		item.MachineID,
+		item.ClusterID,
+		item.MetricName,
+		item.Instance,
+		item.ValueType,
+		labelsJSON,
+		item.CollectedAt.UTC().Format(time.RFC3339Nano),
+	}, "\x00")
+	sum := sha256.Sum256([]byte(source))
+	return hex.EncodeToString(sum[:])
+}
+
+func boolInteger(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func (r *HeartbeatRepository) ListMetricSnapshots(ctx context.Context, clusterID string, since time.Time, limit int) ([]hbdomain.MetricSnapshot, error) {
@@ -103,6 +248,38 @@ func (r *HeartbeatRepository) ListMetricSnapshots(ctx context.Context, clusterID
 		where cluster_id = ? and collected_at >= ?
 		order by collected_at asc limit ?
 	`, clusterID, since.UTC().Format(time.RFC3339Nano), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]hbdomain.MetricSnapshot, 0)
+	for rows.Next() {
+		var item hbdomain.MetricSnapshot
+		var metricsJSON, collectedAt string
+		if err := rows.Scan(&item.ID, &item.AgentID, &item.MachineID, &item.ClusterID, &metricsJSON, &collectedAt); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal([]byte(metricsJSON), &item.Metrics)
+		item.CollectedAt, _ = time.Parse(time.RFC3339Nano, collectedAt)
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (r *HeartbeatRepository) ListMetricSnapshotsRange(ctx context.Context, clusterID string, start, end time.Time, limit int) ([]hbdomain.MetricSnapshot, error) {
+	if limit <= 0 || limit > 20000 {
+		limit = 10000
+	}
+	rows, err := r.db.QueryContext(ctx, `
+		select id, agent_id, machine_id, cluster_id, metrics_json, collected_at
+		from (
+			select id, agent_id, machine_id, cluster_id, metrics_json, collected_at
+			from agent_metric_snapshot
+			where cluster_id = ? and collected_at >= ? and collected_at <= ?
+			order by collected_at desc limit ?
+		)
+		order by collected_at asc
+	`, clusterID, start.UTC().Format(time.RFC3339Nano), end.UTC().Format(time.RFC3339Nano), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -228,6 +405,9 @@ func (r *HeartbeatRepository) DeleteByMachineID(ctx context.Context, machineID s
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `delete from agent_metric_snapshot where machine_id = ?`, machineID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `delete from performance_metric_sample where machine_id = ?`, machineID); err != nil {
 		return err
 	}
 	return tx.Commit()

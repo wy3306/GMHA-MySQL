@@ -124,6 +124,7 @@ func (s *HAService) executeClusterBootstrap(ctx context.Context, parentID, clust
 	_ = s.tasks.UpdateClusterBootstrapStep(ctx, parentID, "create_install_tasks", taskdomain.StepRunning, "正在为每台目标机器创建独立安装任务。", nil)
 	installTaskIDs := make([]string, 0, len(req.Installs))
 	for _, item := range req.Installs {
+		runtimeParameters := clusterBootstrapRuntimeParameters(req, item)
 		detail, err := s.tasks.CreateMySQLInstallTask(ctx, taskusecase.CreateMySQLInstallTaskRequest{
 			ParentTaskID: parentID,
 			Machine:      item.Machine, Version: item.Version, Architecture: item.Architecture, Port: item.Port, ServerID: item.ServerID,
@@ -132,7 +133,7 @@ func (s *HAService) executeClusterBootstrap(ctx context.Context, parentID, clust
 			BaseDir: item.BaseDir, MyCnfPath: item.MyCnfPath, SocketPath: item.SocketPath, ErrorLog: item.ErrorLog, PIDFile: item.PIDFile,
 			CharacterSetsDir: item.CharacterSetsDir, PluginDir: item.PluginDir, InstallPTTools: item.InstallPTTools,
 			InstallXtraBackup: item.InstallXtraBackup, MemoryAllocator: item.MemoryAllocator,
-			RuntimeParameters: item.RuntimeParameters, Accounts: item.Accounts,
+			RuntimeParameters: runtimeParameters, Accounts: item.Accounts,
 		})
 		if err != nil {
 			fail("create_install_tasks", fmt.Errorf("create install task for %s: %w", item.Machine, err))
@@ -193,6 +194,27 @@ func (s *HAService) executeClusterBootstrap(ctx context.Context, parentID, clust
 	_ = s.tasks.UpdateClusterBootstrapStep(ctx, parentID, "apply_architecture", taskdomain.StepSuccess, "主从复制架构已应用。", []string{run.RunID})
 	_ = s.tasks.UpdateClusterBootstrapStep(ctx, parentID, "verify", taskdomain.StepRunning, "正在复核拓扑和 VIP 状态。", []string{run.RunID})
 	_ = s.tasks.UpdateClusterBootstrapStep(ctx, parentID, "verify", taskdomain.StepSuccess, "批量安装、复制拓扑与 VIP 初始化全部完成。", []string{run.RunID})
+}
+
+func clusterBootstrapRuntimeParameters(req ClusterBootstrapRequest, item ClusterBootstrapInstall) map[string]string {
+	parameters := make(map[string]string, len(item.RuntimeParameters)+2)
+	for name, value := range item.RuntimeParameters {
+		normalizedName := strings.TrimSpace(name)
+		if strings.EqualFold(normalizedName, "read_only") || strings.EqualFold(normalizedName, "super_read_only") {
+			continue
+		}
+		parameters[name] = value
+	}
+	writableMaster := item.MachineID == req.PrimaryMachineID ||
+		(req.Architecture == hadomain.ArchitectureDualMaster && item.MachineID == req.SecondaryMasterMachineID)
+	if writableMaster {
+		parameters["read_only"] = "0"
+		parameters["super_read_only"] = "0"
+	} else {
+		parameters["read_only"] = "1"
+		parameters["super_read_only"] = "1"
+	}
+	return parameters
 }
 
 func clusterBootstrapMHAAccount(req ClusterBootstrapRequest) (string, string, bool) {

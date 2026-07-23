@@ -96,10 +96,25 @@ func normalizeCollectConfig(cfg dynamicdomain.DynamicCollectConfig, baseMinimum 
 	if len(cfg.Tasks) > 256 {
 		return cfg, errors.New("a maximum of 256 collectors is allowed")
 	}
+	seen := make(map[string]bool, len(cfg.Tasks))
 	for i := range cfg.Tasks {
 		task := &cfg.Tasks[i]
-		if strings.TrimSpace(task.Name) == "" {
+		task.Name = strings.TrimSpace(task.Name)
+		if task.Name == "" {
 			return cfg, errors.New("collector name is required")
+		}
+		if len(task.Name) > 128 {
+			return cfg, errors.New("collector name must not exceed 128 characters")
+		}
+		if seen[task.Name] {
+			return cfg, errors.New("collector names must be unique")
+		}
+		seen[task.Name] = true
+		if task.Type == "" {
+			task.Type = dynamicdomain.TaskTypeBuiltin
+		}
+		if task.Type != dynamicdomain.TaskTypeBuiltin && task.Type != dynamicdomain.TaskTypeCommand {
+			return cfg, errors.New("collector type must be builtin or command")
 		}
 		minimum := baseMinimum
 		if strings.HasPrefix(task.Name, "agent_") {

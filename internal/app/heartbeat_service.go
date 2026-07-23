@@ -376,6 +376,13 @@ func (s *HeartbeatService) ProcessHeartbeat(ctx context.Context, req *hbgrpc.Hea
 			}
 		}
 	}
+	if writer, ok := s.repo.(hbdomain.MetricSampleWriter); ok {
+		if samples := normalizePerformanceSamples(next, next.Metrics, now); len(samples) > 0 {
+			if err := writer.AppendMetricSamples(ctx, samples); err != nil {
+				return nil, err
+			}
+		}
+	}
 	s.syncOperationalState(ctx, next)
 	if changed {
 		_ = s.repo.AppendEvent(ctx, buildEvent(current, next, reason, payload, now))
@@ -409,9 +416,18 @@ func (s *HeartbeatService) dashboardMetricSnapshot(agentID string, metrics []dyn
 	s.mu.Unlock()
 	wanted := map[string]bool{
 		"mysql_qps": true, "mysql_tps": true, "cpu_usage_percent": true,
-		"io_status": true, "filesystem_usage": true, "network_throughput": true,
+		"io_status": true, "mysql_data_disk_usage": true, "network_throughput": true,
+		"mysql_threads_connected": true, "mysql_threads_running": true,
+		"mysql_active_connections": true, "mysql_sleep_connections": true,
+		"mysql_connection_usage_percent": true,
+		"mysql_lock_wait_sessions":       true, "mysql_blocked_sessions": true,
+		"mysql_row_lock_waits_current": true, "mysql_metadata_lock_waits": true,
+		"mysql_active_transactions": true, "mysql_longest_transaction_seconds": true,
+		"mysql_slow_queries_per_min": true, "mysql_deadlocks": true,
+		"mysql_replication_lag": true, "mysql_buffer_pool_hit_ratio": true,
+		"mysql_table_scan_ratio": true, "mysql_tmp_disk_table_ratio": true,
 	}
-	out := make([]dynamicdomain.MetricResult, 0, 8)
+	out := make([]dynamicdomain.MetricResult, 0, 24)
 	for _, metric := range metrics {
 		if wanted[metric.Name] {
 			out = append(out, metric)
@@ -428,6 +444,34 @@ func (s *HeartbeatService) MetricHistory(ctx context.Context, clusterID string, 
 		return []hbdomain.MetricSnapshot{}, nil
 	}
 	return reader.ListMetricSnapshots(ctx, strings.TrimSpace(clusterID), since, limit)
+}
+
+func (s *HeartbeatService) MetricHistoryRange(ctx context.Context, clusterID string, start, end time.Time, limit int) ([]hbdomain.MetricSnapshot, error) {
+	if reader, ok := s.repo.(hbdomain.MetricSnapshotRangeReader); ok {
+		return reader.ListMetricSnapshotsRange(ctx, strings.TrimSpace(clusterID), start, end, limit)
+	}
+	items, err := s.MetricHistory(ctx, clusterID, start, limit)
+	if err != nil {
+		return nil, err
+	}
+	filtered := make([]hbdomain.MetricSnapshot, 0, len(items))
+	for _, item := range items {
+		if !item.CollectedAt.Before(start) && !item.CollectedAt.After(end) {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered, nil
+}
+
+// MetricSamples returns normalized durable samples for the performance API.
+func (s *HeartbeatService) MetricSamples(ctx context.Context, query hbdomain.MetricSampleQuery) ([]hbdomain.MetricSample, error) {
+	reader, ok := s.repo.(hbdomain.MetricSampleReader)
+	if !ok {
+		return []hbdomain.MetricSample{}, nil
+	}
+	query.ClusterID = strings.TrimSpace(query.ClusterID)
+	query.Metric = strings.TrimSpace(query.Metric)
+	return reader.ListMetricSamples(ctx, query)
 }
 
 func (s *HeartbeatService) Reconcile(ctx context.Context) error {

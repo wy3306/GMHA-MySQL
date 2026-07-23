@@ -47,6 +47,18 @@ func TestParsePackageWithUnderscoreArch(t *testing.T) {
 	}
 }
 
+func TestParseMySQL57TarGzPackage(t *testing.T) {
+	name := "mysql-5.7.44-linux-glibc2.12-x86_64.tar.gz"
+	item, ok := parsePackage(name)
+	if !ok || item.Version != "5.7.44" || item.Arch != "x86_64" || item.GlibcVersion.Minor != 12 {
+		t.Fatalf("unexpected MySQL 5.7 package metadata: ok=%t item=%+v", ok, item)
+	}
+	version, err := PackageVersion(name)
+	if err != nil || version != "5.7.44" {
+		t.Fatalf("PackageVersion() = %q, %v", version, err)
+	}
+}
+
 func TestPackageSelectorListsSupportedVersionsWithCompatibilityMetadata(t *testing.T) {
 	dir := t.TempDir()
 	for _, name := range []string{

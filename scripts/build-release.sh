@@ -2,7 +2,7 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-VERSION=${1:-v0.0.1}
+VERSION=${1:-V0.0.2}
 EMBED_VERSION=$(printf '%s' "$VERSION" | sed 's/^v/V/')
 NAME="gmha-${VERSION}-linux-amd64"
 PACKAGE="$ROOT/dist/$NAME"
@@ -15,15 +15,18 @@ npm run build
 
 cd "$ROOT"
 rm -rf "$PACKAGE" "$ARCHIVE" "$ARCHIVE.sha256" "$MANAGER_PACKAGE" "$AGENT_PACKAGE"
-mkdir -p "$PACKAGE/bin" "$PACKAGE/data" "$PACKAGE/logs"
+mkdir -p "$PACKAGE/bin" "$PACKAGE/data" "$PACKAGE/logs" "$PACKAGE/scripts"
 
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w -X gmha/internal/buildinfo.Version=$EMBED_VERSION" -o "$PACKAGE/gmha" ./cmd/gmha
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o "$PACKAGE/gmha-web" ./cmd/gmha-web
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w -X gmha/internal/buildinfo.Version=$EMBED_VERSION" -o "$PACKAGE/bin/agentd" ./cmd/agent
 
 cp "$ROOT/packaging/start-web.sh" "$PACKAGE/start-web.sh"
+cp "$ROOT/scripts/build-pt-offline-bundle.sh" "$PACKAGE/scripts/build-pt-offline-bundle.sh"
+cp "$ROOT/scripts/build-flamegraph-offline-bundle.sh" "$PACKAGE/scripts/build-flamegraph-offline-bundle.sh"
+cp "$ROOT/packaging/flamegraph-install-offline.sh" "$PACKAGE/scripts/flamegraph-install-offline.sh"
 cp "$ROOT/packaging/README-linux.md" "$PACKAGE/README.md"
-chmod +x "$PACKAGE/start-web.sh" "$PACKAGE/gmha" "$PACKAGE/gmha-web" "$PACKAGE/bin/agentd"
+chmod +x "$PACKAGE/start-web.sh" "$PACKAGE/scripts/build-pt-offline-bundle.sh" "$PACKAGE/scripts/build-flamegraph-offline-bundle.sh" "$PACKAGE/scripts/flamegraph-install-offline.sh" "$PACKAGE/gmha" "$PACKAGE/gmha-web" "$PACKAGE/bin/agentd"
 cp "$PACKAGE/gmha" "$MANAGER_PACKAGE"
 cp "$PACKAGE/bin/agentd" "$AGENT_PACKAGE"
 touch "$PACKAGE/data/.keep" "$PACKAGE/logs/.keep"

@@ -5,10 +5,21 @@ package alert
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	dynamicdomain "gmha/internal/domain/dynamic"
 )
+
+var (
+	ErrNotFound = errors.New("alert resource not found")
+	ErrConflict = errors.New("alert resource state conflict")
+)
+
+type ValidationError struct{ Message string }
+
+func (e ValidationError) Error() string { return e.Message }
+func Invalid(message string) error      { return ValidationError{Message: message} }
 
 type Severity string
 
@@ -119,17 +130,58 @@ type Delivery struct {
 	DeliveredAt time.Time `json:"delivered_at"`
 }
 
+type NotificationJob struct {
+	ID        string    `json:"id"`
+	Event     Event     `json:"event"`
+	Attempts  int       `json:"attempts"`
+	LastError string    `json:"last_error,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// NotificationOutbox is an optional durable queue. Managers backed by a
+// persistent repository use it to recover notifications after a restart.
+type NotificationOutbox interface {
+	SaveNotificationJob(context.Context, NotificationJob) error
+	ListPendingNotificationJobs(context.Context, time.Time, int) ([]NotificationJob, error)
+	FinishNotificationJob(context.Context, string, bool, string, time.Time) error
+	CountPendingNotificationJobs(context.Context) (int, error)
+}
+
 type EvaluationState struct {
-	Fingerprint string
-	RuleID      string
-	Consecutive int
-	LastValue   float64
-	UpdatedAt   time.Time
+	Fingerprint  string
+	RuleID       string
+	Consecutive  int
+	LastValue    float64
+	LastSampleAt time.Time
+	UpdatedAt    time.Time
 }
 
 type EventFilter struct {
 	Status, Severity, ClusterID, Keyword string
-	Limit                                int
+	Limit, Offset                        int
+}
+
+type EventSummary struct {
+	Counts             map[string]int `json:"counts"`
+	Total              int            `json:"total"`
+	ActiveAcknowledged int            `json:"active_acknowledged"`
+	ActiveSilenced     int            `json:"active_silenced"`
+	Last24Hours        int            `json:"last_24_hours"`
+}
+
+// EventSummaryReader is optional so lightweight repositories and tests can
+// retain the small core Repository interface. Persistent repositories should
+// implement it to avoid calculating dashboard totals from a limited event page.
+type EventSummaryReader interface {
+	SummarizeEvents(context.Context, time.Time) (EventSummary, error)
+}
+
+// ActiveEventReader supports lifecycle reconciliation when collector metadata
+// changes. Fingerprints are an optimization, while rule + machine + stable
+// resource labels are the durable identity of an alert target.
+type ActiveEventReader interface {
+	ListActiveEventsForRuleTarget(context.Context, string, string) ([]Event, error)
 }
 
 type Repository interface {
@@ -143,7 +195,7 @@ type Repository interface {
 	GetActiveEvent(context.Context, string) (Event, bool, error)
 	SaveEvent(context.Context, Event) error
 	UpdateEventAction(context.Context, string, string, string, *time.Time) error
-	UpdateAutomationState(context.Context, string, string) error
+	UpdateAutomationState(context.Context, string, string, string) error
 	GetEvaluationState(context.Context, string) (EvaluationState, bool, error)
 	SaveEvaluationState(context.Context, EvaluationState) error
 	ListChannels(context.Context) ([]Channel, error)

@@ -1,5 +1,8 @@
 # GMHA 架构说明文档
 
+实例管理控制台 14 项操作的完整 HTTP 契约、异步结果读取方式与安全约束见 [实例管理 API 手册](docs/instance-management-api.md)。
+备份目标发现、策略管理、运行查询、批量备份以及物理恢复/时间点恢复/数据闪回的 HTTP 契约见 [备份恢复 API 手册](docs/backup-recovery-api.md)。
+
 ## Web 启动器与 Release 程序包
 
 Release 程序包提供独立的 `gmha-web` 启动器。执行 `./start-web.sh` 后访问 `http://服务器IP:8079`，在启动页点击“启动 Manager”，等待健康检查通过后即可进入完整 GMHA 控制台。程序包同时包含 Manager、内嵌前端和可部署到受管机器的 Agent，不要求目标机器安装 Go 或 Node.js。
@@ -7,10 +10,10 @@ Release 程序包提供独立的 `gmha-web` 启动器。执行 `./start-web.sh` 
 本地构建 Linux x86_64 程序包：
 
 ```bash
-./scripts/build-release.sh V0.0.1
+./scripts/build-release.sh V0.0.2
 ```
 
-构建结果位于 `dist/gmha-V0.0.1-linux-amd64.tar.gz`，并同时生成 SHA-256 校验文件。
+构建结果位于 `dist/gmha-V0.0.2-linux-amd64.tar.gz`，并同时生成 SHA-256 校验文件。
 
 ## 数据库配置
 

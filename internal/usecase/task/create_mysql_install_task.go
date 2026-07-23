@@ -25,7 +25,7 @@ type MachineInfoRepository interface {
 }
 
 type PerconaToolkitPackageResolver interface {
-	ResolvePerconaToolkitPackage(arch string) (string, error)
+	ResolvePerconaToolkitPackage(arch, osName string) (string, error)
 	ResolveXtraBackupPackage(mysqlVersion, arch, glibcVersion string) (string, error)
 }
 
@@ -70,6 +70,14 @@ func (u *CreateMySQLInstallTaskUsecase) ListPackages() ([]mysqlapp.PackageOption
 // architecture and glibc before an upgrade workflow is created.
 func (u *CreateMySQLInstallTaskUsecase) ResolvePackage(info collectdomain.MachineInfo, name string) (mysqlapp.Package, error) {
 	return u.packageSelector.SelectNamed(info, name)
+}
+
+// ResolveVersionPackage selects the best local artifact for a requested
+// version using the target machine's architecture and glibc. Cluster rolling
+// upgrades use it so heterogeneous CPU architectures can share one version
+// plan without sharing an incompatible archive.
+func (u *CreateMySQLInstallTaskUsecase) ResolveVersionPackage(info collectdomain.MachineInfo, version string) (mysqlapp.Package, error) {
+	return u.packageSelector.SelectVersionArchitecture(info, version, "")
 }
 
 // CreateMySQLInstallTaskResult 是创建 MySQL 安装任务的结果。
@@ -132,6 +140,9 @@ func (u *CreateMySQLInstallTaskUsecase) Execute(ctx context.Context, req CreateM
 	}
 	if req.Port <= 0 {
 		return CreateMySQLInstallTaskResult{}, errors.New("port is required")
+	}
+	if req.Port > 65535 {
+		return CreateMySQLInstallTaskResult{}, errors.New("port must be between 1 and 65535")
 	}
 	if strings.TrimSpace(req.RootPassword) == "" {
 		return CreateMySQLInstallTaskResult{}, errors.New("root_password is required")
@@ -208,7 +219,7 @@ func (u *CreateMySQLInstallTaskUsecase) Execute(ctx context.Context, req CreateM
 		if u.ptPackageResolver == nil {
 			return CreateMySQLInstallTaskResult{}, errors.New("Percona Toolkit package resolver is not configured")
 		}
-		ptPackageName, err = u.ptPackageResolver.ResolvePerconaToolkitPackage(info.Arch)
+		ptPackageName, err = u.ptPackageResolver.ResolvePerconaToolkitPackage(info.Arch, info.OS)
 		if err != nil {
 			return CreateMySQLInstallTaskResult{}, err
 		}
@@ -260,7 +271,7 @@ func (u *CreateMySQLInstallTaskUsecase) Execute(ctx context.Context, req CreateM
 	}
 	accounts := normalizeInstallAccounts(req.Accounts)
 	if req.InstallXtraBackup {
-		accounts = ensureXtraBackupAccountPrivileges(accounts)
+		accounts = ensureXtraBackupAccountPrivileges(accounts, pkg.Version)
 	}
 	accountCheck := make([]mysqlapp.AccountSpec, 0, len(accounts))
 	for _, item := range accounts {
@@ -302,13 +313,13 @@ func (u *CreateMySQLInstallTaskUsecase) Execute(ctx context.Context, req CreateM
 		PIDFile:                      input.PIDFile,
 		CharacterSetsDir:             input.CharacterSetsDir,
 		PluginDir:                    input.PluginDir,
-		SystemdUnitName:              "mysqld",
+		SystemdUnitName:              mysqlSystemdUnitName(input.Port),
 		SystemdContent:               string(renderedSystemd),
-		LimitsPath:                   "/etc/security/limits.d/mysql.conf",
+		LimitsPath:                   fmt.Sprintf("/etc/security/limits.d/mysql-%d.conf", input.Port),
 		LimitsContent:                string(renderedLimits),
-		SysctlPath:                   "/etc/sysctl.d/99-gmha-mysql.conf",
+		SysctlPath:                   fmt.Sprintf("/etc/sysctl.d/99-gmha-mysql-%d.conf", input.Port),
 		SysctlContent:                string(renderedSysctl),
-		EnvFilePath:                  "/etc/profile.d/mysql.sh",
+		EnvFilePath:                  fmt.Sprintf("/etc/profile.d/mysql-%d.sh", input.Port),
 		EnvContent:                   string(renderedEnv),
 		InstallPTTools:               req.InstallPTTools,
 		PTToolsPackageName:           ptPackageName,
@@ -346,6 +357,10 @@ func (u *CreateMySQLInstallTaskUsecase) Execute(ctx context.Context, req CreateM
 		CreatedAt: now,
 	}}
 	return CreateMySQLInstallTaskResult{Task: task, Steps: steps, Events: events}, nil
+}
+
+func mysqlSystemdUnitName(port int) string {
+	return fmt.Sprintf("mysqld-%d", port)
 }
 
 func (u *CreateMySQLInstallTaskUsecase) managerResourceURL(targetIP, path string) string {
@@ -507,12 +522,15 @@ func normalizeInstallAccounts(input []taskdomain.MySQLAccountSpec) []taskdomain.
 
 // ensureXtraBackupAccountPrivileges makes the enabled backup account usable by
 // XtraBackup immediately after installation without changing disabled accounts.
-func ensureXtraBackupAccountPrivileges(accounts []taskdomain.MySQLAccountSpec) []taskdomain.MySQLAccountSpec {
+func ensureXtraBackupAccountPrivileges(accounts []taskdomain.MySQLAccountSpec, version string) []taskdomain.MySQLAccountSpec {
 	for i := range accounts {
 		if accounts[i].Role != mysqlapp.AccountRoleBackup || !accounts[i].Enabled {
 			continue
 		}
-		accounts[i].ExtendedBackup = true
+		accounts[i].ExtendedBackup = mysqlapp.SupportsDynamicPrivilegeForVersion(version, "BACKUP_ADMIN")
+		if !accounts[i].ExtendedBackup {
+			continue
+		}
 		found := false
 		for _, privilege := range accounts[i].Privileges {
 			if strings.EqualFold(strings.TrimSpace(privilege), "BACKUP_ADMIN") {

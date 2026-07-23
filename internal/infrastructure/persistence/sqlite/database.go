@@ -71,12 +71,21 @@ func (t *Tx) ExecContext(ctx context.Context, query string, args ...any) (sql.Re
 func (t *Tx) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
 	return t.tx.QueryRowContext(ctx, t.db.sql(query), args...)
 }
+func (t *Tx) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return t.tx.QueryContext(ctx, t.db.sql(query), args...)
+}
 func (t *Tx) Commit() error   { return t.tx.Commit() }
 func (t *Tx) Rollback() error { return t.tx.Rollback() }
 
 var excludedColumn = regexp.MustCompile(`(?i)excluded\.([a-z_][a-z0-9_]*)`)
 var conflictUpdate = regexp.MustCompile(`(?is)on\s+conflict\s*\([^)]*\)\s*do\s+update\s+set`)
 var conflictNothing = regexp.MustCompile(`(?is)on\s+conflict\s*\([^)]*\)\s*do\s+nothing`)
+var mysqlIndexIfNotExists = regexp.MustCompile(`(?i)create\s+(unique\s+)?index\s+if\s+not\s+exists`)
+var mysqlKeyTextColumn = regexp.MustCompile(`(?i)\b(id|role|name|cluster_id|failover_id|run_id|machine_id|agent_id|fingerprint|kind|ip|parent_task_id|task_id|created_at|current_state|collected_at|status|metric|last_seen_at|delivered_at|next_run_at|cluster_name|vip_address|interface_name)\s+text\b`)
+var mysqlTextNotNullDefault = regexp.MustCompile(`(?i)\btext\s+not\s+null\s+default\s+'(?:''|[^'])*'`)
+var mysqlTextDefault = regexp.MustCompile(`(?i)\btext\s+default\s+'(?:''|[^'])*'`)
+var mysqlCastInteger = regexp.MustCompile(`(?i)\bas\s+integer\s*\)`)
+var mysqlReservedIdentifier = regexp.MustCompile(`(?i)\b(last_value)\b`)
 
 func (d *DB) sql(query string) string {
 	if d.dialect == DialectSQLite {
@@ -84,6 +93,10 @@ func (d *DB) sql(query string) string {
 	}
 	query = strings.ReplaceAll(query, "integer primary key autoincrement", d.autoIncrement())
 	if d.dialect == DialectMySQL {
+		query = mysqlIndexIfNotExists.ReplaceAllString(query, "create ${1}index")
+		// MySQL does not allow TEXT to use CURRENT_TIMESTAMP as a default.
+		query = strings.ReplaceAll(query, "text default CURRENT_TIMESTAMP", "varchar(64) not null default ''")
+		query = mysqlKeyTextColumn.ReplaceAllString(query, "${1} varchar(191)")
 		if conflictNothing.MatchString(query) {
 			query = conflictNothing.ReplaceAllString(query, "")
 			query = strings.Replace(query, "insert into", "insert ignore into", 1)
@@ -92,7 +105,15 @@ func (d *DB) sql(query string) string {
 		query = excludedColumn.ReplaceAllString(query, "values($1)")
 		// MySQL 不允许 TEXT 使用 CURRENT_TIMESTAMP 默认值；这些字段仅记录审计时间，
 		// 实际写入时由应用层覆盖，因此以空字符串作为建表默认值。
-		query = strings.ReplaceAll(query, "text default CURRENT_TIMESTAMP", "varchar(64) not null default ''")
+		// MySQL 5.7 forbids defaults on TEXT/BLOB. Large payload columns keep a
+		// LONGTEXT type and are always populated explicitly by repositories.
+		query = mysqlTextNotNullDefault.ReplaceAllString(query, "longtext not null")
+		query = mysqlTextDefault.ReplaceAllString(query, "longtext")
+		query = mysqlCastInteger.ReplaceAllString(query, "as signed)")
+		// LAST_VALUE is a window-function keyword in current MySQL releases.
+		// The alert state schema predates that reservation, so quote the existing
+		// column consistently in migrations and CRUD without changing its API.
+		query = mysqlReservedIdentifier.ReplaceAllString(query, "`$1`")
 		return query
 	}
 	return bindPostgres(query)
@@ -115,6 +136,7 @@ func (d *DB) execMySQLMigration(query string) (sql.Result, error) {
 		if statement == "" {
 			continue
 		}
+		statement = mysqlMigrationStatement(statement)
 		result, err := d.db.Exec(statement)
 		if err != nil {
 			if strings.Contains(strings.ToLower(err.Error()), "duplicate key name") {
@@ -125,6 +147,13 @@ func (d *DB) execMySQLMigration(query string) (sql.Result, error) {
 		last = result
 	}
 	return last, nil
+}
+
+func mysqlMigrationStatement(statement string) string {
+	if strings.HasPrefix(strings.ToLower(statement), "create table ") && !strings.Contains(strings.ToLower(statement), "character set") {
+		return statement + " default character set utf8mb4 collate utf8mb4_unicode_ci"
+	}
+	return statement
 }
 
 // bindPostgres 将仓储统一使用的 ? 参数占位符转换为 PostgreSQL 的 $n 格式。

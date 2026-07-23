@@ -75,8 +75,17 @@ func TestBuildMySQLInstallStepsOptionalXtraBackupAndTCMalloc(t *testing.T) {
 	}
 }
 
+func TestMySQLSystemdUnitNameIsUniquePerPort(t *testing.T) {
+	if got := mysqlSystemdUnitName(3306); got != "mysqld-3306" {
+		t.Fatalf("unit name = %q", got)
+	}
+	if mysqlSystemdUnitName(3306) == mysqlSystemdUnitName(3307) {
+		t.Fatal("different ports must not share a systemd unit")
+	}
+}
+
 func TestEnsureXtraBackupAccountPrivileges(t *testing.T) {
-	accounts := ensureXtraBackupAccountPrivileges(normalizeInstallAccounts(nil))
+	accounts := ensureXtraBackupAccountPrivileges(normalizeInstallAccounts(nil), "8.0.44")
 	for _, account := range accounts {
 		if account.Role != mysqlapp.AccountRoleBackup {
 			continue

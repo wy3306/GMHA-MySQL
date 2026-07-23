@@ -42,6 +42,11 @@ type RestoreOptions struct {
 	OutputDir         string
 }
 
+var (
+	ErrBackupPolicyNotFound = errors.New("备份策略不存在")
+	ErrBackupRunNotFound    = errors.New("备份记录不存在")
+)
+
 type BackupService struct {
 	repo     backupdomain.Repository
 	tasks    *TaskService
@@ -67,9 +72,29 @@ type ClusterBackupItem struct {
 }
 
 type ClusterBackupResult struct {
-	Created int                 `json:"created"`
-	Failed  int                 `json:"failed"`
-	Items   []ClusterBackupItem `json:"items"`
+	ParentTaskID string              `json:"parent_task_id,omitempty"`
+	Created      int                 `json:"created"`
+	Failed       int                 `json:"failed"`
+	Items        []ClusterBackupItem `json:"items"`
+}
+
+// BackupTarget is the API-facing inventory needed to select a backup or
+// restore destination. It intentionally excludes credentials and MySQL
+// filesystem paths.
+type BackupTarget struct {
+	Cluster         string   `json:"cluster"`
+	MachineID       string   `json:"machine_id"`
+	MachineName     string   `json:"machine_name"`
+	MachineIP       string   `json:"machine_ip"`
+	AgentStatus     string   `json:"agent_status"`
+	Port            int      `json:"port"`
+	InstanceStatus  string   `json:"instance_status"`
+	MySQLVersion    string   `json:"mysql_version,omitempty"`
+	Architecture    string   `json:"architecture,omitempty"`
+	PackageName     string   `json:"package_name,omitempty"`
+	BackupReady     bool     `json:"backup_ready"`
+	RestoreReady    bool     `json:"restore_ready"`
+	BlockingReasons []string `json:"blocking_reasons,omitempty"`
 }
 
 func NewBackupService(repo backupdomain.Repository, tasks *TaskService, machines machinedomain.Repository, mysql interface {
@@ -217,8 +242,86 @@ func (s *BackupService) SavePolicy(ctx context.Context, p backupdomain.Policy) (
 func (s *BackupService) ListPolicies(ctx context.Context, cluster string) ([]backupdomain.Policy, error) {
 	return s.repo.ListPolicies(ctx, cluster)
 }
+
+func (s *BackupService) GetPolicy(ctx context.Context, id string) (backupdomain.Policy, error) {
+	policy, ok, err := s.repo.GetPolicy(ctx, strings.TrimSpace(id))
+	if err != nil {
+		return backupdomain.Policy{}, err
+	}
+	if !ok {
+		return backupdomain.Policy{}, ErrBackupPolicyNotFound
+	}
+	policy.MySQLPassword = ""
+	return policy, nil
+}
+
 func (s *BackupService) DeletePolicy(ctx context.Context, id string) error {
+	if _, err := s.GetPolicy(ctx, id); err != nil {
+		return err
+	}
 	return s.repo.DeletePolicy(ctx, id)
+}
+
+func (s *BackupService) ListTargets(ctx context.Context, cluster string) ([]BackupTarget, error) {
+	cluster = strings.TrimSpace(cluster)
+	machines, err := s.machines.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	instances, err := s.mysql.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	machineByID := make(map[string]machinedomain.Machine, len(machines))
+	for _, machine := range machines {
+		if strings.TrimSpace(machine.Cluster) != "" && (cluster == "" || machine.Cluster == cluster) {
+			machineByID[machine.ID] = machine
+		}
+	}
+	targets := make([]BackupTarget, 0, len(instances))
+	for _, instance := range instances {
+		machine, ok := machineByID[instance.MachineID]
+		if !ok {
+			continue
+		}
+		target := BackupTarget{
+			Cluster:        machine.Cluster,
+			MachineID:      machine.ID,
+			MachineName:    machine.Name,
+			MachineIP:      machine.IP,
+			AgentStatus:    string(machine.Status),
+			Port:           instance.Port,
+			InstanceStatus: instance.Status,
+			MySQLVersion:   instance.Version,
+			Architecture:   instance.Architecture,
+			PackageName:    instance.PackageName,
+		}
+		if machine.Status != machinedomain.StatusAgentOnline {
+			target.BlockingReasons = append(target.BlockingReasons, "Agent 当前不在线")
+		}
+		switch instance.Status {
+		case mysqlapp.StatusStopped:
+			target.BlockingReasons = append(target.BlockingReasons, "MySQL 实例已停止")
+		case mysqlapp.StatusHeartbeatFailed, mysqlapp.StatusInstanceError:
+			target.BlockingReasons = append(target.BlockingReasons, "MySQL 实例状态异常")
+		}
+		target.BackupReady = len(target.BlockingReasons) == 0
+		target.RestoreReady = machine.Status == machinedomain.StatusAgentOnline
+		targets = append(targets, target)
+	}
+	sort.Slice(targets, func(i, j int) bool {
+		if targets[i].Cluster != targets[j].Cluster {
+			return targets[i].Cluster < targets[j].Cluster
+		}
+		if targets[i].MachineName != targets[j].MachineName {
+			return targets[i].MachineName < targets[j].MachineName
+		}
+		if targets[i].MachineIP != targets[j].MachineIP {
+			return targets[i].MachineIP < targets[j].MachineIP
+		}
+		return targets[i].Port < targets[j].Port
+	})
+	return targets, nil
 }
 
 func (s *BackupService) RunPolicy(ctx context.Context, id string) (backupdomain.Run, error) {
@@ -227,7 +330,7 @@ func (s *BackupService) RunPolicy(ctx context.Context, id string) (backupdomain.
 		return backupdomain.Run{}, err
 	}
 	if !ok {
-		return backupdomain.Run{}, errors.New("备份策略不存在")
+		return backupdomain.Run{}, ErrBackupPolicyNotFound
 	}
 	return s.run(ctx, p)
 }
@@ -246,35 +349,55 @@ func (s *BackupService) RunClusters(ctx context.Context, clusters []string) (Clu
 	if len(selected) == 0 {
 		return ClusterBackupResult{}, errors.New("at least one cluster is required")
 	}
-	result := ClusterBackupResult{}
+	clusterNames := make([]string, 0, len(selected))
 	for cluster := range selected {
-		policies, err := s.repo.ListPolicies(ctx, cluster)
+		clusterNames = append(clusterNames, cluster)
+	}
+	sort.Strings(clusterNames)
+	policies := make([]backupdomain.Policy, 0)
+	for _, cluster := range clusterNames {
+		clusterPolicies, err := s.repo.ListPolicies(ctx, cluster)
 		if err != nil {
 			return ClusterBackupResult{}, err
 		}
-		for _, policy := range policies {
+		for _, policy := range clusterPolicies {
 			if !policy.Enabled {
 				continue
 			}
-			item := ClusterBackupItem{Cluster: cluster, PolicyID: policy.ID, Policy: policy.Name}
-			run, err := s.RunPolicy(ctx, policy.ID)
-			if err != nil {
-				item.Error = err.Error()
-				result.Failed++
-			} else {
-				item.RunID, item.TaskID = run.ID, run.TaskID
-				result.Created++
-			}
-			result.Items = append(result.Items, item)
+			policies = append(policies, policy)
 		}
 	}
-	if len(result.Items) == 0 {
+	if len(policies) == 0 {
 		return ClusterBackupResult{}, errors.New("selected clusters have no enabled backup policies")
+	}
+	parent, err := s.tasks.CreateBatchTrackingTask(ctx, "cluster_backup", "立即备份集群", strings.Join(clusterNames, ", "))
+	if err != nil {
+		return ClusterBackupResult{}, err
+	}
+	result := ClusterBackupResult{ParentTaskID: parent.Task.ID}
+	for _, policy := range policies {
+		item := ClusterBackupItem{Cluster: policy.Cluster, PolicyID: policy.ID, Policy: policy.Name}
+		run, runErr := s.runWithParent(ctx, policy, parent.Task.ID)
+		if runErr != nil {
+			item.Error = runErr.Error()
+			result.Failed++
+		} else {
+			item.RunID, item.TaskID = run.ID, run.TaskID
+			result.Created++
+		}
+		result.Items = append(result.Items, item)
+	}
+	if err := s.tasks.FinalizeBatchTrackingTask(ctx, parent.Task.ID, result.Created, result.Failed); err != nil {
+		return ClusterBackupResult{}, err
 	}
 	return result, nil
 }
 
 func (s *BackupService) run(ctx context.Context, p backupdomain.Policy) (backupdomain.Run, error) {
+	return s.runWithParent(ctx, p, "")
+}
+
+func (s *BackupService) runWithParent(ctx context.Context, p backupdomain.Policy, parentTaskID string) (backupdomain.Run, error) {
 	m, ok, err := s.machines.GetByID(ctx, p.MachineID)
 	if err != nil {
 		return backupdomain.Run{}, err
@@ -299,13 +422,13 @@ func (s *BackupService) run(ctx context.Context, p backupdomain.Policy) (backupd
 		run.BaseRunID, basePath = base.ID, base.BackupPath
 	}
 	run.BackupPath = filepath.Join(p.BackupLocation, safePathPart(p.Cluster), fmt.Sprintf("%s_%d", safePathPart(m.IP), p.Port), run.CreatedAt.Format("20060102_150405")+"_"+run.ID)
-	command := renderRemoteScript(xtrabackupBackupScript, "gmha-xtrabackup-backup", []string{"--target-dir", run.BackupPath, "--backup-type", p.BackupType, "--incremental-basedir", basePath, "--disk-usage-threshold", fmt.Sprint(p.DiskUsageThreshold), "--replication-lag-wait", "30", "--port", fmt.Sprint(p.Port), "--socket", inst.SocketPath, "--user", p.MySQLUser, "--password-base64", base64.StdEncoding.EncodeToString([]byte(p.MySQLPassword)), "--retry-count", fmt.Sprint(p.RetryCount), "--retry-interval", fmt.Sprint(p.RetryIntervalSeconds), "--include-binlog", fmt.Sprint(p.IncludeBinlog), "--binlog-dir", inst.BinlogDir})
+	command := renderRemoteScript(xtrabackupBackupScript, "gmha-xtrabackup-backup", []string{"--target-dir", run.BackupPath, "--backup-type", p.BackupType, "--incremental-basedir", basePath, "--disk-usage-threshold", fmt.Sprint(p.DiskUsageThreshold), "--replication-lag-wait", "30", "--port", fmt.Sprint(p.Port), "--socket", inst.SocketPath, "--user", p.MySQLUser, "--password-base64", base64.StdEncoding.EncodeToString([]byte(p.MySQLPassword)), "--retry-count", fmt.Sprint(p.RetryCount), "--retry-interval", fmt.Sprint(p.RetryIntervalSeconds), "--include-binlog", fmt.Sprint(p.IncludeBinlog), "--binlog-dir", inst.BinlogDir, "--defaults-file", inst.MyCnfPath})
 	backupName := "MySQL 全量备份"
 	if p.BackupType == backupdomain.TypeIncremental {
 		backupName = "MySQL 增量备份"
 	}
 	detail, err := s.tasks.CreateExecTaskWithOptions(ctx, p.MachineID, command, ExecTaskOptions{
-		Operation: "mysql_backup_" + p.BackupType, DisplayName: backupName,
+		ParentTaskID: parentTaskID, Operation: "mysql_backup_" + p.BackupType, DisplayName: backupName,
 		StepName: "执行 XtraBackup " + backupName, Port: p.Port,
 	})
 	if err != nil {
@@ -324,25 +447,43 @@ func (s *BackupService) ListRuns(ctx context.Context, cluster string, limit int)
 		return nil, err
 	}
 	for i := range runs {
-		if d, e := s.tasks.GetTaskDetail(ctx, runs[i].TaskID); e == nil {
-			runs[i].Status = string(d.Task.Status)
-			for _, event := range d.Events {
+		s.enrichRun(ctx, &runs[i])
+	}
+	return runs, nil
+}
+
+func (s *BackupService) GetRun(ctx context.Context, id string) (backupdomain.Run, error) {
+	run, ok, err := s.repo.GetRun(ctx, strings.TrimSpace(id))
+	if err != nil {
+		return backupdomain.Run{}, err
+	}
+	if !ok {
+		return backupdomain.Run{}, ErrBackupRunNotFound
+	}
+	s.enrichRun(ctx, &run)
+	return run, nil
+}
+
+func (s *BackupService) enrichRun(ctx context.Context, run *backupdomain.Run) {
+	if s.tasks != nil && strings.TrimSpace(run.TaskID) != "" {
+		if detail, err := s.tasks.GetTaskDetail(ctx, run.TaskID); err == nil {
+			run.Status = string(detail.Task.Status)
+			for _, event := range detail.Events {
 				message := strings.TrimSpace(event.Content)
 				if message == "" {
 					continue
 				}
-				runs[i].Logs = append(runs[i].Logs, backupdomain.Log{Time: event.CreatedAt, Level: string(event.EventType), Message: message})
+				run.Logs = append(run.Logs, backupdomain.Log{Time: event.CreatedAt, Level: string(event.EventType), Message: message})
 				if event.EventType == "error" {
-					runs[i].LastError = message
+					run.LastError = message
 				}
 			}
 		}
-		if m, ok, e := s.machines.GetByID(ctx, runs[i].MachineID); e == nil && ok {
-			runs[i].MachineName = m.Name
-			runs[i].MachineIP = m.IP
-		}
 	}
-	return runs, nil
+	if machine, ok, err := s.machines.GetByID(ctx, run.MachineID); err == nil && ok {
+		run.MachineName = machine.Name
+		run.MachineIP = machine.IP
+	}
 }
 
 func (s *BackupService) Restore(ctx context.Context, runID string, opts RestoreOptions) (TaskDetail, error) {
@@ -361,7 +502,13 @@ func (s *BackupService) Restore(ctx context.Context, runID string, opts RestoreO
 		return TaskDetail{}, err
 	}
 	if !ok {
-		return TaskDetail{}, errors.New("备份记录不存在")
+		return TaskDetail{}, ErrBackupRunNotFound
+	}
+	if opts.Mode != "physical" && opts.Mode != "point_in_time" && opts.Mode != "flashback" {
+		return TaskDetail{}, errors.New("不支持的恢复模式")
+	}
+	if opts.Mode == "point_in_time" && !run.IncludeBinlog {
+		return TaskDetail{}, errors.New("该备份未包含 Binlog，不能执行按时间点恢复")
 	}
 	if opts.Mode != "flashback" {
 		if d, e := s.tasks.GetTaskDetail(ctx, run.TaskID); e != nil || d.Task.Status != "success" {
@@ -405,9 +552,6 @@ func (s *BackupService) Restore(ctx context.Context, runID string, opts RestoreO
 		}
 		return detail, err
 	}
-	if opts.Mode != "physical" && opts.Mode != "point_in_time" {
-		return TaskDetail{}, errors.New("不支持的恢复模式")
-	}
 	chain, err := s.restoreChain(ctx, run)
 	if err != nil {
 		return TaskDetail{}, err
@@ -430,7 +574,7 @@ func (s *BackupService) Restore(ctx context.Context, runID string, opts RestoreO
 		binlogBase = opts.BackupPath
 	}
 	binlogDir := filepath.Join(binlogBase, "gmha-binlog")
-	args = append(args, "--recovery-mode", opts.Mode, "--restore-time", formatRestoreTime(opts.RestoreTime), "--binlog-dir", binlogDir, "--port", fmt.Sprint(run.Port), "--socket", inst.SocketPath, "--db-user", opts.MySQLUser, "--db-password-base64", base64.StdEncoding.EncodeToString([]byte(opts.MySQLPassword)), "--repair-replication", fmt.Sprint(opts.RepairReplication), "--data-dir", inst.DataDir, "--mysql-os-user", inst.MySQLUser, "--systemd-unit", inst.SystemdUnit)
+	args = append(args, "--recovery-mode", opts.Mode, "--restore-time", formatRestoreTime(opts.RestoreTime), "--binlog-dir", binlogDir, "--port", fmt.Sprint(run.Port), "--socket", inst.SocketPath, "--db-user", opts.MySQLUser, "--db-password-base64", base64.StdEncoding.EncodeToString([]byte(opts.MySQLPassword)), "--repair-replication", fmt.Sprint(opts.RepairReplication), "--data-dir", inst.DataDir, "--instance-binlog-dir", inst.BinlogDir, "--redo-dir", inst.RedoDir, "--undo-dir", inst.UndoDir, "--defaults-file", inst.MyCnfPath, "--mysql-os-user", inst.MySQLUser, "--systemd-unit", inst.SystemdUnit)
 	command := renderRemoteScript(xtrabackupRestoreScript, "gmha-xtrabackup-restore", args)
 	displayName := "MySQL 全量物理恢复"
 	if opts.Mode == "point_in_time" {

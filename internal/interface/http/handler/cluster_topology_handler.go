@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -17,14 +18,15 @@ type ClusterTopologyHandler struct {
 	machines  *app.MachineService
 	mysql     *app.MySQLService
 	heartbeat *app.HeartbeatService
+	backup    *app.BackupService
 }
 
-func NewClusterTopologyHandler(machines *app.MachineService, mysql *app.MySQLService, heartbeat ...*app.HeartbeatService) *ClusterTopologyHandler {
-	var history *app.HeartbeatService
-	if len(heartbeat) > 0 {
-		history = heartbeat[0]
+func NewClusterTopologyHandler(machines *app.MachineService, mysql *app.MySQLService, heartbeat *app.HeartbeatService, backup ...*app.BackupService) *ClusterTopologyHandler {
+	var backupService *app.BackupService
+	if len(backup) > 0 {
+		backupService = backup[0]
 	}
-	return &ClusterTopologyHandler{machines: machines, mysql: mysql, heartbeat: history}
+	return &ClusterTopologyHandler{machines: machines, mysql: mysql, heartbeat: heartbeat, backup: backupService}
 }
 
 type clusterTopologyView struct {
@@ -80,10 +82,43 @@ func (h *ClusterTopologyHandler) HandleTopology(w http.ResponseWriter, r *http.R
 		return
 	}
 	rangeMinutes, _ := strconv.Atoi(r.URL.Query().Get("range_minutes"))
-	if rangeMinutes != 15 && rangeMinutes != 60 && rangeMinutes != 360 && rangeMinutes != 1440 {
+	if rangeMinutes < 1 || rangeMinutes > 10080 {
 		rangeMinutes = 60
 	}
-	view, err := h.build(r.Context(), cluster, rangeMinutes)
+	endAt := time.Now().UTC()
+	if value := strings.TrimSpace(r.URL.Query().Get("end_at")); value != "" {
+		parsed, parseErr := time.Parse(time.RFC3339, value)
+		if parseErr != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid end_at: %w", parseErr))
+			return
+		}
+		endAt = parsed.UTC()
+		if endAt.After(time.Now().UTC()) {
+			endAt = time.Now().UTC()
+		}
+	}
+	if value := strings.TrimSpace(r.URL.Query().Get("start_at")); value != "" {
+		parsed, parseErr := time.Parse(time.RFC3339, value)
+		if parseErr != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid start_at: %w", parseErr))
+			return
+		}
+		duration := endAt.Sub(parsed.UTC())
+		if duration <= 0 {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("start_at must be earlier than end_at"))
+			return
+		}
+		rangeMinutes = int(math.Ceil(duration.Minutes()))
+		if rangeMinutes > 10080 {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("time range cannot exceed 7 days"))
+			return
+		}
+	}
+	instance := strings.TrimSpace(r.URL.Query().Get("instance"))
+	if instance == "all" {
+		instance = ""
+	}
+	view, err := h.buildAt(r.Context(), cluster, rangeMinutes, endAt, instance)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -91,11 +126,7 @@ func (h *ClusterTopologyHandler) HandleTopology(w http.ResponseWriter, r *http.R
 	writeJSON(w, http.StatusOK, view)
 }
 
-func (h *ClusterTopologyHandler) build(ctx context.Context, cluster string, ranges ...int) (clusterTopologyView, error) {
-	rangeMinutes := 60
-	if len(ranges) > 0 && ranges[0] > 0 {
-		rangeMinutes = ranges[0]
-	}
+func (h *ClusterTopologyHandler) buildAt(ctx context.Context, cluster string, rangeMinutes int, endAt time.Time, instanceSelectors ...string) (clusterTopologyView, error) {
 	instances, err := h.mysql.ListInstanceViews(ctx)
 	if err != nil {
 		return clusterTopologyView{}, err
@@ -179,8 +210,33 @@ func (h *ClusterTopologyHandler) build(ctx context.Context, cluster string, rang
 			node.Role = "readonly"
 		}
 	}
-	view.Overview = h.buildOverview(ctx, cluster, view.Nodes, rangeMinutes, time.Now().UTC())
+	instanceSelector := ""
+	if len(instanceSelectors) > 0 {
+		instanceSelector = strings.TrimSpace(instanceSelectors[0])
+	}
+	overviewNodes := view.Nodes
+	if instanceSelector != "" {
+		overviewNodes = make([]clusterTopologyNode, 0, 1)
+		for _, node := range view.Nodes {
+			if overviewInstanceSelector(node) == instanceSelector {
+				overviewNodes = append(overviewNodes, node)
+				break
+			}
+		}
+		if len(overviewNodes) == 0 {
+			return clusterTopologyView{}, fmt.Errorf("instance %q not found in cluster %q", instanceSelector, cluster)
+		}
+	}
+	view.Overview = h.buildOverview(ctx, cluster, overviewNodes, rangeMinutes, endAt, instanceSelector)
 	return view, nil
+}
+
+func (h *ClusterTopologyHandler) build(ctx context.Context, cluster string, ranges ...int) (clusterTopologyView, error) {
+	rangeMinutes := 60
+	if len(ranges) > 0 && ranges[0] > 0 {
+		rangeMinutes = ranges[0]
+	}
+	return h.buildAt(ctx, cluster, rangeMinutes, time.Now().UTC())
 }
 
 func topologyEdgeFromMetric(node clusterTopologyNode, value any) (clusterTopologyEdge, bool) {
@@ -205,6 +261,10 @@ func topologyEdgeFromMetric(node clusterTopologyNode, value any) (clusterTopolog
 
 func topologyEndpoint(ip string, port int) string {
 	return strings.TrimSpace(ip) + ":" + strconv.Itoa(port)
+}
+
+func overviewInstanceSelector(node clusterTopologyNode) string {
+	return strings.TrimSpace(node.MachineID) + ":" + strconv.Itoa(node.Port)
 }
 
 func topologyMap(value any) map[string]any {

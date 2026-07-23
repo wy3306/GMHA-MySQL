@@ -89,3 +89,28 @@ func (h *UpgradeHandler) HandleManager(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusAccepted, item)
 }
+
+func (h *UpgradeHandler) HandleManagerRebuild(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		SourceDir    string `json:"source_dir"`
+		Confirmation string `json:"confirmation"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if strings.TrimSpace(req.Confirmation) != "REBUILD" {
+		writeError(w, http.StatusBadRequest, http.ErrNotSupported)
+		return
+	}
+	item, err := h.service.StartManagerRebuild(req.SourceDir)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, item)
+}

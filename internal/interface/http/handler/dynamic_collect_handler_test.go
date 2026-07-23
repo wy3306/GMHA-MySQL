@@ -29,3 +29,19 @@ func TestNormalizeCollectConfigRejectsUnboundedCollectorCount(t *testing.T) {
 		t.Fatal("expected collector limit error")
 	}
 }
+
+func TestNormalizeCollectConfigRejectsDuplicateAndUnknownCollectors(t *testing.T) {
+	duplicate := dynamicdomain.DynamicCollectConfig{Tasks: []dynamicdomain.CollectTaskSpec{
+		{Name: "cpu", Type: dynamicdomain.TaskTypeBuiltin},
+		{Name: " cpu ", Type: dynamicdomain.TaskTypeBuiltin},
+	}}
+	if _, err := normalizeCollectConfig(duplicate, 1); err == nil {
+		t.Fatal("duplicate collector names must be rejected")
+	}
+	unknownType := dynamicdomain.DynamicCollectConfig{Tasks: []dynamicdomain.CollectTaskSpec{{
+		Name: "cpu", Type: "plugin",
+	}}}
+	if _, err := normalizeCollectConfig(unknownType, 1); err == nil {
+		t.Fatal("unknown collector types must be rejected")
+	}
+}

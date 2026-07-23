@@ -14,10 +14,13 @@ import (
 	"net"
 	"net/http"
 	"net/smtp"
+	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	alertdomain "gmha/internal/domain/alert"
@@ -29,15 +32,64 @@ import (
 // a slow third-party endpoint can never delay Agent heartbeat processing.
 type AlertService struct {
 	repo        alertdomain.Repository
-	queue       chan alertdomain.Event
+	queue       chan alertdomain.NotificationJob
 	evaluations chan hbdomain.HeartbeatPayload
 	http        *http.Client
+
+	overflowMu sync.Mutex
+	overflow   map[string]hbdomain.HeartbeatPayload
+	inFlight   sync.Map
+	runtime    alertRuntimeCounters
+}
+
+type alertRuntimeCounters struct {
+	evaluationsReceived   atomic.Uint64
+	evaluationsProcessed  atomic.Uint64
+	evaluationsCoalesced  atomic.Uint64
+	notificationsQueued   atomic.Uint64
+	notificationsDeferred atomic.Uint64
+	notificationsDropped  atomic.Uint64
+	deliveriesSucceeded   atomic.Uint64
+	deliveriesFailed      atomic.Uint64
+	lastEvaluationUnixMS  atomic.Int64
+	lastDeliveryUnixMS    atomic.Int64
+}
+
+type AlertQueueStatus struct {
+	Depth          int `json:"depth"`
+	Capacity       int `json:"capacity"`
+	Overflow       int `json:"overflow,omitempty"`
+	DurablePending int `json:"durable_pending"`
+}
+
+type AlertRuntimeStatus struct {
+	Healthy               bool             `json:"healthy"`
+	EvaluationQueue       AlertQueueStatus `json:"evaluation_queue"`
+	NotificationQueue     AlertQueueStatus `json:"notification_queue"`
+	EvaluationsReceived   uint64           `json:"evaluations_received"`
+	EvaluationsProcessed  uint64           `json:"evaluations_processed"`
+	EvaluationsCoalesced  uint64           `json:"evaluations_coalesced"`
+	NotificationsQueued   uint64           `json:"notifications_queued"`
+	NotificationsDeferred uint64           `json:"notifications_deferred"`
+	NotificationsDropped  uint64           `json:"notifications_dropped"`
+	DeliveriesSucceeded   uint64           `json:"deliveries_succeeded"`
+	DeliveriesFailed      uint64           `json:"deliveries_failed"`
+	LastEvaluationAt      *time.Time       `json:"last_evaluation_at,omitempty"`
+	LastDeliveryAt        *time.Time       `json:"last_delivery_at,omitempty"`
 }
 
 func NewAlertService(repo alertdomain.Repository) *AlertService {
-	s := &AlertService{repo: repo, queue: make(chan alertdomain.Event, 256), evaluations: make(chan hbdomain.HeartbeatPayload, 128), http: &http.Client{Timeout: 8 * time.Second}}
+	s := &AlertService{
+		repo: repo, queue: make(chan alertdomain.NotificationJob, 256),
+		evaluations: make(chan hbdomain.HeartbeatPayload, 256),
+		overflow:    make(map[string]hbdomain.HeartbeatPayload),
+		http:        &http.Client{Timeout: 8 * time.Second},
+	}
 	go s.deliveryLoop()
 	go s.evaluationLoop()
+	if _, ok := repo.(alertdomain.NotificationOutbox); ok {
+		go s.notificationRecoveryLoop()
+	}
 	return s
 }
 
@@ -53,6 +105,10 @@ func (s *AlertService) EnsureDefaults(ctx context.Context) error {
 	defaults := []alertdomain.Rule{
 		{Name: "主机 CPU 使用率过高", Metric: "cpu_usage_percent", Operator: ">=", Threshold: 85, Severity: alertdomain.SeverityWarning, ConsecutiveCount: 3},
 		{Name: "主机内存使用率严重", Metric: "mem_usage_percent", Operator: ">=", Threshold: 90, Severity: alertdomain.SeverityCritical, ConsecutiveCount: 3},
+		{Name: "主机文件系统空间不足", Metric: "host_filesystem_used_percent", Operator: ">=", Threshold: 85, Severity: alertdomain.SeverityCritical, ConsecutiveCount: 2},
+		{Name: "主机 Inode 使用率过高", Metric: "host_inode_used_percent", Operator: ">=", Threshold: 85, Severity: alertdomain.SeverityWarning, ConsecutiveCount: 2},
+		{Name: "主机 Swap 使用率过高", Metric: "host_swap_used_percent", Operator: ">=", Threshold: 80, Severity: alertdomain.SeverityWarning, ConsecutiveCount: 3},
+		{Name: "SSH 服务探测失败", Metric: "host_ssh_probe_ok", Operator: "==", Threshold: 0, Severity: alertdomain.SeverityCritical, ConsecutiveCount: 2},
 		{Name: "数据盘空间不足", Metric: "mysql_data_disk_usage", Operator: ">=", Threshold: 85, Severity: alertdomain.SeverityCritical, ConsecutiveCount: 2},
 		{Name: "Binlog 盘空间不足", Metric: "mysql_binlog_disk_usage", Operator: ">=", Threshold: 85, Severity: alertdomain.SeverityCritical, ConsecutiveCount: 2},
 		{Name: "MySQL 无法连接", Metric: "mysql_connectivity", Operator: "==", Threshold: 0, Severity: alertdomain.SeverityFatal, ConsecutiveCount: 2},
@@ -93,10 +149,10 @@ func (s *AlertService) ListRules(ctx context.Context) ([]alertdomain.Rule, error
 }
 func (s *AlertService) SaveRule(ctx context.Context, x alertdomain.Rule) (alertdomain.Rule, error) {
 	if strings.TrimSpace(x.Name) == "" || strings.TrimSpace(x.Metric) == "" {
-		return x, errors.New("name and metric are required")
+		return x, alertdomain.Invalid("name and metric are required")
 	}
 	if !validOperator(x.Operator) {
-		return x, errors.New("operator must be one of >, >=, <, <=, ==, !=")
+		return x, alertdomain.Invalid("operator must be one of >, >=, <, <=, ==, !=")
 	}
 	if len(x.Thresholds) == 0 {
 		x.Thresholds = []alertdomain.ThresholdLevel{{Severity: x.Severity, Threshold: x.Threshold, Enabled: true}}
@@ -108,17 +164,20 @@ func (s *AlertService) SaveRule(ctx context.Context, x alertdomain.Rule) (alertd
 			continue
 		}
 		if alertdomain.SeverityRank(level.Severity) == 0 || seenSeverities[level.Severity] {
-			return x, errors.New("threshold severity must be valid and unique")
+			return x, alertdomain.Invalid("threshold severity must be valid and unique")
 		}
 		seenSeverities[level.Severity] = true
 		normalized = append(normalized, level)
 	}
 	if len(normalized) == 0 {
-		return x, errors.New("at least one severity threshold must be enabled")
+		return x, alertdomain.Invalid("at least one severity threshold must be enabled")
 	}
 	sort.Slice(normalized, func(i, j int) bool {
 		return alertdomain.SeverityRank(normalized[i].Severity) < alertdomain.SeverityRank(normalized[j].Severity)
 	})
+	if err := validateThresholdOrder(x.Operator, normalized); err != nil {
+		return x, err
+	}
 	x.Thresholds = normalized
 	x.Severity, x.Threshold = normalized[0].Severity, normalized[0].Threshold
 	if x.ConsecutiveCount < 1 {
@@ -149,21 +208,21 @@ func (s *AlertService) ListFilters(ctx context.Context) ([]alertdomain.Filter, e
 }
 func (s *AlertService) SaveFilter(ctx context.Context, x alertdomain.Filter) (alertdomain.Filter, error) {
 	if strings.TrimSpace(x.Name) == "" {
-		return x, errors.New("filter name is required")
+		return x, alertdomain.Invalid("filter name is required")
 	}
 	if strings.TrimSpace(x.ClusterPattern+x.MachinePattern+x.IPCIDR+x.CategoryPattern+x.MessagePattern) == "" {
-		return x, errors.New("at least one filter condition is required")
+		return x, alertdomain.Invalid("at least one filter condition is required")
 	}
 	if x.IPCIDR != "" {
 		if _, _, err := net.ParseCIDR(strings.TrimSpace(x.IPCIDR)); err != nil {
-			return x, errors.New("invalid IP CIDR")
+			return x, alertdomain.Invalid("invalid IP CIDR")
 		}
 	}
 	if x.UseRegex {
 		for _, pattern := range []string{x.ClusterPattern, x.MachinePattern, x.CategoryPattern, x.MessagePattern} {
 			if pattern != "" {
 				if _, err := regexp.Compile(pattern); err != nil {
-					return x, fmt.Errorf("invalid regular expression: %w", err)
+					return x, alertdomain.Invalid(fmt.Sprintf("invalid regular expression: %v", err))
 				}
 			}
 		}
@@ -183,44 +242,84 @@ func (s *AlertService) DeleteFilter(ctx context.Context, id string) error {
 	return s.repo.DeleteFilter(ctx, id)
 }
 func (s *AlertService) ListEvents(ctx context.Context, f alertdomain.EventFilter) ([]alertdomain.Event, error) {
-	items, err := s.repo.ListEvents(ctx, f)
+	return s.repo.ListEvents(ctx, f)
+}
+func (s *AlertService) Summary(ctx context.Context) (alertdomain.EventSummary, error) {
+	if reader, ok := s.repo.(alertdomain.EventSummaryReader); ok {
+		return reader.SummarizeEvents(ctx, time.Now().UTC())
+	}
+	items, err := s.ListEvents(ctx, alertdomain.EventFilter{Limit: 1000})
 	if err != nil {
-		return nil, err
+		return alertdomain.EventSummary{}, err
 	}
-	filters, err := s.repo.ListFilters(ctx)
-	if err != nil || len(filters) == 0 {
-		return items, err
-	}
-	out := make([]alertdomain.Event, 0, len(items))
+	out := alertdomain.EventSummary{Counts: defaultAlertCounts(), Total: len(items)}
+	now := time.Now().UTC()
 	for _, event := range items {
-		if !storedEventFiltered(filters, event) {
-			out = append(out, event)
+		out.Counts[event.Status]++
+		if event.LastSeenAt.After(now.Add(-24 * time.Hour)) {
+			out.Last24Hours++
+		}
+		if event.Status != "firing" {
+			continue
+		}
+		out.Counts[string(event.Severity)]++
+		if event.AcknowledgedAt != nil {
+			out.ActiveAcknowledged++
+		}
+		if event.SilencedUntil != nil && event.SilencedUntil.After(now) {
+			out.ActiveSilenced++
 		}
 	}
 	return out, nil
 }
+func defaultAlertCounts() map[string]int {
+	return map[string]int{"firing": 0, "resolved": 0, "notice": 0, "warning": 0, "critical": 0, "fatal": 0}
+}
 func (s *AlertService) EventAction(ctx context.Context, id, action, actor string, until *time.Time) error {
+	if strings.TrimSpace(id) == "" {
+		return alertdomain.Invalid("event id is required")
+	}
+	switch action {
+	case "acknowledge", "resolve":
+	case "silence":
+		if until == nil || !until.After(time.Now().UTC()) {
+			return alertdomain.Invalid("silence deadline must be in the future")
+		}
+	default:
+		return alertdomain.Invalid("action must be acknowledge, silence or resolve")
+	}
 	return s.repo.UpdateEventAction(ctx, id, action, actor, until)
 }
-func (s *AlertService) UpdateAutomationState(ctx context.Context, id, state string) error {
+func (s *AlertService) UpdateAutomationState(ctx context.Context, id, state, expectedState string) error {
+	if strings.TrimSpace(id) == "" {
+		return alertdomain.Invalid("event id is required")
+	}
 	switch state {
 	case "pending", "claimed", "running", "succeeded", "failed", "skipped":
 	default:
-		return errors.New("invalid automation state")
+		return alertdomain.Invalid("invalid automation state")
 	}
-	return s.repo.UpdateAutomationState(ctx, id, state)
+	if expectedState != "" {
+		switch expectedState {
+		case "pending", "claimed", "running", "succeeded", "failed", "skipped":
+		default:
+			return alertdomain.Invalid("invalid expected automation state")
+		}
+	}
+	return s.repo.UpdateAutomationState(ctx, id, state, expectedState)
 }
 func (s *AlertService) ListChannels(ctx context.Context) ([]alertdomain.Channel, error) {
 	return s.repo.ListChannels(ctx)
 }
 func (s *AlertService) SaveChannel(ctx context.Context, x alertdomain.Channel) (alertdomain.Channel, error) {
+	x.Name, x.Type = strings.TrimSpace(x.Name), strings.TrimSpace(x.Type)
 	if x.Name == "" || x.Type == "" {
-		return x, errors.New("name and type are required")
+		return x, alertdomain.Invalid("name and type are required")
 	}
 	switch x.Type {
 	case "email", "dingtalk", "feishu", "webhook", "zabbix":
 	default:
-		return x, errors.New("unsupported channel type")
+		return x, alertdomain.Invalid("unsupported channel type")
 	}
 	if err := validateChannelConfig(x); err != nil {
 		return x, err
@@ -232,6 +331,9 @@ func (s *AlertService) SaveChannel(ctx context.Context, x alertdomain.Channel) (
 	}
 	if x.MinimumSeverity == "" {
 		x.MinimumSeverity = alertdomain.SeverityWarning
+	}
+	if alertdomain.SeverityRank(x.MinimumSeverity) == 0 {
+		return x, alertdomain.Invalid("minimum severity is invalid")
 	}
 	x.UpdatedAt = now
 	return x, s.repo.SaveChannel(ctx, x)
@@ -247,15 +349,48 @@ func (s *AlertService) SaveMetricConfig(ctx context.Context, kind string, cfg dy
 }
 
 func (s *AlertService) ObserveHeartbeat(ctx context.Context, payload hbdomain.HeartbeatPayload) {
+	s.runtime.evaluationsReceived.Add(1)
 	select {
 	case s.evaluations <- payload:
 	default:
+		key := payload.AgentID
+		if key == "" {
+			key = payload.MachineID
+		}
+		if key == "" {
+			key = fmt.Sprintf("anonymous-%d", time.Now().UnixNano())
+		}
+		s.overflowMu.Lock()
+		s.overflow[key] = payload
+		s.overflowMu.Unlock()
+		s.runtime.evaluationsCoalesced.Add(1)
 	}
 }
 func (s *AlertService) evaluationLoop() {
 	for payload := range s.evaluations {
-		s.evaluatePayload(context.Background(), payload)
+		s.processEvaluation(payload)
+		for {
+			next, ok := s.popOverflow()
+			if !ok {
+				break
+			}
+			s.processEvaluation(next)
+		}
 	}
+}
+func (s *AlertService) processEvaluation(payload hbdomain.HeartbeatPayload) {
+	s.evaluatePayload(context.Background(), payload)
+	s.runtime.evaluationsProcessed.Add(1)
+	s.runtime.lastEvaluationUnixMS.Store(time.Now().UTC().UnixMilli())
+}
+func (s *AlertService) popOverflow() (hbdomain.HeartbeatPayload, bool) {
+	s.overflowMu.Lock()
+	defer s.overflowMu.Unlock()
+	for key, payload := range s.overflow {
+		delete(s.overflow, key)
+		return payload, true
+	}
+	return hbdomain.HeartbeatPayload{}, false
 }
 func (s *AlertService) evaluatePayload(ctx context.Context, payload hbdomain.HeartbeatPayload) {
 	rules, err := s.repo.ListRules(ctx)
@@ -269,14 +404,8 @@ func (s *AlertService) evaluatePayload(ctx context.Context, payload hbdomain.Hea
 			byMetric[r.Metric] = append(byMetric[r.Metric], r)
 		}
 	}
-	for _, metric := range payload.Metrics {
-		if !metric.Success {
-			continue
-		}
-		numeric, ok := metricNumber(metric.Value)
-		if !ok {
-			continue
-		}
+	for _, metric := range alertEvaluationMetrics(payload.Metrics) {
+		numeric, _ := metricNumber(metric.Value)
 		for _, rule := range byMetric[metric.Name] {
 			if rule.ClusterID != "" && rule.ClusterID != payload.ClusterID {
 				continue
@@ -288,6 +417,7 @@ func (s *AlertService) evaluatePayload(ctx context.Context, payload hbdomain.Hea
 				continue
 			}
 			if alertFiltered(filters, rule, payload, metric) {
+				s.suppressEvaluation(ctx, rule, payload, metric, numeric)
 				continue
 			}
 			s.evaluate(ctx, rule, payload, metric, numeric)
@@ -295,10 +425,64 @@ func (s *AlertService) evaluatePayload(ctx context.Context, payload hbdomain.Hea
 	}
 }
 
+func (s *AlertService) suppressEvaluation(ctx context.Context, rule alertdomain.Rule, payload hbdomain.HeartbeatPayload, metric dynamicdomain.MetricResult, value float64) {
+	fp := fingerprint(rule.ID, payload.MachineID, metric.Labels)
+	now := time.Now().UTC()
+	state := alertdomain.EvaluationState{
+		Fingerprint: fp, RuleID: rule.ID, Consecutive: 0, LastValue: value,
+		LastSampleAt: metric.CollectedAt.UTC(), UpdatedAt: now,
+	}
+	_ = s.repo.SaveEvaluationState(ctx, state)
+	activeEvents, err := s.activeEventsForTarget(ctx, rule, payload.MachineID, metric.Labels, fp)
+	if err != nil {
+		return
+	}
+	for _, active := range activeEvents {
+		resolveAlertEvent(&active, value, now, "suppressed_by_filter")
+		_ = s.repo.SaveEvent(ctx, active)
+	}
+}
+
+// alertEvaluationMetrics turns structured collectors into the same normalized
+// numeric leaf metrics used by the performance API. This makes disk devices,
+// filesystems, network interfaces and load averages first-class alert targets.
+func alertEvaluationMetrics(metrics []dynamicdomain.MetricResult) []dynamicdomain.MetricResult {
+	out := make([]dynamicdomain.MetricResult, 0, len(metrics)*2)
+	for _, metric := range metrics {
+		if !metric.Success {
+			continue
+		}
+		if number, ok := performanceNumber(metric.Value); ok {
+			metric.Value = number
+			metric.ValueType = dynamicdomain.ValueTypeFloat
+			out = append(out, metric)
+			continue
+		}
+		leaves := flattenPerformanceMetric(metric)
+		if len(leaves) == 0 && strings.HasPrefix(metric.Name, "mysql_") {
+			if number, ok := structuredMetricNumber(metric.Value); ok {
+				leaves = append(leaves, performanceLeaf{name: metric.Name, category: metric.Category, value: number, valueType: dynamicdomain.ValueTypeFloat})
+			}
+		}
+		for _, leaf := range leaves {
+			out = append(out, dynamicdomain.MetricResult{
+				Name: leaf.name, Category: leaf.category, Success: true,
+				ValueType: leaf.valueType, Value: leaf.value,
+				Labels:      mergeLabels(metric.Labels, leaf.labels),
+				CollectedAt: metric.CollectedAt, DurationMS: metric.DurationMS,
+			})
+		}
+	}
+	return out
+}
+
 func (s *AlertService) evaluate(ctx context.Context, rule alertdomain.Rule, payload hbdomain.HeartbeatPayload, metric dynamicdomain.MetricResult, v float64) {
 	fp := fingerprint(rule.ID, payload.MachineID, metric.Labels)
 	state, _, err := s.repo.GetEvaluationState(ctx, fp)
 	if err != nil {
+		return
+	}
+	if !metric.CollectedAt.IsZero() && !state.LastSampleAt.IsZero() && !metric.CollectedAt.After(state.LastSampleAt) {
 		return
 	}
 	now := time.Now().UTC()
@@ -311,18 +495,16 @@ func (s *AlertService) evaluate(ctx context.Context, rule alertdomain.Rule, payl
 	state.Fingerprint = fp
 	state.RuleID = rule.ID
 	state.LastValue = v
+	state.LastSampleAt = metric.CollectedAt.UTC()
 	state.UpdatedAt = now
 	_ = s.repo.SaveEvaluationState(ctx, state)
-	active, ok, err := s.repo.GetActiveEvent(ctx, fp)
+	activeEvents, err := s.activeEventsForTarget(ctx, rule, payload.MachineID, metric.Labels, fp)
 	if err != nil {
 		return
 	}
 	if !firing {
-		if ok {
-			active.Status = "resolved"
-			active.LastSeenAt = now
-			active.Value = v
-			active.ResolvedAt = &now
+		for _, active := range activeEvents {
+			resolveAlertEvent(&active, v, now, "condition_cleared")
 			_ = s.repo.SaveEvent(ctx, active)
 			s.enqueue(active)
 		}
@@ -330,6 +512,16 @@ func (s *AlertService) evaluate(ctx context.Context, rule alertdomain.Rule, payl
 	}
 	if state.Consecutive < rule.ConsecutiveCount {
 		return
+	}
+	var active alertdomain.Event
+	ok := len(activeEvents) > 0
+	if ok {
+		active = activeEvents[0]
+		active.Fingerprint = fp
+		for _, duplicate := range activeEvents[1:] {
+			resolveAlertEvent(&duplicate, v, now, "duplicate_merged")
+			_ = s.repo.SaveEvent(ctx, duplicate)
+		}
 	}
 	if !ok {
 		labels := cloneLabels(metric.Labels)
@@ -349,14 +541,51 @@ func (s *AlertService) evaluate(ctx context.Context, rule alertdomain.Rule, payl
 	notify := active.SilencedUntil == nil || active.SilencedUntil.Before(now)
 	notify = notify && (rule.MaxNotifications == 0 || active.NotificationCount < rule.MaxNotifications)
 	notify = notify && (active.LastNotifiedAt == nil || now.Sub(*active.LastNotifiedAt) >= time.Duration(rule.RepeatIntervalSeconds)*time.Second)
+	// Persist the event before creating its durable notification job. External
+	// consumers must never receive an event ID that is absent from the API.
+	if err := s.repo.SaveEvent(ctx, active); err != nil {
+		return
+	}
 	if notify {
 		notify = s.enqueue(active)
 		if notify {
 			active.NotificationCount++
 			active.LastNotifiedAt = &now
+			_ = s.repo.SaveEvent(ctx, active)
 		}
 	}
-	_ = s.repo.SaveEvent(ctx, active)
+}
+
+func (s *AlertService) activeEventsForTarget(ctx context.Context, rule alertdomain.Rule, machineID string, labels map[string]string, fp string) ([]alertdomain.Event, error) {
+	if reader, ok := s.repo.(alertdomain.ActiveEventReader); ok {
+		candidates, err := reader.ListActiveEventsForRuleTarget(ctx, rule.ID, machineID)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]alertdomain.Event, 0, len(candidates))
+		for _, event := range candidates {
+			if event.Fingerprint == fp || sameAlertTarget(event.Labels, labels) {
+				out = append(out, event)
+			}
+		}
+		return out, nil
+	}
+	active, found, err := s.repo.GetActiveEvent(ctx, fp)
+	if err != nil || !found {
+		return nil, err
+	}
+	return []alertdomain.Event{active}, nil
+}
+
+func resolveAlertEvent(event *alertdomain.Event, value float64, now time.Time, reason string) {
+	event.Status = "resolved"
+	event.Value = value
+	event.LastSeenAt = now
+	event.ResolvedAt = &now
+	if event.Labels == nil {
+		event.Labels = map[string]string{}
+	}
+	event.Labels["resolution_reason"] = reason
 }
 
 func matchingThreshold(rule alertdomain.Rule, value float64) (alertdomain.ThresholdLevel, bool) {
@@ -387,28 +616,6 @@ func alertFiltered(filters []alertdomain.Filter, rule alertdomain.Rule, payload 
 			continue
 		}
 		return true
-	}
-	return false
-}
-
-func storedEventFiltered(filters []alertdomain.Filter, event alertdomain.Event) bool {
-	for _, filter := range filters {
-		if !filter.Enabled {
-			continue
-		}
-		machine := strings.TrimSpace(event.Labels["machine_name"] + " " + event.MachineID)
-		category := event.Labels["alert_category"]
-		if category == "" {
-			category = event.Labels["metric_scope"]
-		}
-		message := strings.Join([]string{event.RuleName, event.Metric, event.Labels["display_name"]}, " ")
-		if matchAlertText(filter.ClusterPattern, event.ClusterID, filter.UseRegex) &&
-			matchAlertText(filter.MachinePattern, machine, filter.UseRegex) &&
-			matchAlertText(filter.CategoryPattern, category, filter.UseRegex) &&
-			matchAlertText(filter.MessagePattern, message, filter.UseRegex) &&
-			matchAlertCIDR(filter.IPCIDR, event.Labels["machine_ip"]) {
-			return true
-		}
 	}
 	return false
 }
@@ -459,72 +666,220 @@ func cloneLabels(source map[string]string) map[string]string {
 }
 
 func (s *AlertService) enqueue(event alertdomain.Event) bool {
+	now := time.Now().UTC()
+	job := alertdomain.NotificationJob{
+		ID:    stableID("notification", event.ID, fmt.Sprint(now.UnixNano())),
+		Event: event, CreatedAt: now, UpdatedAt: now,
+	}
+	durable := false
+	if outbox, ok := s.repo.(alertdomain.NotificationOutbox); ok {
+		if err := outbox.SaveNotificationJob(context.Background(), job); err != nil {
+			s.runtime.notificationsDropped.Add(1)
+			return false
+		}
+		durable = true
+	}
+	s.inFlight.Store(job.ID, struct{}{})
 	select {
-	case s.queue <- event:
+	case s.queue <- job:
+		s.runtime.notificationsQueued.Add(1)
 		return true
 	default:
+		s.inFlight.Delete(job.ID)
+		if durable {
+			s.runtime.notificationsDeferred.Add(1)
+			return true
+		}
+		s.runtime.notificationsDropped.Add(1)
 		return false
 	}
 }
 func (s *AlertService) deliveryLoop() {
-	for event := range s.queue {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		channels, err := s.repo.ListChannels(ctx)
-		if err == nil {
-			for _, channel := range channels {
-				if channel.Enabled && alertdomain.SeverityRank(event.Severity) >= alertdomain.SeverityRank(channel.MinimumSeverity) {
-					var deliveryErr error
-					for attempt := 0; attempt < 3; attempt++ {
-						deliveryErr = s.deliver(ctx, channel, event)
-						if deliveryErr == nil {
-							break
+	for job := range s.queue {
+		func() {
+			defer s.inFlight.Delete(job.ID)
+			event := job.Event
+			allSucceeded := true
+			lastError := ""
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			channels, err := s.repo.ListChannels(ctx)
+			cancel()
+			if err != nil {
+				allSucceeded, lastError = false, err.Error()
+			} else {
+				for _, channel := range channels {
+					if channel.Enabled && alertdomain.SeverityRank(event.Severity) >= alertdomain.SeverityRank(channel.MinimumSeverity) {
+						ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+						var deliveryErr error
+					retryLoop:
+						for attempt := 0; attempt < 3; attempt++ {
+							deliveryErr = s.deliver(ctx, channel, event)
+							if deliveryErr == nil {
+								break
+							}
+							select {
+							case <-ctx.Done():
+								break retryLoop
+							case <-time.After(time.Duration(attempt+1) * 200 * time.Millisecond):
+							}
 						}
-						select {
-						case <-ctx.Done():
-							break
-						case <-time.After(time.Duration(attempt+1) * 200 * time.Millisecond):
+						cancel()
+						now := time.Now().UTC()
+						channel.UpdatedAt = now
+						if deliveryErr != nil {
+							channel.LastStatus = "failed"
+							channel.LastError = deliveryErr.Error()
+							allSucceeded, lastError = false, deliveryErr.Error()
+							s.runtime.deliveriesFailed.Add(1)
+						} else {
+							channel.LastStatus = "success"
+							channel.LastError = ""
+							channel.LastDeliveredAt = &now
+							s.runtime.deliveriesSucceeded.Add(1)
 						}
+						persistCtx, persistCancel := context.WithTimeout(context.Background(), 3*time.Second)
+						if err := s.repo.SaveChannel(persistCtx, channel); err != nil {
+							allSucceeded, lastError = false, err.Error()
+						}
+						delivery := alertdomain.Delivery{ID: stableID(event.ID, channel.ID, fmt.Sprint(now.UnixNano())), EventID: event.ID, RuleName: event.RuleName, Severity: event.Severity, MachineID: event.MachineID, ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: channel.Type, Status: channel.LastStatus, DeliveredAt: now}
+						if deliveryErr != nil {
+							delivery.Error = deliveryErr.Error()
+						}
+						if err := s.repo.SaveDelivery(persistCtx, delivery); err != nil {
+							allSucceeded, lastError = false, err.Error()
+						}
+						persistCancel()
+						s.runtime.lastDeliveryUnixMS.Store(now.UnixMilli())
 					}
-					now := time.Now().UTC()
-					channel.UpdatedAt = now
-					if deliveryErr != nil {
-						channel.LastStatus = "failed"
-						channel.LastError = deliveryErr.Error()
-					} else {
-						channel.LastStatus = "success"
-						channel.LastError = ""
-						channel.LastDeliveredAt = &now
-					}
-					_ = s.repo.SaveChannel(ctx, channel)
-					delivery := alertdomain.Delivery{ID: stableID(event.ID, channel.ID, fmt.Sprint(now.UnixNano())), EventID: event.ID, RuleName: event.RuleName, Severity: event.Severity, MachineID: event.MachineID, ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: channel.Type, Status: channel.LastStatus, DeliveredAt: now}
-					if deliveryErr != nil {
-						delivery.Error = deliveryErr.Error()
-					}
-					_ = s.repo.SaveDelivery(ctx, delivery)
 				}
 			}
+			if outbox, ok := s.repo.(alertdomain.NotificationOutbox); ok {
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				_ = outbox.FinishNotificationJob(ctx, job.ID, allSucceeded, lastError, time.Now().UTC())
+				cancel()
+			}
+		}()
+	}
+}
+
+func (s *AlertService) notificationRecoveryLoop() {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		outbox, ok := s.repo.(alertdomain.NotificationOutbox)
+		if !ok {
+			return
 		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		jobs, err := outbox.ListPendingNotificationJobs(ctx, time.Now().UTC().Add(-30*time.Second), 100)
+		cancel()
+		if err != nil {
+			continue
+		}
+		for _, job := range jobs {
+			if _, loaded := s.inFlight.LoadOrStore(job.ID, struct{}{}); loaded {
+				continue
+			}
+			select {
+			case s.queue <- job:
+				s.runtime.notificationsQueued.Add(1)
+			default:
+				s.inFlight.Delete(job.ID)
+				s.runtime.notificationsDeferred.Add(1)
+				return
+			}
+		}
+	}
+}
+
+func (s *AlertService) RuntimeStatus() AlertRuntimeStatus {
+	s.overflowMu.Lock()
+	overflow := len(s.overflow)
+	s.overflowMu.Unlock()
+	durablePending := 0
+	if outbox, ok := s.repo.(alertdomain.NotificationOutbox); ok {
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		durablePending, _ = outbox.CountPendingNotificationJobs(ctx)
 		cancel()
 	}
+	out := AlertRuntimeStatus{
+		EvaluationQueue:       AlertQueueStatus{Depth: len(s.evaluations), Capacity: cap(s.evaluations), Overflow: overflow},
+		NotificationQueue:     AlertQueueStatus{Depth: len(s.queue), Capacity: cap(s.queue), DurablePending: durablePending},
+		EvaluationsReceived:   s.runtime.evaluationsReceived.Load(),
+		EvaluationsProcessed:  s.runtime.evaluationsProcessed.Load(),
+		EvaluationsCoalesced:  s.runtime.evaluationsCoalesced.Load(),
+		NotificationsQueued:   s.runtime.notificationsQueued.Load(),
+		NotificationsDeferred: s.runtime.notificationsDeferred.Load(),
+		NotificationsDropped:  s.runtime.notificationsDropped.Load(),
+		DeliveriesSucceeded:   s.runtime.deliveriesSucceeded.Load(),
+		DeliveriesFailed:      s.runtime.deliveriesFailed.Load(),
+	}
+	out.Healthy = overflow == 0 &&
+		out.EvaluationQueue.Depth < out.EvaluationQueue.Capacity*4/5 &&
+		out.NotificationQueue.Depth < out.NotificationQueue.Capacity*4/5 &&
+		out.NotificationQueue.DurablePending < out.NotificationQueue.Capacity*4/5
+	out.LastEvaluationAt = unixMilliTime(s.runtime.lastEvaluationUnixMS.Load())
+	out.LastDeliveryAt = unixMilliTime(s.runtime.lastDeliveryUnixMS.Load())
+	return out
+}
+
+func unixMilliTime(value int64) *time.Time {
+	if value <= 0 {
+		return nil
+	}
+	result := time.UnixMilli(value).UTC()
+	return &result
 }
 func validateChannelConfig(c alertdomain.Channel) error {
 	require := func(keys ...string) error {
 		for _, key := range keys {
 			if strings.TrimSpace(c.Config[key]) == "" {
-				return fmt.Errorf("%s is required for %s", key, c.Type)
+				return alertdomain.Invalid(fmt.Sprintf("%s is required for %s", key, c.Type))
 			}
 		}
 		return nil
 	}
 	switch c.Type {
 	case "email":
-		return require("host", "username", "password", "from", "to")
+		if err := require("host", "username", "password", "from", "to"); err != nil {
+			return err
+		}
+		if err := validatePort(c.Config["port"], 25); err != nil {
+			return err
+		}
+		return nil
 	case "dingtalk", "feishu":
-		return require("webhook")
+		if err := require("webhook"); err != nil {
+			return err
+		}
+		return validateAlertHTTPURL(c.Config["webhook"])
 	case "webhook":
-		return require("url")
+		if err := require("url"); err != nil {
+			return err
+		}
+		return validateAlertHTTPURL(c.Config["url"])
 	case "zabbix":
-		return require("host")
+		if err := require("host"); err != nil {
+			return err
+		}
+		return validatePort(c.Config["port"], 10051)
+	}
+	return nil
+}
+func validateAlertHTTPURL(raw string) error {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return alertdomain.Invalid("webhook address must be a valid http or https URL")
+	}
+	return nil
+}
+func validatePort(raw string, defaultPort int) error {
+	if strings.TrimSpace(raw) == "" {
+		raw = strconv.Itoa(defaultPort)
+	}
+	port, err := strconv.Atoi(raw)
+	if err != nil || port < 1 || port > 65535 {
+		return alertdomain.Invalid("port must be between 1 and 65535")
 	}
 	return nil
 }
@@ -715,6 +1070,24 @@ func validOperator(v string) bool {
 	}
 	return false
 }
+func validateThresholdOrder(operator string, levels []alertdomain.ThresholdLevel) error {
+	if len(levels) <= 1 {
+		return nil
+	}
+	if operator == "==" || operator == "!=" {
+		return alertdomain.Invalid("== and != rules support exactly one enabled severity threshold")
+	}
+	for i := 1; i < len(levels); i++ {
+		previous, current := levels[i-1].Threshold, levels[i].Threshold
+		if (operator == ">" || operator == ">=") && current < previous {
+			return alertdomain.Invalid("higher severities must use greater or equal thresholds")
+		}
+		if (operator == "<" || operator == "<=") && current > previous {
+			return alertdomain.Invalid("higher severities must use lower or equal thresholds")
+		}
+	}
+	return nil
+}
 func compare(v float64, op string, t float64) bool {
 	switch op {
 	case ">":
@@ -741,17 +1114,58 @@ func labelsMatch(expected, actual map[string]string) bool {
 	return true
 }
 func fingerprint(ruleID, machineID string, labels map[string]string) string {
-	keys := make([]string, 0, len(labels))
-	for k := range labels {
+	identity := alertIdentityLabels(labels)
+	keys := make([]string, 0, len(identity))
+	for k := range identity {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	b := strings.Builder{}
 	b.WriteString(ruleID + "|" + machineID)
 	for _, k := range keys {
-		b.WriteString("|" + k + "=" + labels[k])
+		b.WriteString("|" + k + "=" + identity[k])
 	}
 	return stableID(b.String(), "")
+}
+
+func alertIdentityLabels(labels map[string]string) map[string]string {
+	out := make(map[string]string, len(labels))
+	mysqlPort := strings.TrimSpace(labels["mysql_port"])
+	for key, raw := range labels {
+		value := strings.TrimSpace(raw)
+		if value == "" || !alertIdentityLabel(key, mysqlPort != "") {
+			continue
+		}
+		out[key] = value
+	}
+	if mysqlPort != "" {
+		out["mysql_port"] = mysqlPort
+	}
+	return out
+}
+
+func alertIdentityLabel(key string, hasMySQLPort bool) bool {
+	switch key {
+	case "display_name", "metric_scope", "machine_name", "machine_ip", "alert_category", "resolution_reason":
+		return false
+	case "mysql_host", "mysql_endpoint", "mysql_instance":
+		return !hasMySQLPort
+	default:
+		return true
+	}
+}
+
+func sameAlertTarget(left, right map[string]string) bool {
+	a, b := alertIdentityLabels(left), alertIdentityLabels(right)
+	if len(a) != len(b) {
+		return false
+	}
+	for key, value := range a {
+		if b[key] != value {
+			return false
+		}
+	}
+	return true
 }
 func stableID(parts ...string) string {
 	sum := sha256.Sum256([]byte(strings.Join(parts, "|")))

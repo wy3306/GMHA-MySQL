@@ -17,9 +17,12 @@ import (
 
 	"gmha/internal/app"
 	taskdomain "gmha/internal/domain/task"
+	mysqlapp "gmha/internal/mysql"
 	taskusecase "gmha/internal/usecase/task"
 	"golang.org/x/net/websocket"
 )
+
+const mysqlDefaultsFilePlaceholder = "__GMHA_MYSQL_DEFAULTS_FILE__"
 
 // TaskHandler 是任务管理 HTTP API 的请求处理器。
 type TaskHandler struct {
@@ -168,8 +171,6 @@ type clusterAutomationRequest struct {
 	Operation       string   `json:"operation"`
 	Script          string   `json:"script"`
 	Port            int      `json:"port"`
-	MySQLUser       string   `json:"mysql_user"`
-	MySQLPassword   string   `json:"mysql_password"`
 	UserAction      string   `json:"user_action"`
 	TargetUsername  string   `json:"target_username"`
 	TargetPassword  string   `json:"target_password"`
@@ -199,6 +200,44 @@ type clusterAutomationResponse struct {
 	Items        []clusterAutomationItem `json:"items"`
 }
 
+type clusterAutomationCollectionRow struct {
+	TaskID           string `json:"task_id"`
+	MachineID        string `json:"machine_id"`
+	Machine          string `json:"machine"`
+	IP               string `json:"ip"`
+	Status           string `json:"status"`
+	Error            string `json:"error,omitempty"`
+	Hostname         string `json:"hostname,omitempty"`
+	OS               string `json:"os,omitempty"`
+	Architecture     string `json:"architecture,omitempty"`
+	CPUCores         int    `json:"cpu_cores,omitempty"`
+	MemoryGB         int    `json:"memory_gb,omitempty"`
+	DiskFreeGB       int    `json:"disk_free_gb,omitempty"`
+	GlibcVersion     string `json:"glibc_version,omitempty"`
+	SELinux          string `json:"selinux,omitempty"`
+	Firewall         string `json:"firewall,omitempty"`
+	NTPEnabled       bool   `json:"ntp_enabled"`
+	TimeOffsetMS     int64  `json:"time_offset_ms,omitempty"`
+	MySQLVersion     string `json:"mysql_version,omitempty"`
+	MySQLPort        int    `json:"mysql_port,omitempty"`
+	ThreadsConnected string `json:"threads_connected,omitempty"`
+	ThreadsRunning   string `json:"threads_running,omitempty"`
+	Questions        string `json:"questions,omitempty"`
+	Queries          string `json:"queries,omitempty"`
+	QPS              string `json:"qps,omitempty"`
+	TPS              string `json:"tps,omitempty"`
+	SlowQueries      string `json:"slow_queries,omitempty"`
+	Uptime           string `json:"uptime,omitempty"`
+}
+
+type clusterAutomationCollectionResponse struct {
+	Operation string                           `json:"operation"`
+	Ready     bool                             `json:"ready"`
+	Pending   int                              `json:"pending"`
+	Failed    int                              `json:"failed"`
+	Rows      []clusterAutomationCollectionRow `json:"rows"`
+}
+
 type mysqlUserTaskRequest struct {
 	Machine        string   `json:"machine"`
 	Port           int      `json:"port"`
@@ -207,6 +246,73 @@ type mysqlUserTaskRequest struct {
 	TargetPassword string   `json:"target_password"`
 	TargetHost     string   `json:"target_host"`
 	Privileges     []string `json:"privileges"`
+}
+
+type mysqlIndexTaskRequest struct {
+	Machine          string                    `json:"machine"`
+	Port             int                       `json:"port"`
+	Action           string                    `json:"action"`
+	Schema           string                    `json:"schema"`
+	Table            string                    `json:"table"`
+	Name             string                    `json:"name"`
+	NewName          string                    `json:"new_name"`
+	Kind             string                    `json:"kind"`
+	Columns          []mysqlIndexColumnRequest `json:"columns"`
+	LockMode         string                    `json:"lock_mode"`
+	Purpose          string                    `json:"purpose"`
+	Impact           string                    `json:"impact"`
+	LockAcknowledged bool                      `json:"lock_acknowledged"`
+	OnlineWithPT     bool                      `json:"online_with_pt"`
+	Confirmation     string                    `json:"confirmation"`
+}
+
+type mysqlIndexColumnRequest struct {
+	Name      string `json:"name"`
+	PrefixLen int    `json:"prefix_length"`
+	Direction string `json:"direction"`
+}
+
+// mysqlOnlineDDLTaskRequest deliberately accepts an ALTER clause instead of
+// arbitrary SQL. The Manager always executes it through pt-online-schema-change
+// and keeps connection credentials inside the Agent.
+type mysqlOnlineDDLTaskRequest struct {
+	Machine                string  `json:"machine"`
+	Port                   int     `json:"port"`
+	Action                 string  `json:"action"`
+	Schema                 string  `json:"schema"`
+	Table                  string  `json:"table"`
+	Alter                  string  `json:"alter"`
+	Purpose                string  `json:"purpose"`
+	Impact                 string  `json:"impact"`
+	MaxLoadThreadsRunning  int     `json:"max_load_threads_running"`
+	CriticalThreadsRunning int     `json:"critical_threads_running"`
+	MaxLagSeconds          int     `json:"max_lag_seconds"`
+	ChunkTimeSeconds       float64 `json:"chunk_time_seconds"`
+	CheckIntervalSeconds   int     `json:"check_interval_seconds"`
+	AlterForeignKeysMethod string  `json:"alter_foreign_keys_method"`
+	RiskAcknowledged       bool    `json:"risk_acknowledged"`
+	Confirmation           string  `json:"confirmation"`
+}
+
+// mysqlArchiveTaskRequest describes a same-instance pt-archiver workflow.
+// Credentials are intentionally absent: the Agent injects its registered MHA
+// account through a short-lived defaults file immediately before execution.
+type mysqlArchiveTaskRequest struct {
+	Machine           string `json:"machine"`
+	Port              int    `json:"port"`
+	Action            string `json:"action"`
+	SourceSchema      string `json:"source_schema"`
+	SourceTable       string `json:"source_table"`
+	DestinationSchema string `json:"destination_schema"`
+	DestinationTable  string `json:"destination_table"`
+	Where             string `json:"where"`
+	Index             string `json:"index,omitempty"`
+	BatchSize         int    `json:"batch_size"`
+	SleepSeconds      int    `json:"sleep_seconds"`
+	RunTimeSeconds    int    `json:"run_time_seconds,omitempty"`
+	DeleteSource      bool   `json:"delete_source"`
+	RiskAcknowledged  bool   `json:"risk_acknowledged"`
+	Confirmation      string `json:"confirmation"`
 }
 
 type createMySQLInstallTaskRequest struct {
@@ -259,6 +365,7 @@ type mysqlParameterTaskRequest struct {
 	RestartTargets   []mysqlParameterTargetRequest `json:"restart_targets"`
 	Changes          []mysqlParameterChangeRequest `json:"changes"`
 	MySQLDPath       string                        `json:"-"`
+	Version          string                        `json:"-"`
 }
 
 type mysqlParameterTargetRequest struct {
@@ -267,6 +374,7 @@ type mysqlParameterTargetRequest struct {
 	ConfigPath  string `json:"config_path"`
 	SystemdUnit string `json:"systemd_unit"`
 	MySQLDPath  string `json:"-"`
+	Version     string `json:"-"`
 }
 
 type mysqlParameterChangeRequest struct {
@@ -404,6 +512,7 @@ func (h *TaskHandler) HandleClusterAutomation(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	req.Clusters = normalizeAutomationClusters(req.Clusters)
 	machines, err := h.service.ListClusterMachines(r.Context(), req.Clusters)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -434,14 +543,30 @@ func (h *TaskHandler) HandleClusterAutomation(w http.ResponseWriter, r *http.Req
 		if req.Operation == "collect_machine" {
 			detail, err = h.service.CreateCollectMachineInfoTask(r.Context(), machine.IP)
 		} else {
-			command, commandErr := clusterAutomationCommand(req)
+			var instance mysqlapp.Instance
+			if isDatabaseAutomationOperation(req.Operation) {
+				_, instance, err = h.service.ResolveMySQLInstance(r.Context(), machine.ID, req.Port)
+				if err != nil {
+					item.Error = fmt.Sprintf("端口 %d 未登记可管理的 MySQL 实例: %v", req.Port, err)
+					result.Failed++
+					result.Items = append(result.Items, item)
+					continue
+				}
+				if compatible, reason := h.service.MachineCapability(machine.ID, taskdomain.CapabilityMySQLDefaultsFile); !compatible {
+					item.Error = reason
+					result.Failed++
+					result.Items = append(result.Items, item)
+					continue
+				}
+			}
+			command, commandErr := clusterAutomationCommand(req, instance)
 			if commandErr != nil {
 				item.Error = commandErr.Error()
 				result.Failed++
 				result.Items = append(result.Items, item)
 				continue
 			}
-			if opts, ok := databaseAutomationTaskOptions(req); ok {
+			if opts, ok := clusterAutomationTaskOptions(req); ok {
 				opts.ParentTaskID = parent.Task.ID
 				detail, err = h.service.CreateExecTaskWithOptions(r.Context(), machine.IP, command, opts)
 			} else {
@@ -461,6 +586,9 @@ func (h *TaskHandler) HandleClusterAutomation(w http.ResponseWriter, r *http.Req
 					continue
 				}
 			}
+			if req.Operation == "mysql_user" {
+				go redactAutomationCommandAfterCompletion(h.service, detail.Task.ID)
+			}
 			result.Created++
 		}
 		result.Items = append(result.Items, item)
@@ -472,11 +600,159 @@ func (h *TaskHandler) HandleClusterAutomation(w http.ResponseWriter, r *http.Req
 	writeJSON(w, http.StatusOK, result)
 }
 
+func redactAutomationCommandAfterCompletion(service *app.TaskService, taskID string) {
+	finished, err := service.WaitForTask(context.Background(), taskID, 5*time.Minute)
+	if err == nil && (finished.Task.Status == taskdomain.StatusSuccess || finished.Task.Status == taskdomain.StatusFailed) {
+		_ = service.RedactExecTaskCommand(context.Background(), taskID)
+	}
+}
+
+// HandleClusterAutomationResults returns structured collection data for the
+// current automation page. Agent tasks remain an internal transport detail;
+// callers poll this endpoint and render the resulting rows directly.
+func (h *TaskHandler) HandleClusterAutomationResults(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	operation := strings.TrimSpace(r.URL.Query().Get("operation"))
+	if operation != "collect_machine" && operation != "collect_mysql" {
+		writeError(w, http.StatusBadRequest, errors.New("collection operation must be collect_machine or collect_mysql"))
+		return
+	}
+	rawIDs := strings.Split(strings.TrimSpace(r.URL.Query().Get("task_ids")), ",")
+	if len(rawIDs) == 0 || strings.TrimSpace(rawIDs[0]) == "" || len(rawIDs) > 1000 {
+		writeError(w, http.StatusBadRequest, errors.New("between 1 and 1000 task_ids are required"))
+		return
+	}
+	result := clusterAutomationCollectionResponse{Operation: operation, Ready: true, Rows: make([]clusterAutomationCollectionRow, 0, len(rawIDs))}
+	for _, rawID := range rawIDs {
+		taskID := strings.TrimSpace(rawID)
+		if taskID == "" {
+			continue
+		}
+		detail, err := h.service.GetTaskDetail(r.Context(), taskID)
+		if err != nil {
+			result.Failed++
+			result.Rows = append(result.Rows, clusterAutomationCollectionRow{TaskID: taskID, Status: "failed", Error: err.Error()})
+			continue
+		}
+		row := clusterAutomationCollectionRow{
+			TaskID: taskID, MachineID: detail.Task.MachineID, Machine: detail.MachineName, IP: detail.MachineIP,
+			Status: string(detail.Task.Status),
+		}
+		if !automationCollectionTaskMatches(operation, detail.Task) {
+			row.Status, row.Error = "failed", "task does not belong to the requested collection operation"
+			result.Failed++
+			result.Rows = append(result.Rows, row)
+			continue
+		}
+		if detail.Task.Status != taskdomain.StatusSuccess && detail.Task.Status != taskdomain.StatusFailed {
+			result.Ready = false
+			result.Pending++
+			result.Rows = append(result.Rows, row)
+			continue
+		}
+		if detail.Task.Status == taskdomain.StatusFailed {
+			row.Error = automationTaskFailure(detail)
+			result.Failed++
+			result.Rows = append(result.Rows, row)
+			continue
+		}
+		if operation == "collect_machine" {
+			info, ok, infoErr := h.service.GetCollectedMachineInfo(r.Context(), detail.Task.MachineID)
+			if infoErr != nil || !ok {
+				row.Status = "failed"
+				if infoErr != nil {
+					row.Error = infoErr.Error()
+				} else {
+					row.Error = "machine collection completed without persisted data"
+				}
+				result.Failed++
+			} else {
+				row.Hostname, row.OS, row.Architecture = info.Hostname, info.OS, info.Arch
+				row.CPUCores, row.MemoryGB, row.DiskFreeGB = info.CPUCores, info.MemoryGB, info.DiskFreeGB
+				row.GlibcVersion, row.SELinux, row.Firewall = info.GlibcVersion, info.SELinux, info.Firewall
+				row.NTPEnabled, row.TimeOffsetMS = info.NTPEnabled, info.TimeOffsetMS
+			}
+		} else {
+			parseMySQLAutomationCollection(&row, detail.Events)
+			if row.MySQLVersion == "" {
+				row.Status = "failed"
+				row.Error = "MySQL collection completed without structured output"
+				result.Failed++
+			}
+		}
+		result.Rows = append(result.Rows, row)
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func automationCollectionTaskMatches(operation string, task taskdomain.Task) bool {
+	if operation == "collect_machine" {
+		return task.Type == taskdomain.TypeCollectMachineInfo
+	}
+	if operation != "collect_mysql" || task.Type != taskdomain.TypeExec {
+		return false
+	}
+	var spec taskdomain.ExecSpec
+	return json.Unmarshal(task.SpecJSON, &spec) == nil && spec.Operation == "mysql_collect"
+}
+
+func automationTaskFailure(detail app.TaskDetail) string {
+	for i := len(detail.Events) - 1; i >= 0; i-- {
+		if detail.Events[i].EventType == taskdomain.EventError && strings.TrimSpace(detail.Events[i].Content) != "" {
+			return strings.TrimSpace(detail.Events[i].Content)
+		}
+	}
+	for i := len(detail.Steps) - 1; i >= 0; i-- {
+		if detail.Steps[i].Status == taskdomain.StepFailed && strings.TrimSpace(detail.Steps[i].Message) != "" {
+			return strings.TrimSpace(detail.Steps[i].Message)
+		}
+	}
+	return "collection failed"
+}
+
+func parseMySQLAutomationCollection(row *clusterAutomationCollectionRow, events []taskdomain.Event) {
+	statusValues := map[string]*string{
+		"Threads_connected": &row.ThreadsConnected,
+		"Threads_running":   &row.ThreadsRunning,
+		"Questions":         &row.Questions,
+		"Queries":           &row.Queries,
+		"Slow_queries":      &row.SlowQueries,
+		"Uptime":            &row.Uptime,
+	}
+	rateValues := map[string]*string{"QPS": &row.QPS, "TPS": &row.TPS}
+	for _, event := range events {
+		for _, line := range strings.Split(strings.ReplaceAll(event.Content, "\r\n", "\n"), "\n") {
+			parts := strings.Split(strings.TrimSpace(line), "\t")
+			if len(parts) >= 4 && parts[0] == "GMHA_MYSQL_INSTANCE" {
+				row.Hostname, row.MySQLVersion = parts[1], parts[2]
+				row.MySQLPort, _ = strconv.Atoi(parts[3])
+			}
+			if len(parts) >= 3 && parts[0] == "GMHA_MYSQL_STATUS" {
+				if target := statusValues[parts[1]]; target != nil {
+					*target = parts[2]
+				}
+			}
+			if len(parts) >= 3 && parts[0] == "GMHA_MYSQL_RATE" {
+				if target := rateValues[parts[1]]; target != nil {
+					*target = parts[2]
+				}
+			}
+		}
+	}
+}
+
 func databaseAutomationTaskOptions(req clusterAutomationRequest) (app.ExecTaskOptions, bool) {
 	port := req.Port
 	switch req.Operation {
 	case "collect_mysql":
 		return app.ExecTaskOptions{Operation: "mysql_collect", DisplayName: "采集 MySQL 运行数据", StepName: "查询数据库运行状态", Port: port}, true
+	case "database_inspection":
+		return app.ExecTaskOptions{Operation: "database_inspection", DisplayName: "数据库巡检", StepName: "执行数据库巡检", Port: port}, true
+	case "database_deep_inspection":
+		return app.ExecTaskOptions{Operation: "database_deep_inspection", DisplayName: "数据库深度巡检", StepName: "执行数据库深度巡检", Port: port}, true
 	case "mysql_parameter":
 		return app.ExecTaskOptions{Operation: "mysql_parameter", DisplayName: "修改 MySQL 参数 " + strings.TrimSpace(req.ParameterName), StepName: "应用数据库参数", Port: port}, true
 	case "mysql_user":
@@ -487,14 +763,56 @@ func databaseAutomationTaskOptions(req clusterAutomationRequest) (app.ExecTaskOp
 	}
 }
 
+func clusterAutomationTaskOptions(req clusterAutomationRequest) (app.ExecTaskOptions, bool) {
+	if req.Operation == "shell" {
+		return app.ExecTaskOptions{Operation: "cluster_shell", DisplayName: "执行集群 Shell 脚本", StepName: "执行 Shell 脚本"}, true
+	}
+	return databaseAutomationTaskOptions(req)
+}
+
+func normalizeAutomationClusters(clusters []string) []string {
+	seen := make(map[string]bool, len(clusters))
+	result := make([]string, 0, len(clusters))
+	for _, cluster := range clusters {
+		cluster = strings.TrimSpace(cluster)
+		if cluster == "" || seen[cluster] {
+			continue
+		}
+		seen[cluster] = true
+		result = append(result, cluster)
+	}
+	return result
+}
+
+func isDatabaseAutomationOperation(operation string) bool {
+	switch operation {
+	case "collect_mysql", "mysql_user", "mysql_parameter", "database_inspection", "database_deep_inspection":
+		return true
+	default:
+		return false
+	}
+}
+
 var mysqlIdentifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_$.-]{0,63}$`)
 var mysqlHostPattern = regexp.MustCompile(`^[A-Za-z0-9%_.*:.-]{1,255}$`)
 var mysqlParameterPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
+var mysqlIndexIdentifierPattern = regexp.MustCompile(`^[A-Za-z0-9_$]{1,64}$`)
+var mysqlOnlineDDLStartPattern = regexp.MustCompile(`(?i)^(ADD|DROP|MODIFY|CHANGE|ALTER|CONVERT|ENGINE|ROW_FORMAT|DEFAULT|ORDER|RENAME[[:space:]]+(COLUMN|INDEX))[[:space:]=]`)
+var mysqlOnlineDDLUnsafePattern = regexp.MustCompile(`(?i)(;|--|#[^\n]*|/\*|\*/|\b(ALGORITHM|LOCK)[[:space:]]*=|\bRENAME[[:space:]]+(TO|AS)\b|\b(DIScard|IMPORT)[[:space:]]+TABLESPACE\b)`)
+var mysqlArchiveUnsafeWherePattern = regexp.MustCompile(`(?i)(;|--|#[^\n]*|/\*|\*/|\b(INSERT|UPDATE|DELETE|REPLACE|DROP|ALTER|CREATE|TRUNCATE|RENAME|GRANT|REVOKE|CALL|LOAD|OUTFILE|DUMPFILE|HANDLER|DO|SET|SLEEP|BENCHMARK|GET_LOCK|RELEASE_LOCK)[[:space:](])`)
 
 var mysqlPrivilegeSet = map[string]bool{
 	"SELECT": true, "INSERT": true, "UPDATE": true, "DELETE": true, "CREATE": true, "CREATE USER": true, "ALTER": true, "DROP": true,
 	"SHOW VIEW": true, "TRIGGER": true, "EVENT": true, "PROCESS": true, "RELOAD": true, "LOCK TABLES": true,
-	"REPLICATION CLIENT": true, "REPLICATION SLAVE": true, "CONNECTION_ADMIN": true, "SYSTEM_VARIABLES_ADMIN": true, "REPLICATION_SLAVE_ADMIN": true, "BACKUP_ADMIN": true, "CLONE_ADMIN": true,
+	"REPLICATION CLIENT": true, "REPLICATION SLAVE": true, "SUPER": true, "CONNECTION_ADMIN": true, "SYSTEM_VARIABLES_ADMIN": true, "REPLICATION_SLAVE_ADMIN": true, "BACKUP_ADMIN": true, "CLONE_ADMIN": true,
+}
+
+var mysqlDynamicPrivileges = map[string]bool{
+	"CONNECTION_ADMIN":        true,
+	"SYSTEM_VARIABLES_ADMIN":  true,
+	"REPLICATION_SLAVE_ADMIN": true,
+	"BACKUP_ADMIN":            true,
+	"CLONE_ADMIN":             true,
 }
 
 func validateClusterAutomationRequest(req clusterAutomationRequest) error {
@@ -508,26 +826,26 @@ func validateClusterAutomationRequest(req clusterAutomationRequest) error {
 		return errors.New("at least one target cluster is required")
 	}
 	switch req.Operation {
-	case "collect_machine", "shell", "collect_mysql", "mysql_user", "mysql_parameter":
+	case "collect_machine", "shell", "collect_mysql", "mysql_user", "mysql_parameter", "database_inspection", "database_deep_inspection":
 	default:
 		return fmt.Errorf("unsupported automation operation %q", req.Operation)
 	}
 	if req.Operation == "shell" && strings.TrimSpace(req.Script) == "" {
 		return errors.New("shell script is required")
 	}
-	if req.Operation == "collect_mysql" || req.Operation == "mysql_user" || req.Operation == "mysql_parameter" {
+	if req.Operation == "shell" && (len(req.Script) > 256*1024 || strings.ContainsRune(req.Script, '\x00')) {
+		return errors.New("shell script must be at most 256 KiB and contain no NUL bytes")
+	}
+	if req.Operation == "collect_mysql" || req.Operation == "mysql_user" || req.Operation == "mysql_parameter" || req.Operation == "database_inspection" || req.Operation == "database_deep_inspection" {
 		if req.Port <= 0 || req.Port > 65535 {
 			return errors.New("a valid MySQL port is required")
-		}
-		if !mysqlIdentifierPattern.MatchString(strings.TrimSpace(req.MySQLUser)) || req.MySQLPassword == "" {
-			return errors.New("MySQL administrator username and password are required")
 		}
 	}
 	if req.Operation == "mysql_user" {
 		return validateMySQLUserAction(req.UserAction, req.TargetUsername, req.TargetHost, req.TargetPassword, req.Privileges)
 	}
 	if req.Operation == "mysql_parameter" {
-		if !mysqlParameterPattern.MatchString(strings.TrimSpace(req.ParameterName)) || strings.TrimSpace(req.ParameterValue) == "" {
+		if !mysqlParameterPattern.MatchString(strings.TrimSpace(req.ParameterName)) || strings.TrimSpace(req.ParameterValue) == "" || strings.ContainsAny(req.ParameterValue, "\r\n\x00") {
 			return errors.New("valid MySQL parameter name and value are required")
 		}
 		if req.ApplyMode != "dynamic" && req.ApplyMode != "restart" && req.ApplyMode != "both" {
@@ -563,6 +881,19 @@ func validateMySQLUserAction(action, username, host, password string, privileges
 	for _, privilege := range privileges {
 		if !mysqlPrivilegeSet[strings.ToUpper(strings.TrimSpace(privilege))] {
 			return fmt.Errorf("unsupported MySQL privilege %q", privilege)
+		}
+	}
+	return nil
+}
+
+func validateMySQLUserPrivilegesForVersion(privileges []string, version string) error {
+	for _, privilege := range privileges {
+		privilege = strings.ToUpper(strings.TrimSpace(privilege))
+		if mysqlDynamicPrivileges[privilege] && !mysqlapp.SupportsDynamicPrivilegeForVersion(version, privilege) {
+			if mysqlapp.IsMySQL57(version) {
+				return fmt.Errorf("MySQL 5.7 does not support dynamic privilege %s; use a compatible static privilege such as SUPER where appropriate", privilege)
+			}
+			return fmt.Errorf("MySQL %s does not support platform-managed dynamic privilege %s; use a compatible static privilege such as SUPER where appropriate", version, privilege)
 		}
 	}
 	return nil
@@ -607,38 +938,534 @@ func mysqlUserTaskCommand(baseDir string, req mysqlUserTaskRequest) (string, err
 	return client + " --execute=" + shellQuote(sql), nil
 }
 
-func clusterAutomationCommand(req clusterAutomationRequest) (string, error) {
+func validateMySQLIndexRequest(req mysqlIndexTaskRequest) error {
+	switch req.Action {
+	case "list":
+		return nil
+	case "create":
+		if !mysqlIndexIdentifierPattern.MatchString(req.Schema) || !mysqlIndexIdentifierPattern.MatchString(req.Table) || !mysqlIndexIdentifierPattern.MatchString(req.Name) {
+			return errors.New("schema, table and index name must be valid MySQL identifiers")
+		}
+		if strings.EqualFold(req.Name, "PRIMARY") {
+			return errors.New("primary key management is not supported by this workflow")
+		}
+		if req.Purpose == "" || req.Impact == "" {
+			return errors.New("index purpose and expected impact are required")
+		}
+		if len(req.Purpose) > 500 || len(req.Impact) > 500 || strings.ContainsRune(req.Purpose, '\x00') || strings.ContainsRune(req.Impact, '\x00') {
+			return errors.New("index purpose and expected impact must be at most 500 characters and contain no NUL bytes")
+		}
+		if !req.LockAcknowledged {
+			return errors.New("the metadata-lock and DDL impact acknowledgement is required")
+		}
+		if len(req.Columns) == 0 || len(req.Columns) > 16 {
+			return errors.New("an index requires between 1 and 16 columns")
+		}
+		switch req.Kind {
+		case "btree", "unique", "fulltext", "spatial":
+		default:
+			return errors.New("index kind must be btree, unique, fulltext, or spatial")
+		}
+		switch req.LockMode {
+		case "", "none", "shared", "exclusive", "default":
+		default:
+			return errors.New("lock_mode must be none, shared, exclusive, or default")
+		}
+		for _, column := range req.Columns {
+			if !mysqlIndexIdentifierPattern.MatchString(strings.TrimSpace(column.Name)) {
+				return fmt.Errorf("invalid index column %q", column.Name)
+			}
+			if column.PrefixLen < 0 || column.PrefixLen > 3072 {
+				return fmt.Errorf("invalid prefix length for column %s", column.Name)
+			}
+			direction := strings.ToUpper(strings.TrimSpace(column.Direction))
+			if direction != "" && direction != "ASC" && direction != "DESC" {
+				return fmt.Errorf("invalid direction for column %s", column.Name)
+			}
+			if (req.Kind == "fulltext" || req.Kind == "spatial") && direction != "" {
+				return fmt.Errorf("%s indexes do not accept a column direction", req.Kind)
+			}
+		}
+		return nil
+	case "rename":
+		if !mysqlIndexIdentifierPattern.MatchString(req.Schema) || !mysqlIndexIdentifierPattern.MatchString(req.Table) ||
+			!mysqlIndexIdentifierPattern.MatchString(req.Name) || !mysqlIndexIdentifierPattern.MatchString(req.NewName) {
+			return errors.New("schema, table, current name and new name must be valid MySQL identifiers")
+		}
+		if strings.EqualFold(req.Name, "PRIMARY") {
+			return errors.New("the primary key cannot be renamed")
+		}
+		if req.Name == req.NewName {
+			return errors.New("the new index name must be different")
+		}
+		return nil
+	case "delete":
+		if !mysqlIndexIdentifierPattern.MatchString(req.Schema) || !mysqlIndexIdentifierPattern.MatchString(req.Table) || !mysqlIndexIdentifierPattern.MatchString(req.Name) {
+			return errors.New("schema, table and index name must be valid MySQL identifiers")
+		}
+		if strings.EqualFold(req.Name, "PRIMARY") {
+			return errors.New("primary key deletion is not supported by this workflow")
+		}
+		if req.Confirmation != req.Schema+"."+req.Table+"."+req.Name {
+			return errors.New("the exact schema.table.index confirmation is required")
+		}
+		return nil
+	default:
+		return errors.New("index action must be list, create, rename, or delete")
+	}
+}
+
+func mysqlIndexTaskCommands(baseDir string, req mysqlIndexTaskRequest) ([]taskdomain.ExecCommandStep, string, error) {
+	if err := validateMySQLIndexRequest(req); err != nil {
+		return nil, "", err
+	}
+	client := fmt.Sprintf("%s --defaults-extra-file=%s --protocol=tcp --host=127.0.0.1 --port=%d --batch --raw --skip-column-names",
+		shellQuote(filepath.Join(baseDir, "bin", "mysql")), mysqlDefaultsFilePlaceholder, req.Port)
+	execute := func(sql string) string { return client + " --execute=" + shellQuote(sql) }
+	listCommand := mysqlIndexListCommand(client)
+	switch req.Action {
+	case "list":
+		return []taskdomain.ExecCommandStep{{Name: "读取索引与空间信息", Command: listCommand}}, "读取 MySQL 索引清单", nil
+	case "create":
+		definition := mysqlIndexDefinition(req)
+		if req.OnlineWithPT {
+			impactSQL := fmt.Sprintf(
+				"SELECT CONCAT('GMHA_MYSQL_INDEX_IMPACT\\t',TABLE_SCHEMA,'\\t',TABLE_NAME,'\\t',ENGINE,'\\t',COALESCE(TABLE_ROWS,0),'\\t',COALESCE(DATA_LENGTH,0),'\\t',COALESCE(INDEX_LENGTH,0),'\\t',%s,'\\t',%s,'\\tPT_ONLINE') FROM information_schema.tables WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s; SELECT CONCAT('GMHA_MYSQL_INDEX_PT_GATES\\t',SUM(INDEX_NAME='PRIMARY'),'\\t',(SELECT COUNT(*) FROM information_schema.triggers WHERE EVENT_OBJECT_SCHEMA=%s AND EVENT_OBJECT_TABLE=%s),'\\t',(SELECT COUNT(*) FROM information_schema.referential_constraints WHERE CONSTRAINT_SCHEMA=%s AND REFERENCED_TABLE_NAME=%s)) FROM information_schema.statistics WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s;",
+				sqlString(req.Purpose), sqlString(req.Impact), sqlString(req.Schema), sqlString(req.Table),
+				sqlString(req.Schema), sqlString(req.Table), sqlString(req.Schema), sqlString(req.Table), sqlString(req.Schema), sqlString(req.Table))
+			ptBase := "pt-online-schema-change --defaults-file=" + mysqlDefaultsFilePlaceholder +
+				" --host=127.0.0.1" + fmt.Sprintf(" --port=%d", req.Port) +
+				" --alter=" + shellQuote("ADD "+definition) +
+				" --alter-foreign-keys-method=auto --max-load=Threads_running=25 --critical-load=Threads_running=50" +
+				" --max-lag=10 --chunk-time=0.5 --set-vars=lock_wait_timeout=10,innodb_lock_wait_timeout=1" +
+				" --progress=percentage,1 --statistics --print " +
+				shellQuote("D="+req.Schema+",t="+req.Table)
+			verify := fmt.Sprintf("SELECT CONCAT('GMHA_MYSQL_INDEX_VERIFIED\\t',TABLE_SCHEMA,'\\t',TABLE_NAME,'\\t',INDEX_NAME,'\\t',COUNT(*)) FROM information_schema.statistics WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s AND INDEX_NAME=%s GROUP BY TABLE_SCHEMA,TABLE_NAME,INDEX_NAME;",
+				sqlString(req.Schema), sqlString(req.Table), sqlString(req.Name))
+			return []taskdomain.ExecCommandStep{
+				{Name: "检查 PT 工具与在线变更条件", Command: "command -v pt-online-schema-change >/dev/null && pt-online-schema-change --version && " + execute(impactSQL)},
+				{Name: "PT 在线变更预演", Command: ptBase + " --dry-run"},
+				{Name: "PT 在线复制并切换", Command: ptBase + " --execute"},
+				{Name: "核验索引并刷新空间", Command: execute(verify) + " && " + listCommand},
+			}, fmt.Sprintf("PT 在线创建索引 %s.%s.%s", req.Schema, req.Table, req.Name), nil
+		}
+		lockMode := strings.ToUpper(req.LockMode)
+		if lockMode == "" {
+			lockMode = "NONE"
+		}
+		algorithm := "INPLACE"
+		if req.Kind == "fulltext" || req.Kind == "spatial" {
+			algorithm = "DEFAULT"
+		}
+		impactSQL := fmt.Sprintf(
+			"SELECT CONCAT('GMHA_MYSQL_INDEX_IMPACT\\t',TABLE_SCHEMA,'\\t',TABLE_NAME,'\\t',ENGINE,'\\t',COALESCE(TABLE_ROWS,0),'\\t',COALESCE(DATA_LENGTH,0),'\\t',COALESCE(INDEX_LENGTH,0),'\\t',%s,'\\t',%s,'\\t',%s) FROM information_schema.tables WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s; SELECT CONCAT('GMHA_MYSQL_INDEX_LOCK_WAITERS\\t',COUNT(*)) FROM performance_schema.metadata_locks WHERE OBJECT_SCHEMA=%s AND OBJECT_NAME=%s AND LOCK_STATUS='PENDING';",
+			sqlString(req.Purpose), sqlString(req.Impact), sqlString(lockMode), sqlString(req.Schema), sqlString(req.Table), sqlString(req.Schema), sqlString(req.Table))
+		ddl := fmt.Sprintf("SET SESSION lock_wait_timeout=10; ALTER TABLE %s.%s ADD %s, ALGORITHM=%s, LOCK=%s;",
+			sqlIdentifier(req.Schema), sqlIdentifier(req.Table), definition, algorithm, lockMode)
+		verify := fmt.Sprintf("SELECT CONCAT('GMHA_MYSQL_INDEX_VERIFIED\\t',TABLE_SCHEMA,'\\t',TABLE_NAME,'\\t',INDEX_NAME,'\\t',COUNT(*)) FROM information_schema.statistics WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s AND INDEX_NAME=%s GROUP BY TABLE_SCHEMA,TABLE_NAME,INDEX_NAME;",
+			sqlString(req.Schema), sqlString(req.Table), sqlString(req.Name))
+		return []taskdomain.ExecCommandStep{
+			{Name: "评估表规模与锁影响", Command: execute(impactSQL)},
+			{Name: "创建索引", Command: execute(ddl)},
+			{Name: "核验索引并刷新空间", Command: execute(verify) + " && " + listCommand},
+		}, fmt.Sprintf("创建索引 %s.%s.%s", req.Schema, req.Table, req.Name), nil
+	case "rename":
+		ddl := fmt.Sprintf("SET SESSION lock_wait_timeout=10; ALTER TABLE %s.%s RENAME INDEX %s TO %s;",
+			sqlIdentifier(req.Schema), sqlIdentifier(req.Table), sqlIdentifier(req.Name), sqlIdentifier(req.NewName))
+		verify := fmt.Sprintf("SELECT CONCAT('GMHA_MYSQL_INDEX_VERIFIED\\t',TABLE_SCHEMA,'\\t',TABLE_NAME,'\\t',INDEX_NAME) FROM information_schema.statistics WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s AND INDEX_NAME=%s LIMIT 1;",
+			sqlString(req.Schema), sqlString(req.Table), sqlString(req.NewName))
+		return []taskdomain.ExecCommandStep{
+			{Name: "检查索引目标", Command: execute(mysqlIndexExistsSQL(req.Schema, req.Table, req.Name))},
+			{Name: "重命名索引", Command: execute(ddl)},
+			{Name: "核验重命名结果", Command: execute(verify)},
+		}, fmt.Sprintf("重命名索引 %s.%s.%s", req.Schema, req.Table, req.Name), nil
+	case "delete":
+		ddl := fmt.Sprintf("SET SESSION lock_wait_timeout=10; ALTER TABLE %s.%s DROP INDEX %s, ALGORITHM=INPLACE, LOCK=NONE;",
+			sqlIdentifier(req.Schema), sqlIdentifier(req.Table), sqlIdentifier(req.Name))
+		verify := fmt.Sprintf("SELECT CONCAT('GMHA_MYSQL_INDEX_REMOVED\\t',%s,'\\t',%s,'\\t',%s,'\\t',IF(COUNT(*)=0,'YES','NO')) FROM information_schema.statistics WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s AND INDEX_NAME=%s;",
+			sqlString(req.Schema), sqlString(req.Table), sqlString(req.Name), sqlString(req.Schema), sqlString(req.Table), sqlString(req.Name))
+		return []taskdomain.ExecCommandStep{
+			{Name: "检查索引与表影响", Command: execute(mysqlIndexExistsSQL(req.Schema, req.Table, req.Name))},
+			{Name: "删除索引", Command: execute(ddl)},
+			{Name: "核验删除结果", Command: execute(verify)},
+		}, fmt.Sprintf("删除索引 %s.%s.%s", req.Schema, req.Table, req.Name), nil
+	}
+	return nil, "", errors.New("unsupported index action")
+}
+
+func normalizeMySQLOnlineDDLRequest(req mysqlOnlineDDLTaskRequest) mysqlOnlineDDLTaskRequest {
+	req.Machine = strings.TrimSpace(req.Machine)
+	req.Action = strings.ToLower(strings.TrimSpace(req.Action))
+	req.Schema = strings.TrimSpace(req.Schema)
+	req.Table = strings.TrimSpace(req.Table)
+	req.Alter = strings.TrimSpace(req.Alter)
+	req.Purpose = strings.TrimSpace(req.Purpose)
+	req.Impact = strings.TrimSpace(req.Impact)
+	req.AlterForeignKeysMethod = strings.ToLower(strings.TrimSpace(req.AlterForeignKeysMethod))
+	req.Confirmation = strings.TrimSpace(req.Confirmation)
+	if req.MaxLoadThreadsRunning == 0 {
+		req.MaxLoadThreadsRunning = 25
+	}
+	if req.CriticalThreadsRunning == 0 {
+		req.CriticalThreadsRunning = 50
+	}
+	if req.MaxLagSeconds == 0 {
+		req.MaxLagSeconds = 10
+	}
+	if req.ChunkTimeSeconds == 0 {
+		req.ChunkTimeSeconds = 0.5
+	}
+	if req.CheckIntervalSeconds == 0 {
+		req.CheckIntervalSeconds = 1
+	}
+	if req.AlterForeignKeysMethod == "" {
+		req.AlterForeignKeysMethod = "auto"
+	}
+	return req
+}
+
+func validateMySQLOnlineDDLRequest(req mysqlOnlineDDLTaskRequest) error {
+	switch req.Action {
+	case "dry_run", "execute":
+	default:
+		return errors.New("online DDL action must be dry_run or execute")
+	}
+	if !mysqlIndexIdentifierPattern.MatchString(req.Schema) || !mysqlIndexIdentifierPattern.MatchString(req.Table) {
+		return errors.New("schema and table must be valid MySQL identifiers")
+	}
+	if req.Alter == "" || len(req.Alter) > 8*1024 || strings.ContainsRune(req.Alter, '\x00') {
+		return errors.New("ALTER clause is required, must be at most 8 KiB, and contain no NUL bytes")
+	}
+	if strings.HasPrefix(strings.ToUpper(req.Alter), "ALTER TABLE") {
+		return errors.New("provide only the ALTER clause, without ALTER TABLE")
+	}
+	if !mysqlOnlineDDLStartPattern.MatchString(req.Alter) {
+		return errors.New("ALTER clause must start with a supported ALTER TABLE operation")
+	}
+	if mysqlOnlineDDLUnsafePattern.MatchString(req.Alter) {
+		return errors.New("ALTER clause contains an unsupported statement separator, comment, lock directive, or table rename")
+	}
+	if req.Purpose == "" || req.Impact == "" {
+		return errors.New("change purpose and expected impact are required")
+	}
+	if len(req.Purpose) > 500 || len(req.Impact) > 500 || strings.ContainsRune(req.Purpose, '\x00') || strings.ContainsRune(req.Impact, '\x00') {
+		return errors.New("change purpose and expected impact must be at most 500 characters and contain no NUL bytes")
+	}
+	if req.MaxLoadThreadsRunning < 1 || req.MaxLoadThreadsRunning > 10000 {
+		return errors.New("max_load_threads_running must be between 1 and 10000")
+	}
+	if req.CriticalThreadsRunning <= req.MaxLoadThreadsRunning || req.CriticalThreadsRunning > 20000 {
+		return errors.New("critical_threads_running must be greater than max_load_threads_running and at most 20000")
+	}
+	if req.MaxLagSeconds < 1 || req.MaxLagSeconds > 3600 {
+		return errors.New("max_lag_seconds must be between 1 and 3600")
+	}
+	if req.ChunkTimeSeconds < 0.1 || req.ChunkTimeSeconds > 10 {
+		return errors.New("chunk_time_seconds must be between 0.1 and 10")
+	}
+	if req.CheckIntervalSeconds < 1 || req.CheckIntervalSeconds > 60 {
+		return errors.New("check_interval_seconds must be between 1 and 60")
+	}
+	switch req.AlterForeignKeysMethod {
+	case "auto", "rebuild_constraints", "drop_swap", "none":
+	default:
+		return errors.New("alter_foreign_keys_method must be auto, rebuild_constraints, drop_swap, or none")
+	}
+	if req.Action == "execute" {
+		if !req.RiskAcknowledged {
+			return errors.New("online DDL risk acknowledgement is required")
+		}
+		if req.Confirmation != req.Schema+"."+req.Table {
+			return errors.New("the exact schema.table confirmation is required")
+		}
+	}
+	return nil
+}
+
+func mysqlOnlineDDLTaskCommands(baseDir string, input mysqlOnlineDDLTaskRequest) ([]taskdomain.ExecCommandStep, string, error) {
+	req := normalizeMySQLOnlineDDLRequest(input)
+	if err := validateMySQLOnlineDDLRequest(req); err != nil {
+		return nil, "", err
+	}
+	client := fmt.Sprintf("%s --defaults-extra-file=%s --protocol=tcp --host=127.0.0.1 --port=%d --batch --raw --skip-column-names",
+		shellQuote(filepath.Join(baseDir, "bin", "mysql")), mysqlDefaultsFilePlaceholder, req.Port)
+	executeSQL := func(sql string) string { return client + " --execute=" + shellQuote(sql) }
+	targetSQL := fmt.Sprintf(
+		"SELECT CONCAT('GMHA_ONLINE_DDL_TARGET\\t',t.TABLE_SCHEMA,'\\t',t.TABLE_NAME,'\\t',t.ENGINE,'\\t',COALESCE(t.TABLE_ROWS,0),'\\t',COALESCE(t.DATA_LENGTH,0),'\\t',COALESCE(t.INDEX_LENGTH,0),'\\t',(SELECT COUNT(*) FROM information_schema.statistics s WHERE s.TABLE_SCHEMA=t.TABLE_SCHEMA AND s.TABLE_NAME=t.TABLE_NAME AND s.NON_UNIQUE=0),'\\t',(SELECT COUNT(*) FROM information_schema.triggers tr WHERE tr.EVENT_OBJECT_SCHEMA=t.TABLE_SCHEMA AND tr.EVENT_OBJECT_TABLE=t.TABLE_NAME),'\\t',(SELECT COUNT(*) FROM information_schema.referential_constraints rc WHERE rc.CONSTRAINT_SCHEMA=t.TABLE_SCHEMA AND (rc.TABLE_NAME=t.TABLE_NAME OR rc.REFERENCED_TABLE_NAME=t.TABLE_NAME)),'\\t',%s,'\\t',%s) FROM information_schema.tables t WHERE t.TABLE_SCHEMA=%s AND t.TABLE_NAME=%s AND t.TABLE_TYPE='BASE TABLE'; SELECT CONCAT('GMHA_ONLINE_DDL_LOAD\\t',@@version,'\\t',@@global.binlog_format,'\\t',@@global.read_only,'\\t',(SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME='Threads_running'),'\\t',(SELECT COUNT(*) FROM information_schema.innodb_trx));",
+		sqlString(req.Purpose), sqlString(req.Impact), sqlString(req.Schema), sqlString(req.Table))
+	ptBase := "pt-online-schema-change --defaults-file=" + mysqlDefaultsFilePlaceholder +
+		" --host=127.0.0.1" + fmt.Sprintf(" --port=%d", req.Port) +
+		" --alter=" + shellQuote(req.Alter) +
+		fmt.Sprintf(" --max-load=Threads_running=%d --critical-load=Threads_running=%d", req.MaxLoadThreadsRunning, req.CriticalThreadsRunning) +
+		fmt.Sprintf(" --max-lag=%d --chunk-time=%s --check-interval=%d", req.MaxLagSeconds, strconv.FormatFloat(req.ChunkTimeSeconds, 'f', -1, 64), req.CheckIntervalSeconds) +
+		" --alter-foreign-keys-method=" + req.AlterForeignKeysMethod +
+		" --set-vars=lock_wait_timeout=10,innodb_lock_wait_timeout=1" +
+		" --progress=percentage,1 --statistics --print " +
+		shellQuote("D="+req.Schema+",t="+req.Table)
+	precheck := taskdomain.ExecCommandStep{
+		Name:    "检查 PT 工具、目标表与运行负载",
+		Command: "command -v pt-online-schema-change >/dev/null && pt-online-schema-change --version && " + executeSQL(targetSQL),
+	}
+	dryRun := taskdomain.ExecCommandStep{Name: "PT 在线 DDL 预演", Command: ptBase + " --dry-run"}
+	if req.Action == "dry_run" {
+		return []taskdomain.ExecCommandStep{precheck, dryRun}, fmt.Sprintf("PT 在线 DDL 预检 %s.%s", req.Schema, req.Table), nil
+	}
+	verifySQL := fmt.Sprintf(
+		"SELECT CONCAT('GMHA_ONLINE_DDL_VERIFIED\\t',TABLE_SCHEMA,'\\t',TABLE_NAME,'\\t',ENGINE,'\\t',COALESCE(TABLE_ROWS,0),'\\t',COALESCE(DATA_LENGTH,0),'\\t',COALESCE(INDEX_LENGTH,0)) FROM information_schema.tables WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s AND TABLE_TYPE='BASE TABLE'; SHOW CREATE TABLE %s.%s;",
+		sqlString(req.Schema), sqlString(req.Table), sqlIdentifier(req.Schema), sqlIdentifier(req.Table))
+	return []taskdomain.ExecCommandStep{
+		precheck,
+		dryRun,
+		{Name: "PT 在线复制与原子切换", Command: ptBase + " --execute"},
+		{Name: "核验变更后表结构", Command: executeSQL(verifySQL)},
+	}, fmt.Sprintf("PT 在线 DDL %s.%s", req.Schema, req.Table), nil
+}
+
+func normalizeMySQLArchiveRequest(req mysqlArchiveTaskRequest) mysqlArchiveTaskRequest {
+	req.Machine = strings.TrimSpace(req.Machine)
+	req.Action = strings.ToLower(strings.TrimSpace(req.Action))
+	req.SourceSchema = strings.TrimSpace(req.SourceSchema)
+	req.SourceTable = strings.TrimSpace(req.SourceTable)
+	req.DestinationSchema = strings.TrimSpace(req.DestinationSchema)
+	req.DestinationTable = strings.TrimSpace(req.DestinationTable)
+	req.Where = strings.TrimSpace(req.Where)
+	req.Index = strings.TrimSpace(req.Index)
+	req.Confirmation = strings.TrimSpace(req.Confirmation)
+	if req.BatchSize == 0 {
+		req.BatchSize = 1000
+	}
+	return req
+}
+
+func mysqlArchiveConfirmation(req mysqlArchiveTaskRequest) string {
+	return req.SourceSchema + "." + req.SourceTable + "->" + req.DestinationSchema + "." + req.DestinationTable
+}
+
+func validateMySQLArchiveRequest(req mysqlArchiveTaskRequest) error {
+	switch req.Action {
+	case "dry_run", "execute":
+	default:
+		return errors.New("archive action must be dry_run or execute")
+	}
+	for name, identifier := range map[string]string{
+		"source_schema": req.SourceSchema, "source_table": req.SourceTable,
+		"destination_schema": req.DestinationSchema, "destination_table": req.DestinationTable,
+	} {
+		if !mysqlIndexIdentifierPattern.MatchString(identifier) {
+			return fmt.Errorf("%s must be a valid MySQL identifier", name)
+		}
+	}
+	if req.SourceSchema == req.DestinationSchema && req.SourceTable == req.DestinationTable {
+		return errors.New("archive destination must be different from the source table")
+	}
+	if req.Index != "" && !mysqlIndexIdentifierPattern.MatchString(req.Index) {
+		return errors.New("index must be a valid MySQL identifier")
+	}
+	if req.Where == "" || len(req.Where) > 2000 || strings.ContainsAny(req.Where, "\r\n\x00") {
+		return errors.New("where is required, must be at most 2000 characters, and contain no line breaks or NUL bytes")
+	}
+	if strings.EqualFold(strings.ReplaceAll(req.Where, " ", ""), "1=1") {
+		return errors.New("where must select a bounded archive set; 1=1 is not allowed")
+	}
+	if mysqlArchiveUnsafeWherePattern.MatchString(req.Where) {
+		return errors.New("where contains a statement separator, comment, or data-changing SQL keyword")
+	}
+	if req.BatchSize < 1 || req.BatchSize > 100000 {
+		return errors.New("batch_size must be between 1 and 100000")
+	}
+	if req.SleepSeconds < 0 || req.SleepSeconds > 60 {
+		return errors.New("sleep_seconds must be between 0 and 60")
+	}
+	if req.RunTimeSeconds < 0 || req.RunTimeSeconds > 86400 {
+		return errors.New("run_time_seconds must be between 0 and 86400")
+	}
+	if req.Action == "execute" {
+		if !req.RiskAcknowledged {
+			return errors.New("archive risk acknowledgement is required")
+		}
+		if req.Confirmation != mysqlArchiveConfirmation(req) {
+			return errors.New("the exact source->destination confirmation is required")
+		}
+	}
+	return nil
+}
+
+func mysqlArchiveTaskCommands(baseDir string, input mysqlArchiveTaskRequest) ([]taskdomain.ExecCommandStep, string, error) {
+	req := normalizeMySQLArchiveRequest(input)
+	if err := validateMySQLArchiveRequest(req); err != nil {
+		return nil, "", err
+	}
+	client := fmt.Sprintf("%s --defaults-extra-file=%s --protocol=tcp --host=127.0.0.1 --port=%d --batch --raw --skip-column-names",
+		shellQuote(filepath.Join(baseDir, "bin", "mysql")), mysqlDefaultsFilePlaceholder, req.Port)
+	executeSQL := func(sql string) string { return client + " --execute=" + shellQuote(sql) }
+	sourceTable := sqlIdentifier(req.SourceSchema) + "." + sqlIdentifier(req.SourceTable)
+	destinationTable := sqlIdentifier(req.DestinationSchema) + "." + sqlIdentifier(req.DestinationTable)
+	sourceIndexHint := ""
+	if req.Index != "" {
+		sourceIndexHint = " FORCE INDEX (" + sqlIdentifier(req.Index) + ")"
+	}
+	sourceDSN := fmt.Sprintf("F=%s,h=127.0.0.1,P=%d,D=%s,t=%s", mysqlDefaultsFilePlaceholder, req.Port, req.SourceSchema, req.SourceTable)
+	if req.Index != "" {
+		sourceDSN += ",i=" + req.Index
+	}
+	destinationDSN := fmt.Sprintf("F=%s,h=127.0.0.1,P=%d,D=%s,t=%s", mysqlDefaultsFilePlaceholder, req.Port, req.DestinationSchema, req.DestinationTable)
+	ptBase := "pt-archiver --source " + sourceDSN +
+		" --dest " + destinationDSN +
+		" --where " + shellQuote(req.Where) +
+		fmt.Sprintf(" --limit=%d --commit-each --sleep=%d --progress=%d", req.BatchSize, req.SleepSeconds, req.BatchSize) +
+		" --retries=3 --statistics --why-quit --set-vars=lock_wait_timeout=10,innodb_lock_wait_timeout=1"
+	if req.RunTimeSeconds > 0 {
+		ptBase += fmt.Sprintf(" --run-time=%ds", req.RunTimeSeconds)
+	}
+	if !req.DeleteSource {
+		ptBase += " --no-delete"
+	}
+	precheckSQL := fmt.Sprintf(
+		"SELECT CONCAT('GMHA_ARCHIVE_SOURCE\\t',%s,'\\t',%s,'\\t',COUNT(*),'\\t',IF(COUNT(*)>=100000,'YES','NO')) FROM (SELECT 1 AS candidate FROM %s%s WHERE %s LIMIT 100000) gmha_archive_candidates; "+
+			"SELECT CONCAT('GMHA_ARCHIVE_TABLE\\t',TABLE_SCHEMA,'\\t',TABLE_NAME,'\\t',ENGINE,'\\t',COALESCE(TABLE_ROWS,0),'\\t',COALESCE(DATA_LENGTH,0),'\\t',COALESCE(INDEX_LENGTH,0),'\\t',(SELECT COUNT(*) FROM information_schema.statistics s WHERE s.TABLE_SCHEMA=t.TABLE_SCHEMA AND s.TABLE_NAME=t.TABLE_NAME AND s.INDEX_NAME='PRIMARY')) FROM information_schema.tables t WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s AND TABLE_TYPE='BASE TABLE'; "+
+			"SELECT CONCAT('GMHA_ARCHIVE_DESTINATION\\t',%s,'\\t',%s,'\\t',COUNT(*)) FROM information_schema.tables WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s AND TABLE_TYPE='BASE TABLE'; "+
+			"EXPLAIN SELECT * FROM %s%s WHERE %s LIMIT %d;",
+		sqlString(req.SourceSchema), sqlString(req.SourceTable), sourceTable, sourceIndexHint, req.Where,
+		sqlString(req.SourceSchema), sqlString(req.SourceTable),
+		sqlString(req.DestinationSchema), sqlString(req.DestinationTable), sqlString(req.DestinationSchema), sqlString(req.DestinationTable),
+		sourceTable, sourceIndexHint, req.Where, req.BatchSize)
+	precheck := taskdomain.ExecCommandStep{
+		Name:    "检查 PT 工具、源数据与归档目标",
+		Command: "command -v pt-archiver >/dev/null && pt-archiver --version && " + executeSQL(precheckSQL),
+	}
+	destinationExistsSQL := fmt.Sprintf(
+		"SELECT COUNT(*) FROM information_schema.tables WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s AND TABLE_TYPE='BASE TABLE';",
+		sqlString(req.DestinationSchema), sqlString(req.DestinationTable))
+	dryRunCommand := "if [ \"$(" + executeSQL(destinationExistsSQL) + ")\" = \"1\" ]; then " + ptBase + " --dry-run; else echo " +
+		shellQuote("GMHA_ARCHIVE_DESTINATION_MISSING\t"+req.DestinationSchema+"\t"+req.DestinationTable+"\t正式执行时将按源表结构自动创建") + "; fi"
+	dryRun := taskdomain.ExecCommandStep{Name: "PT 归档预演", Command: dryRunCommand}
+	if req.Action == "dry_run" {
+		return []taskdomain.ExecCommandStep{precheck, dryRun},
+			fmt.Sprintf("PT 归档预检 %s.%s", req.SourceSchema, req.SourceTable), nil
+	}
+	prepareSQL := fmt.Sprintf(
+		"CREATE TABLE IF NOT EXISTS %s LIKE %s; SELECT CONCAT('GMHA_ARCHIVE_DESTINATION_READY\\t',TABLE_SCHEMA,'\\t',TABLE_NAME,'\\t',ENGINE) FROM information_schema.tables WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s AND TABLE_TYPE='BASE TABLE';",
+		destinationTable, sourceTable, sqlString(req.DestinationSchema), sqlString(req.DestinationTable))
+	verifySQL := fmt.Sprintf(
+		"SELECT CONCAT('GMHA_ARCHIVE_REMAINING\\t',%s,'\\t',%s,'\\t',COUNT(*)) FROM %s WHERE %s; "+
+			"SELECT CONCAT('GMHA_ARCHIVE_DESTINATION_ROWS\\t',%s,'\\t',%s,'\\t',COUNT(*)) FROM %s;",
+		sqlString(req.SourceSchema), sqlString(req.SourceTable), sourceTable, req.Where,
+		sqlString(req.DestinationSchema), sqlString(req.DestinationTable), destinationTable)
+	mode := "复制"
+	if req.DeleteSource {
+		mode = "迁移"
+	}
+	return []taskdomain.ExecCommandStep{
+		precheck,
+		{Name: "准备并核验归档表", Command: executeSQL(prepareSQL)},
+		{Name: "PT 归档预演", Command: ptBase + " --dry-run"},
+		{Name: "PT 分批" + mode + "归档数据", Command: ptBase},
+		{Name: "核验源表与归档表数据", Command: executeSQL(verifySQL)},
+	}, fmt.Sprintf("PT 数据归档 %s.%s → %s.%s", req.SourceSchema, req.SourceTable, req.DestinationSchema, req.DestinationTable), nil
+}
+
+func mysqlIndexDefinition(req mysqlIndexTaskRequest) string {
+	columns := make([]string, 0, len(req.Columns))
+	for _, item := range req.Columns {
+		column := sqlIdentifier(strings.TrimSpace(item.Name))
+		if item.PrefixLen > 0 {
+			column += fmt.Sprintf("(%d)", item.PrefixLen)
+		}
+		if direction := strings.ToUpper(strings.TrimSpace(item.Direction)); direction != "" {
+			column += " " + direction
+		}
+		columns = append(columns, column)
+	}
+	prefix, suffix := "INDEX ", " USING BTREE"
+	switch req.Kind {
+	case "unique":
+		prefix = "UNIQUE INDEX "
+	case "fulltext":
+		prefix, suffix = "FULLTEXT INDEX ", ""
+	case "spatial":
+		prefix, suffix = "SPATIAL INDEX ", ""
+	}
+	return prefix + sqlIdentifier(req.Name) + " (" + strings.Join(columns, ", ") + ")" + suffix
+}
+
+func mysqlIndexExistsSQL(schema, table, name string) string {
+	return fmt.Sprintf("SELECT CONCAT('GMHA_MYSQL_INDEX_TARGET\\t',TABLE_SCHEMA,'\\t',TABLE_NAME,'\\t',INDEX_NAME,'\\t',INDEX_TYPE,'\\t',IF(NON_UNIQUE=0,'UNIQUE','NON_UNIQUE'),'\\t',GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX)) FROM information_schema.statistics WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s AND INDEX_NAME=%s GROUP BY TABLE_SCHEMA,TABLE_NAME,INDEX_NAME,INDEX_TYPE,NON_UNIQUE;",
+		sqlString(schema), sqlString(table), sqlString(name))
+}
+
+func mysqlIndexListCommand(client string) string {
+	// mysql.innodb_index_stats reports index pages. The LEFT JOIN deliberately
+	// keeps non-InnoDB indexes visible, with an unknown (zero) byte estimate.
+	query := "SELECT CONCAT('GMHA_MYSQL_INDEX\\t',s.TABLE_SCHEMA,'\\t',s.TABLE_NAME,'\\t',s.INDEX_NAME,'\\t',s.INDEX_TYPE,'\\t',IF(s.NON_UNIQUE=0,'YES','NO'),'\\t',GROUP_CONCAT(CONCAT(COALESCE(s.COLUMN_NAME,'(expression)'),IF(s.SUB_PART IS NULL,'',CONCAT('(',s.SUB_PART,')'))) ORDER BY s.SEQ_IN_INDEX SEPARATOR ','),'\\t',COALESCE(MAX(p.bytes),0),'\\t',COALESCE(MAX(t.TABLE_ROWS),0),'\\t',COALESCE(MAX(t.DATA_LENGTH),0),'\\t',COALESCE(MAX(t.INDEX_LENGTH),0)) FROM information_schema.statistics s JOIN information_schema.tables t ON t.TABLE_SCHEMA=s.TABLE_SCHEMA AND t.TABLE_NAME=s.TABLE_NAME LEFT JOIN (SELECT database_name,table_name,index_name,MAX(CASE WHEN stat_name='size' THEN stat_value END)*@@innodb_page_size AS bytes FROM mysql.innodb_index_stats GROUP BY database_name,table_name,index_name) p ON p.database_name=s.TABLE_SCHEMA AND p.table_name=s.TABLE_NAME AND p.index_name=s.INDEX_NAME WHERE s.TABLE_SCHEMA NOT IN ('mysql','information_schema','performance_schema','sys') GROUP BY s.TABLE_SCHEMA,s.TABLE_NAME,s.INDEX_NAME,s.INDEX_TYPE,s.NON_UNIQUE ORDER BY s.TABLE_SCHEMA,s.TABLE_NAME,s.INDEX_NAME;"
+	return client + " --execute=" + shellQuote(query)
+}
+
+func sqlIdentifier(value string) string {
+	return "`" + strings.ReplaceAll(value, "`", "``") + "`"
+}
+
+func clusterAutomationCommand(req clusterAutomationRequest, instances ...mysqlapp.Instance) (string, error) {
 	if req.Operation == "shell" {
 		return req.Script, nil
 	}
+	var instance mysqlapp.Instance
+	if len(instances) > 0 {
+		instance = instances[0]
+	}
+	client := mysqlAutomationClient(instance, req.Port)
+	version := strings.TrimSpace(instance.Version)
+	if version == "" && strings.TrimSpace(instance.PackageName) != "" {
+		version, _ = mysqlapp.PackageVersion(instance.PackageName)
+	}
 	if req.Operation == "collect_mysql" {
-		return mysqlCommand(req, "SELECT @@hostname AS hostname, @@version AS version, @@port AS port; SHOW GLOBAL STATUS WHERE Variable_name IN ('Threads_connected','Questions','Queries','Uptime');"), nil
+		sql := "SET @gmha_questions_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Questions'); " +
+			"SET @gmha_commit_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Com_commit'); " +
+			"SET @gmha_rollback_before=(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Com_rollback'); DO SLEEP(1); " +
+			"SELECT CONCAT('GMHA_MYSQL_INSTANCE\\t', @@hostname, '\\t', @@version, '\\t', @@port); " +
+			"SELECT CONCAT('GMHA_MYSQL_RATE\\tQPS\\t', GREATEST(VARIABLE_VALUE+0-@gmha_questions_before,0)) FROM performance_schema.global_status WHERE VARIABLE_NAME='Questions'; " +
+			"SELECT CONCAT('GMHA_MYSQL_RATE\\tTPS\\t', GREATEST(SUM(CASE WHEN VARIABLE_NAME='Com_commit' THEN VARIABLE_VALUE+0 ELSE 0 END)-@gmha_commit_before+SUM(CASE WHEN VARIABLE_NAME='Com_rollback' THEN VARIABLE_VALUE+0 ELSE 0 END)-@gmha_rollback_before,0)) FROM performance_schema.global_status WHERE VARIABLE_NAME IN ('Com_commit','Com_rollback'); " +
+			"SELECT CONCAT('GMHA_MYSQL_STATUS\\t', Variable_name, '\\t', Variable_value) FROM performance_schema.global_status " +
+			"WHERE Variable_name IN ('Threads_connected','Threads_running','Questions','Queries','Com_select','Com_insert','Com_update','Com_delete','Slow_queries','Uptime') ORDER BY Variable_name;"
+		return client + " --execute=" + shellQuote(sql), nil
+	}
+	if req.Operation == "database_inspection" || req.Operation == "database_deep_inspection" {
+		return databaseInspectionCommand(client, req.Operation == "database_deep_inspection"), nil
 	}
 	if req.Operation == "mysql_user" {
+		if version != "" {
+			if err := validateMySQLUserPrivilegesForVersion(req.Privileges, version); err != nil {
+				return "", err
+			}
+		}
 		sql, err := mysqlUserSQL(req.UserAction, req.TargetUsername, req.TargetHost, req.TargetPassword, req.Privileges)
 		if err != nil {
 			return "", err
 		}
-		return mysqlCommand(req, sql), nil
+		return client + " --execute=" + shellQuote(sql), nil
 	}
 	if req.Operation == "mysql_parameter" {
-		name, value := req.ParameterName, sqlString(req.ParameterValue)
-		parts := make([]string, 0, 2)
-		if req.ApplyMode == "dynamic" || req.ApplyMode == "both" {
-			parts = append(parts, mysqlCommand(req, fmt.Sprintf("SET GLOBAL %s = %s; SELECT @@GLOBAL.%s AS effective_value;", name, value, name)))
+		configPath := strings.TrimSpace(req.ConfigPath)
+		if configPath == "" {
+			configPath = strings.TrimSpace(instance.MyCnfPath)
 		}
-		if req.ApplyMode == "restart" || req.ApplyMode == "both" {
-			configPath, unit := req.ConfigPath, req.SystemdUnit
-			if configPath == "" {
-				configPath = "/etc/my.cnf"
-			}
-			if unit == "" {
-				unit = "mysqld"
-			}
-			line := name + "=" + req.ParameterValue
-			parts = append(parts, fmt.Sprintf("config=%s; tmp=\"${config}.gmha.$$\"; if grep -qE '^[[:space:]]*%s[[:space:]]*=' \"$config\"; then sed -E 's|^[[:space:]]*%s[[:space:]]*=.*|%s|' \"$config\" > \"$tmp\"; else cp \"$config\" \"$tmp\"; printf '\\n%%s\\n' %s >> \"$tmp\"; fi; mv \"$tmp\" \"$config\"; systemctl restart %s; systemctl is-active %s", shellQuote(configPath), name, name, shellQuote(line), shellQuote(line), shellQuote(unit), shellQuote(unit)))
+		unit := strings.TrimSpace(req.SystemdUnit)
+		if unit == "" {
+			unit = strings.TrimSuffix(strings.TrimSpace(instance.SystemdUnit), ".service")
 		}
-		return strings.Join(parts, " && "), nil
+		applyMode, restart := req.ApplyMode, false
+		if applyMode == "restart" {
+			applyMode, restart = "config", true
+		}
+		mysqldPath := ""
+		if strings.TrimSpace(instance.BaseDir) != "" {
+			mysqldPath = filepath.Join(instance.BaseDir, "bin", "mysqld")
+		}
+		command, _, _, _, err := mysqlParameterCommand(client, mysqlParameterTaskRequest{
+			Action: "update", Name: req.ParameterName, Value: req.ParameterValue, ApplyMode: applyMode,
+			ConfigPath: configPath, SystemdUnit: unit, Port: req.Port,
+			MySQLDPath: mysqldPath, Version: version, Restart: restart,
+		})
+		return command, err
 	}
 	return "", errors.New("unsupported automation operation")
 }
@@ -647,9 +1474,12 @@ func clusterAutomationArtifactDir() string {
 	return filepath.Join(os.TempDir(), "gmha", "cluster-reports")
 }
 
-func mysqlCommand(req clusterAutomationRequest, sql string) string {
-	password := shellQuote(req.MySQLPassword)
-	return fmt.Sprintf("MYSQL_PWD=%s mysql --protocol=tcp --host=127.0.0.1 --port=%d --user=%s --batch --raw --execute=%s", password, req.Port, shellQuote(req.MySQLUser), shellQuote(sql))
+func mysqlAutomationClient(instance mysqlapp.Instance, port int) string {
+	binary := "mysql"
+	if strings.TrimSpace(instance.BaseDir) != "" {
+		binary = filepath.Join(instance.BaseDir, "bin", "mysql")
+	}
+	return fmt.Sprintf("%s --defaults-extra-file=%s --protocol=tcp --host=127.0.0.1 --port=%d --batch --raw --skip-column-names", shellQuote(binary), mysqlDefaultsFilePlaceholder, port)
 }
 
 func sqlString(value string) string { return "'" + strings.ReplaceAll(value, "'", "''") + "'" }
@@ -820,6 +1650,14 @@ func (h *TaskHandler) HandleMySQLUsers(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	version := strings.TrimSpace(instance.Version)
+	if version == "" {
+		version, _ = mysqlapp.PackageVersion(instance.PackageName)
+	}
+	if err := validateMySQLUserPrivilegesForVersion(req.Privileges, version); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	command, err := mysqlUserTaskCommand(instance.BaseDir, req)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -837,6 +1675,155 @@ func (h *TaskHandler) HandleMySQLUsers(w http.ResponseWriter, r *http.Request) {
 			_ = h.service.RedactExecTaskCommand(context.Background(), taskID)
 		}
 	}(detail.Task.ID)
+	writeJSON(w, http.StatusOK, detail)
+}
+
+// HandleMySQLIndexes exposes index discovery and DDL as auditable Agent tasks.
+// The Agent injects the registered MHA credential into a temporary 0600
+// defaults file, so database credentials never cross the browser API.
+func (h *TaskHandler) HandleMySQLIndexes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var req mysqlIndexTaskRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	req.Machine = strings.TrimSpace(req.Machine)
+	req.Action = strings.ToLower(strings.TrimSpace(req.Action))
+	req.Schema = strings.TrimSpace(req.Schema)
+	req.Table = strings.TrimSpace(req.Table)
+	req.Name = strings.TrimSpace(req.Name)
+	req.NewName = strings.TrimSpace(req.NewName)
+	req.Kind = strings.ToLower(strings.TrimSpace(req.Kind))
+	req.LockMode = strings.ToLower(strings.TrimSpace(req.LockMode))
+	req.Purpose = strings.TrimSpace(req.Purpose)
+	req.Impact = strings.TrimSpace(req.Impact)
+	req.Confirmation = strings.TrimSpace(req.Confirmation)
+	if req.Machine == "" || req.Port <= 0 || req.Port > 65535 {
+		writeError(w, http.StatusBadRequest, errors.New("machine and valid port are required"))
+		return
+	}
+	if err := validateMySQLIndexRequest(req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	machine, instance, err := h.service.ResolveMySQLInstance(r.Context(), req.Machine, req.Port)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	commands, displayName, err := mysqlIndexTaskCommands(instance.BaseDir, req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	detail, err := h.service.CreateExecTaskWithOptions(r.Context(), machine.IP, "", app.ExecTaskOptions{
+		Operation:   "mysql_index_" + req.Action,
+		DisplayName: displayName,
+		Port:        req.Port,
+		Commands:    commands,
+	})
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, detail)
+}
+
+// HandleMySQLOnlineDDL creates a controlled pt-online-schema-change workflow.
+// A dry-run and a real execution are separate auditable tasks; real execution
+// additionally requires an explicit risk acknowledgement and exact target.
+func (h *TaskHandler) HandleMySQLOnlineDDL(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var req mysqlOnlineDDLTaskRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	req = normalizeMySQLOnlineDDLRequest(req)
+	if req.Machine == "" || req.Port <= 0 || req.Port > 65535 {
+		writeError(w, http.StatusBadRequest, errors.New("machine and valid port are required"))
+		return
+	}
+	if err := validateMySQLOnlineDDLRequest(req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	machine, instance, err := h.service.ResolveMySQLInstance(r.Context(), req.Machine, req.Port)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	commands, displayName, err := mysqlOnlineDDLTaskCommands(instance.BaseDir, req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	detail, err := h.service.CreateExecTaskWithOptions(r.Context(), machine.IP, "", app.ExecTaskOptions{
+		Operation:   "mysql_online_ddl_" + req.Action,
+		DisplayName: displayName,
+		Port:        req.Port,
+		Commands:    commands,
+	})
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, detail)
+}
+
+// HandleMySQLArchive creates a controlled pt-archiver workflow. Preview and
+// execution are separate tasks, and source-row deletion requires an exact
+// source-to-destination confirmation in addition to the risk acknowledgement.
+func (h *TaskHandler) HandleMySQLArchive(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var req mysqlArchiveTaskRequest
+	if err := decodeStrictJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	req = normalizeMySQLArchiveRequest(req)
+	if req.Machine == "" || req.Port <= 0 || req.Port > 65535 {
+		writeError(w, http.StatusBadRequest, errors.New("machine and valid port are required"))
+		return
+	}
+	if err := validateMySQLArchiveRequest(req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	machine, instance, err := h.service.ResolveMySQLInstance(r.Context(), req.Machine, req.Port)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if compatible, reason := h.service.MachineCapability(machine.ID, taskdomain.CapabilityMySQLDefaultsFile); !compatible {
+		writeError(w, http.StatusConflict, fmt.Errorf("Agent does not support secure MySQL credential injection: %s", reason))
+		return
+	}
+	commands, displayName, err := mysqlArchiveTaskCommands(instance.BaseDir, req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	detail, err := h.service.CreateExecTaskWithOptions(r.Context(), machine.IP, "", app.ExecTaskOptions{
+		Operation:   "mysql_archive_" + req.Action,
+		DisplayName: displayName,
+		Port:        req.Port,
+		Commands:    commands,
+	})
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, detail)
 }
 
@@ -1050,6 +2037,10 @@ func (h *TaskHandler) createMySQLParameterTask(ctx context.Context, target mysql
 		target.SystemdUnit = instance.SystemdUnit
 	}
 	target.MySQLDPath = filepath.Join(instance.BaseDir, "bin", "mysqld")
+	target.Version = instance.Version
+	if strings.TrimSpace(target.Version) == "" {
+		target.Version, _ = mysqlapp.PackageVersion(instance.PackageName)
+	}
 	client := fmt.Sprintf("%s --defaults-extra-file=__GMHA_MYSQL_DEFAULTS_FILE__ --protocol=tcp --host=127.0.0.1 --port=%d --batch --raw --skip-column-names", shellQuote(filepath.Join(instance.BaseDir, "bin", "mysql")), target.Port)
 	var command, operation, displayName, stepName string
 	if mode == "collect" {
@@ -1136,6 +2127,10 @@ func mysqlParameterCommand(client string, req mysqlParameterTaskRequest) (string
 	if !mysqlParameterPattern.MatchString(name) {
 		return "", "", "", "", errors.New("invalid MySQL parameter name")
 	}
+	configName, configValue, err := mysqlParameterForVersion(name, req.Value, req.Version)
+	if err != nil {
+		return "", "", "", "", err
+	}
 	if req.Action == "update" && (strings.TrimSpace(req.Value) == "" || strings.ContainsAny(req.Value, "\r\n\x00")) {
 		return "", "", "", "", errors.New("parameter value is required and must be a single line")
 	}
@@ -1156,24 +2151,30 @@ func mysqlParameterCommand(client string, req mysqlParameterTaskRequest) (string
 	parts := make([]string, 0, 4)
 	configChanged := false
 	if req.Action == "update" && (req.ApplyMode == "config" || req.ApplyMode == "both") {
-		parts = append(parts, mysqlParameterConfigCommand(configPath, name, req.Value, false))
+		parts = append(parts, mysqlParameterConfigCommand(configPath, configName, configValue, false))
 		configChanged = true
 	}
 	if req.Action == "delete" {
-		parts = append(parts, mysqlParameterConfigCommand(configPath, name, "", true))
+		parts = append(parts, mysqlParameterConfigCommand(configPath, configName, "", true))
 		configChanged = true
 	}
 	if configChanged && strings.TrimSpace(req.MySQLDPath) != "" {
-		parts = append(parts, mysqlParameterValidateConfigCommand(req.MySQLDPath, configPath))
+		parts = append(parts, mysqlParameterValidateConfigCommand(req.MySQLDPath, configPath, req.Version))
 	}
 	if req.Action == "update" && (req.ApplyMode == "dynamic" || req.ApplyMode == "both") {
-		sql := fmt.Sprintf("SET GLOBAL %s = %s; SELECT CONCAT('GMHA_EFFECTIVE_VALUE\\t', @@GLOBAL.%s);", name, sqlString(req.Value), name)
+		dynamicName := mysqlDynamicParameterNameForVersion(configName, req.Version)
+		sql := fmt.Sprintf("SET GLOBAL %s = %s; SELECT CONCAT('GMHA_EFFECTIVE_VALUE\\t', @@GLOBAL.%s);", dynamicName, sqlString(configValue), dynamicName)
 		parts = append(parts, client+" --execute="+shellQuote(sql))
 	}
 	if req.Action == "delete" {
-		resetSQL := "RESET PERSIST IF EXISTS " + name
+		dynamicName := mysqlDynamicParameterNameForVersion(configName, req.Version)
+		resetSQL := "RESET PERSIST IF EXISTS " + configName
 		if req.ApplyMode == "dynamic" || req.ApplyMode == "both" {
-			resetSQL = "SET GLOBAL " + name + " = DEFAULT; " + resetSQL
+			resetSQL = "SET GLOBAL " + dynamicName + " = DEFAULT; " + resetSQL
+		}
+		capabilities, capabilityErr := mysqlapp.CapabilitiesForVersion(req.Version)
+		if capabilityErr == nil && !capabilities.SupportsSetPersist {
+			resetSQL = "SET GLOBAL " + dynamicName + " = DEFAULT"
 		}
 		parts = append(parts, client+" --execute="+shellQuote(resetSQL))
 	}
@@ -1187,9 +2188,79 @@ func mysqlParameterCommand(client string, req mysqlParameterTaskRequest) (string
 	return strings.Join(parts, " && "), "mysql_parameter_" + req.Action, actionText + " MySQL 参数 " + name, actionText + "运行参数", nil
 }
 
-func mysqlParameterValidateConfigCommand(mysqldPath, configPath string) string {
-	validate := shellQuote(strings.TrimSpace(mysqldPath)) + " --defaults-file=" + shellQuote(configPath) + " --validate-config"
+func mysqlParameterValidateConfigCommand(mysqldPath, configPath string, version ...string) string {
+	mysqld := shellQuote(strings.TrimSpace(mysqldPath))
+	base := mysqld + " --defaults-file=" + shellQuote(configPath)
+	validate := "if " + mysqld + " --no-defaults --verbose --help 2>/dev/null | grep -q -- '--validate-config'; then " + base + " --validate-config; else " + base + " --verbose --help >/dev/null; fi"
 	return "if ! " + validate + "; then cp -a \"$backup\" \"$config\"; echo 'GMHA_CONFIG_VALIDATION_FAILED: restored previous my.cnf' >&2; exit 1; fi"
+}
+
+func mysqlParameterForVersion(name, value, version string) (string, string, error) {
+	if strings.TrimSpace(version) == "" {
+		version = "8.0.35"
+	}
+	capabilities, err := mysqlapp.CapabilitiesForVersion(version)
+	if err != nil {
+		return "", "", err
+	}
+	switch name {
+	case "collation_server":
+		if capabilities.Legacy57 && strings.EqualFold(strings.TrimSpace(value), "utf8mb4_0900_ai_ci") {
+			return name, "utf8mb4_unicode_ci", nil
+		}
+		return name, value, nil
+	case "binlog_expire_logs_seconds":
+		if !capabilities.Legacy57 {
+			return name, value, nil
+		}
+		seconds, err := strconv.Atoi(strings.TrimSpace(value))
+		if value != "" && (err != nil || seconds < 0) {
+			return "", "", errors.New("binlog_expire_logs_seconds must be a non-negative integer")
+		}
+		days := seconds / 86400
+		if seconds%86400 != 0 {
+			days++
+		}
+		return "expire_logs_days", strconv.Itoa(days), nil
+	case "log_replica_updates":
+		if capabilities.LegacyReplicationNames {
+			return "log_slave_updates", value, nil
+		}
+		return name, value, nil
+	case "log_slow_replica_statements":
+		if capabilities.LegacyReplicationNames {
+			return "log_slow_slave_statements", value, nil
+		}
+		return name, value, nil
+	case "transaction_isolation":
+		return name, value, nil
+	case "innodb_redo_log_capacity":
+		if !capabilities.LegacyRedoLog {
+			return name, value, nil
+		}
+		if value == "" {
+			return "innodb_log_file_size", value, nil
+		}
+		match := regexp.MustCompile(`^([0-9]+)([KMGTP]?)$`).FindStringSubmatch(strings.ToUpper(strings.TrimSpace(value)))
+		if len(match) != 3 {
+			return "", "", errors.New("innodb_redo_log_capacity must be a MySQL size such as 512M or 4G")
+		}
+		total, _ := strconv.ParseInt(match[1], 10, 64)
+		if total < 2 {
+			return "", "", errors.New("innodb_redo_log_capacity is too small for two legacy redo log files")
+		}
+		return "innodb_log_file_size", strconv.FormatInt(total/2, 10) + match[2], nil
+	default:
+		return name, value, nil
+	}
+}
+
+func mysqlDynamicParameterNameForVersion(name, version string) string {
+	capabilities, err := mysqlapp.CapabilitiesForVersion(version)
+	if err == nil && capabilities.LegacyTransactionVariable && name == "transaction_isolation" {
+		return "tx_isolation"
+	}
+	return name
 }
 
 func mysqlParameterCollectionSQL() string {
@@ -1198,7 +2269,7 @@ func mysqlParameterCollectionSQL() string {
 		names = append(names, sqlString(name))
 	}
 	sort.Strings(names)
-	return "SELECT CONCAT('GMHA_MYSQL_PARAMETER\\t', VARIABLE_NAME, '\\t', " +
+	return "SELECT CONCAT('GMHA_MYSQL_PARAMETER\\t', IF(LOWER(VARIABLE_NAME)='tx_isolation','transaction_isolation',VARIABLE_NAME), '\\t', " +
 		"REPLACE(REPLACE(VARIABLE_VALUE, CHAR(10), '\\\\n'), CHAR(9), ' '), '\\t', " +
 		"IF(LOWER(VARIABLE_NAME) IN (" + strings.Join(names, ",") + "), 'dynamic', 'restart')) " +
 		"FROM performance_schema.global_variables ORDER BY VARIABLE_NAME"
@@ -1254,7 +2325,7 @@ func mysqlParameterBatchCommand(client string, target mysqlParameterTargetReques
 		}
 		command, _, _, _, err := mysqlParameterCommand(client, mysqlParameterTaskRequest{
 			Action: change.Action, Name: change.Name, Value: change.Value, ApplyMode: applyMode,
-			ConfigPath: target.ConfigPath, SystemdUnit: target.SystemdUnit, Port: target.Port, MySQLDPath: target.MySQLDPath,
+			ConfigPath: target.ConfigPath, SystemdUnit: target.SystemdUnit, Port: target.Port, MySQLDPath: target.MySQLDPath, Version: target.Version,
 		})
 		if err != nil {
 			return "", err
@@ -1278,7 +2349,7 @@ func mysqlParameterBatchCommand(client string, target mysqlParameterTargetReques
 }
 
 var dynamicMySQLParameterNames = map[string]struct{}{
-	"autocommit": {}, "binlog_expire_logs_seconds": {}, "binlog_format": {}, "connect_timeout": {}, "event_scheduler": {},
+	"autocommit": {}, "binlog_expire_logs_seconds": {}, "expire_logs_days": {}, "binlog_format": {}, "connect_timeout": {}, "event_scheduler": {},
 	"general_log": {}, "general_log_file": {}, "group_concat_max_len": {}, "innodb_buffer_pool_size": {},
 	"innodb_flush_log_at_trx_commit": {}, "innodb_io_capacity": {}, "innodb_io_capacity_max": {}, "innodb_lock_wait_timeout": {},
 	"innodb_max_dirty_pages_pct": {}, "innodb_old_blocks_time": {}, "innodb_online_alter_log_max_size": {}, "innodb_print_all_deadlocks": {},
@@ -1288,7 +2359,7 @@ var dynamicMySQLParameterNames = map[string]struct{}{
 	"max_prepared_stmt_count": {}, "net_read_timeout": {}, "net_write_timeout": {}, "optimizer_switch": {}, "read_buffer_size": {},
 	"read_only": {}, "read_rnd_buffer_size": {}, "slow_query_log": {}, "sort_buffer_size": {}, "sql_mode": {},
 	"super_read_only": {}, "sync_binlog": {}, "table_definition_cache": {}, "table_open_cache": {}, "thread_cache_size": {},
-	"tmp_table_size": {}, "transaction_isolation": {}, "wait_timeout": {},
+	"tmp_table_size": {}, "transaction_isolation": {}, "tx_isolation": {}, "wait_timeout": {},
 }
 
 func mysqlParameterIsDynamic(name string) bool {

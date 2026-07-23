@@ -46,6 +46,15 @@ type TaskService struct {
 	agentCaps      map[string]map[string]bool
 	agentMachines  map[string]string
 	machineAgents  map[string]string
+	flameGraphs    FlameGraphTaskResultSaver
+	clusterHA      *HAService
+	clusterBackup  *BackupService
+}
+
+// FlameGraphTaskResultSaver keeps TaskService independent from the profiling
+// repository while still persisting the structured result sent by the Agent.
+type FlameGraphTaskResultSaver interface {
+	SaveFlameGraphTaskResult(context.Context, taskdomain.Task, taskdomain.ReportEnvelope, time.Time) error
 }
 
 // MachineInfoSaver 定义了机器信息保存接口。
@@ -73,6 +82,13 @@ type MySQLInstanceSaver interface {
 	Delete(ctx context.Context, machineID string, port int) error
 	UpdateStatus(ctx context.Context, machineID string, port int, status string) error
 	Get(ctx context.Context, machineID string, port int) (mysqlapp.Instance, bool, error)
+}
+
+// MySQLInstanceTarget joins an instance with its managed machine. Lifecycle
+// operations use this view to validate every member of the same cluster.
+type MySQLInstanceTarget struct {
+	Machine  machinedomain.Machine
+	Instance mysqlapp.Instance
 }
 
 // TaskDetail 是任务的完整详情，包含任务本身、步骤和事件列表。
@@ -213,6 +229,7 @@ type MySQLUpgradeRequest struct {
 	PrecheckTaskID   string
 	Force            bool
 	RiskAcknowledged bool
+	ParentTaskID     string
 }
 
 type MySQLUpgradePlan struct {
@@ -352,7 +369,7 @@ func (s *TaskService) aggregateParentTask(ctx context.Context, parent taskdomain
 	// Manager-driven workflows own their state machine and step progress. Their
 	// Agent children are displayed hierarchically, but must not complete the
 	// parent before later workflow steps have even been created.
-	if parent.Type == taskdomain.TypeArchitecture || parent.Type == taskdomain.TypeClusterBootstrap {
+	if parent.Type == taskdomain.TypeArchitecture || parent.Type == taskdomain.TypeClusterBootstrap || parent.Type == taskdomain.TypeMySQLClusterUpgrade || parent.Type == taskdomain.TypeAIWorkflow {
 		return parent, children, nil
 	}
 	completed, failed, progress := 0, 0, 0
@@ -448,6 +465,17 @@ func NewTaskService(repo taskdomain.Repository, createExec *taskusecase.CreateEx
 		agentMachines:  make(map[string]string),
 		machineAgents:  make(map[string]string),
 	}
+}
+
+// ConfigureClusterSafetyDependencies lets cluster-wide destructive task APIs
+// reject operations that would orphan HA or backup references.
+func (s *TaskService) ConfigureClusterSafetyDependencies(ha *HAService, backup *BackupService) {
+	s.clusterHA = ha
+	s.clusterBackup = backup
+}
+
+func (s *TaskService) SetFlameGraphTaskResultSaver(saver FlameGraphTaskResultSaver) {
+	s.flameGraphs = saver
 }
 
 // IsAgentConnected 返回 Agent 是否具有可下发任务的实时连接。
@@ -610,6 +638,160 @@ func architectureStepMayBeSkipped(code string) bool {
 	}
 }
 
+// AIWorkflowTaskOperation is the task-center projection of one durable AI
+// workflow operation. The AI domain owns orchestration; TaskService only keeps
+// the shared audit timeline synchronized.
+type AIWorkflowTaskOperation struct {
+	ID         string
+	Title      string
+	Status     string
+	Message    string
+	StartedAt  *time.Time
+	FinishedAt *time.Time
+}
+
+type AIWorkflowTaskSnapshot struct {
+	ID                 string
+	Goal               string
+	Target             string
+	Status             string
+	CurrentOperationID string
+	Error              string
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
+	StartedAt          *time.Time
+	FinishedAt         *time.Time
+	Operations         []AIWorkflowTaskOperation
+}
+
+// CreateAIWorkflowTrackingTask creates a Manager-owned parent before any child
+// action is submitted. Its deterministic ID makes workflow recovery idempotent
+// after a Manager restart.
+func (s *TaskService) CreateAIWorkflowTrackingTask(ctx context.Context, snapshot AIWorkflowTaskSnapshot) (TaskDetail, error) {
+	if s.repo == nil {
+		return TaskDetail{}, errors.New("task repository is not configured")
+	}
+	taskID := "ai-workflow-" + strings.TrimSpace(snapshot.ID)
+	if existing, ok, err := s.repo.GetTask(ctx, taskID); err != nil {
+		return TaskDetail{}, err
+	} else if ok {
+		return s.GetTaskDetail(ctx, existing.ID)
+	}
+	createdAt := snapshot.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
+	spec, err := json.Marshal(map[string]any{
+		"operation": "ai_workflow", "display_name": snapshot.Goal,
+		"target": snapshot.Target, "workflow_id": snapshot.ID,
+	})
+	if err != nil {
+		return TaskDetail{}, err
+	}
+	task := taskdomain.Task{
+		ID: taskID, Type: taskdomain.TypeAIWorkflow, MachineID: snapshot.Target,
+		AgentID: "manager", Status: taskdomain.StatusPending, CurrentStep: "waiting_approval",
+		SpecJSON: spec, CreatedAt: createdAt,
+	}
+	steps := make([]taskdomain.Step, 0, len(snapshot.Operations))
+	for index, operation := range snapshot.Operations {
+		steps = append(steps, taskdomain.Step{
+			ID: taskID + "-" + operation.ID, TaskID: taskID, StepNo: index + 1,
+			StepName: operation.ID, Status: taskdomain.StepPending, Message: operation.Title,
+		})
+	}
+	events := []taskdomain.Event{{
+		ID: taskID + "-created", TaskID: taskID, EventType: taskdomain.EventInfo,
+		Content: "AI 多步骤工作流已持久化，等待审批或安全执行。", CreatedAt: createdAt,
+	}}
+	if err := s.repo.CreateTask(ctx, task, steps, events); err != nil {
+		return TaskDetail{}, err
+	}
+	return s.GetTaskDetail(ctx, taskID)
+}
+
+// SyncAIWorkflowTrackingTask mirrors the durable orchestrator state into the
+// task center. Child Agent/platform tasks remain linked beneath this parent.
+func (s *TaskService) SyncAIWorkflowTrackingTask(ctx context.Context, snapshot AIWorkflowTaskSnapshot) error {
+	taskID := "ai-workflow-" + strings.TrimSpace(snapshot.ID)
+	task, found, err := s.repo.GetTask(ctx, taskID)
+	if err != nil || !found {
+		return err
+	}
+	now := snapshot.UpdatedAt
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	task.CurrentStep = firstNonEmptyTask(snapshot.CurrentOperationID, snapshot.Status)
+	task.StartedAt = snapshot.StartedAt
+	task.FinishedAt = snapshot.FinishedAt
+	switch snapshot.Status {
+	case "succeeded":
+		task.Status, task.ProgressPercent = taskdomain.StatusSuccess, 100
+	case "failed", "interrupted", "blocked":
+		task.Status = taskdomain.StatusFailed
+	case "running", "paused":
+		task.Status = taskdomain.StatusRunning
+	default:
+		task.Status = taskdomain.StatusPending
+	}
+	steps, err := s.repo.ListSteps(ctx, taskID)
+	if err != nil {
+		return err
+	}
+	byID := make(map[string]AIWorkflowTaskOperation, len(snapshot.Operations))
+	for _, operation := range snapshot.Operations {
+		byID[operation.ID] = operation
+	}
+	completed := 0
+	for _, step := range steps {
+		operation, ok := byID[step.StepName]
+		if !ok {
+			continue
+		}
+		step.Message = firstNonEmptyTask(operation.Message, operation.Title)
+		step.StartedAt = operation.StartedAt
+		step.FinishedAt = operation.FinishedAt
+		switch operation.Status {
+		case "succeeded", "skipped":
+			step.Status = taskdomain.StepSuccess
+			completed++
+		case "failed", "blocked", "interrupted":
+			step.Status = taskdomain.StepFailed
+		case "executing", "submitted", "verifying":
+			step.Status = taskdomain.StepRunning
+		default:
+			step.Status = taskdomain.StepPending
+		}
+		if err := s.repo.UpdateStep(ctx, step); err != nil {
+			return err
+		}
+	}
+	if task.Status != taskdomain.StatusSuccess && len(steps) > 0 {
+		task.ProgressPercent = completed * 100 / len(steps)
+	}
+	if err := s.repo.UpdateTask(ctx, task); err != nil {
+		return err
+	}
+	if strings.TrimSpace(snapshot.Error) != "" {
+		eventID := fmt.Sprintf("%s-error-%d", taskID, now.UnixNano())
+		_ = s.repo.AppendEvent(ctx, taskdomain.Event{
+			ID: eventID, TaskID: taskID, EventType: taskdomain.EventError,
+			Content: snapshot.Error, CreatedAt: now,
+		})
+	}
+	return nil
+}
+
+func firstNonEmptyTask(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
 // RegisterAgent 注册 Agent 的任务连接（无能力声明）。
 func (s *TaskService) RegisterAgent(agentID string, conn TaskConnection) {
 	s.RegisterAgentWithCapabilities(agentID, conn, nil)
@@ -685,6 +867,22 @@ func (s *TaskService) MachineCapability(machineID, capability string) (bool, str
 	return true, ""
 }
 
+// MachineAgentReady reports whether a machine currently has a live Agent task
+// channel without requiring an action-specific capability.
+func (s *TaskService) MachineAgentReady(machineID string) (bool, string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	machineID = strings.TrimSpace(machineID)
+	agentID := s.machineAgents[machineID]
+	if agentID == "" {
+		agentID = "agent-" + machineID
+	}
+	if _, online := s.agents[agentID]; !online {
+		return false, "Agent 未连接任务通道"
+	}
+	return true, ""
+}
+
 // IsAgentOnline 检查指定 Agent 的任务连接是否在线。
 func (s *TaskService) IsAgentOnline(agentID string) bool {
 	s.mu.RLock()
@@ -725,6 +923,25 @@ func (s *TaskService) ListClusterMachines(ctx context.Context, clusters []string
 	return result, nil
 }
 
+// GetTaskMachine returns machine metadata needed when task results are rendered
+// into business reports. It keeps HTTP handlers independent from repositories.
+func (s *TaskService) GetTaskMachine(ctx context.Context, machineID string) (machinedomain.Machine, bool, error) {
+	if s.machines == nil {
+		return machinedomain.Machine{}, false, errors.New("machine repository not configured")
+	}
+	return s.machines.GetByID(ctx, strings.TrimSpace(machineID))
+}
+
+// GetCollectedMachineInfo returns the latest persisted result produced by a
+// machine-information collection task. Automation result APIs use this method
+// so callers receive structured data instead of parsing task logs.
+func (s *TaskService) GetCollectedMachineInfo(ctx context.Context, machineID string) (collectdomain.MachineInfo, bool, error) {
+	if s.machineInfo == nil {
+		return collectdomain.MachineInfo{}, false, errors.New("machine info repository not configured")
+	}
+	return s.machineInfo.Get(ctx, strings.TrimSpace(machineID))
+}
+
 // CreateExecTask 创建 Shell 命令执行任务并尝试下发。
 func (s *TaskService) CreateExecTask(ctx context.Context, machine, command string) (TaskDetail, error) {
 	return s.CreateExecTaskWithOptions(ctx, machine, command, ExecTaskOptions{})
@@ -761,6 +978,31 @@ func (s *TaskService) CreateExecTaskWithOptions(ctx context.Context, machine, co
 		return TaskDetail{}, err
 	}
 	return TaskDetail{Task: taskForDisplay(task), Steps: steps, Events: events}, nil
+}
+
+// CreateFlameGraphTask reuses the established machine/Agent validation from
+// exec task creation, but persists and dispatches a typed, command-free spec.
+func (s *TaskService) CreateFlameGraphTask(ctx context.Context, machine string, spec taskdomain.FlameGraphSpec) (TaskDetail, error) {
+	if s.createExec == nil {
+		return TaskDetail{}, errors.New("task usecase not configured")
+	}
+	result, err := s.createExec.Execute(ctx, taskusecase.CreateExecTaskRequest{
+		Machine: machine, Command: "agent-native-stack-sampling",
+		Operation: "flamegraph_capture", DisplayName: "生成 Linux 火焰图",
+		StepName: "采集并聚合调用栈", TaskType: taskdomain.TypeFlameGraph,
+	})
+	if err != nil {
+		return TaskDetail{}, err
+	}
+	result.Task.SpecJSON, err = json.Marshal(spec)
+	if err != nil {
+		return TaskDetail{}, err
+	}
+	if err := s.repo.CreateTask(ctx, result.Task, result.Steps, result.Events); err != nil {
+		return TaskDetail{}, err
+	}
+	_ = s.tryDispatchPendingTask(ctx, result.Task.ID)
+	return s.GetTaskDetail(ctx, result.Task.ID)
 }
 
 // RedactExecTaskCommand removes a completed one-off command from durable task
@@ -906,6 +1148,45 @@ func (s *TaskService) ResolveMySQLInstance(ctx context.Context, selector string,
 	return machinedomain.Machine{}, mysqlapp.Instance{}, fmt.Errorf("machine %s not found", selector)
 }
 
+// ListClusterMySQLTargets returns every registered MySQL instance in a
+// cluster. The result is intentionally assembled in the application layer so
+// HTTP handlers do not reach into repositories directly.
+func (s *TaskService) ListClusterMySQLTargets(ctx context.Context, cluster string) ([]MySQLInstanceTarget, error) {
+	if s.machines == nil || s.mysqlInstance == nil {
+		return nil, errors.New("machine or mysql instance repository is not configured")
+	}
+	cluster = strings.TrimSpace(cluster)
+	machines, err := s.machines.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	instances, err := s.mysqlInstance.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	byMachineID := make(map[string]machinedomain.Machine, len(machines))
+	for _, machine := range machines {
+		if machine.Cluster == cluster {
+			byMachineID[machine.ID] = machine
+		}
+	}
+	result := make([]MySQLInstanceTarget, 0, len(instances))
+	for _, instance := range instances {
+		if machine, ok := byMachineID[instance.MachineID]; ok {
+			result = append(result, MySQLInstanceTarget{Machine: machine, Instance: instance})
+		}
+	}
+	return result, nil
+}
+
+// UpdateMySQLInstanceStatus records the terminal result of a lifecycle task.
+func (s *TaskService) UpdateMySQLInstanceStatus(ctx context.Context, machineID string, port int, status string) error {
+	if s.mysqlInstance == nil {
+		return errors.New("mysql instance repository is not configured")
+	}
+	return s.mysqlInstance.UpdateStatus(ctx, machineID, port, status)
+}
+
 func (s *TaskService) resolveMySQLUpgrade(ctx context.Context, machineName string, port int, packageName string) (machinedomain.Machine, mysqlapp.Instance, mysqlapp.Package, string, error) {
 	if s.createMySQL == nil || s.machineInfo == nil || s.mysqlInstance == nil || s.machines == nil {
 		return machinedomain.Machine{}, mysqlapp.Instance{}, mysqlapp.Package{}, "", errors.New("mysql upgrade dependencies are not configured")
@@ -958,6 +1239,12 @@ func (s *TaskService) CreateMySQLUpgradePrecheck(ctx context.Context, req MySQLU
 	defaults := mysqlDefaultsFilePlaceholder
 	client := q(baseDir+"/bin/mysql") + " --defaults-extra-file=" + defaults + fmt.Sprintf(" --protocol=tcp --host=127.0.0.1 --port=%d --batch --raw --table", instance.Port)
 	checker := "if command -v mysqlsh >/dev/null 2>&1; then echo 'checker=mysqlsh util.checkForServerUpgrade'; mysqlsh --defaults-file=" + defaults + fmt.Sprintf(" --host=127.0.0.1 --port=%d -- util check-for-server-upgrade --target-version=%s; else echo 'checker=mysqlcheck --check-upgrade (mysqlsh unavailable)'; %s --defaults-extra-file=%s --protocol=tcp --host=127.0.0.1 --port=%d --all-databases --check-upgrade; fi", instance.Port, q(targetPackage.Version), q(baseDir+"/bin/mysqlcheck"), defaults, instance.Port)
+	checkerName := "MySQL Shell Upgrade Checker（优先）/ mysqlcheck --check-upgrade（回退）"
+	if mysqlapp.IsMySQL57(currentVersion) {
+		checker = fmt.Sprintf("echo 'checker=mysqlcheck --check-upgrade (MySQL 5.7)'; %s --defaults-extra-file=%s --protocol=tcp --host=127.0.0.1 --port=%d --all-databases --check-upgrade", q(baseDir+"/bin/mysqlcheck"), defaults, instance.Port)
+		checkerName = "mysqlcheck --check-upgrade（MySQL 5.7）"
+	}
+	validateCurrentConfig := "if " + q(baseDir+"/bin/mysqld") + " --verbose --help 2>/dev/null | grep -q -- '--validate-config'; then " + q(baseDir+"/bin/mysqld") + " --defaults-file=" + q(myCnf) + " --validate-config; else echo '当前 5.7 小版本不支持 --validate-config，使用 --verbose --help 校验配置'; " + q(baseDir+"/bin/mysqld") + " --defaults-file=" + q(myCnf) + " --verbose --help >/dev/null; fi"
 	commands := []taskdomain.ExecCommandStep{
 		{Name: "安装布局与系统环境", Command: strings.Join([]string{
 			"echo 'GMHA_PRECHECK_SECTION=安装布局与系统环境'",
@@ -968,19 +1255,19 @@ func (s *TaskService) CreateMySQLUpgradePrecheck(ctx context.Context, req MySQLU
 			"echo target_version=" + q(targetPackage.Version) + " target_package=" + q(targetPackage.FileName),
 			"echo machine_arch=$(uname -m) glibc=$(ldd --version 2>&1 | head -1)",
 			"df -Pk " + q(filepath.Dir(baseDir)) + " | tail -1",
-			"test -r " + q(myCnf) + " && " + q(baseDir+"/bin/mysqld") + " --defaults-file=" + q(myCnf) + " --validate-config",
+			"test -r " + q(myCnf) + " && " + validateCurrentConfig,
 		}, " && ")},
 		{Name: "运行状态与复制风险", Command: "echo 'GMHA_PRECHECK_SECTION=运行状态与复制风险' && " + client + " --execute=" + q("SELECT @@version AS current_version, @@version_comment AS edition, @@global.read_only AS read_only, @@global.super_read_only AS super_read_only; SELECT COUNT(*) AS active_transactions FROM information_schema.innodb_trx; SELECT CHANNEL_NAME, SERVICE_STATE, LAST_ERROR_NUMBER, LAST_ERROR_MESSAGE FROM performance_schema.replication_connection_status; SELECT CHANNEL_NAME, SERVICE_STATE, LAST_ERROR_NUMBER, LAST_ERROR_MESSAGE FROM performance_schema.replication_applier_status_by_coordinator;")},
 		{Name: "MySQL 官方升级检查", Command: "echo 'GMHA_PRECHECK_SECTION=MySQL 官方升级检查' && " + checker},
 	}
-	detail, err := s.CreateExecTaskWithOptions(ctx, machine.IP, "", ExecTaskOptions{Operation: "mysql_upgrade_precheck", DisplayName: fmt.Sprintf("MySQL %s → %s 升级预检", currentVersion, targetPackage.Version), Port: instance.Port, PackageName: targetPackage.FileName, Commands: commands, TaskType: taskdomain.TypeMySQLUpgrade})
+	detail, err := s.CreateExecTaskWithOptions(ctx, machine.IP, "", ExecTaskOptions{ParentTaskID: req.ParentTaskID, Operation: "mysql_upgrade_precheck", DisplayName: fmt.Sprintf("MySQL %s → %s 升级预检", currentVersion, targetPackage.Version), Port: instance.Port, PackageName: targetPackage.FileName, Commands: commands, TaskType: taskdomain.TypeMySQLUpgrade})
 	if err != nil {
 		return MySQLUpgradePrecheckPlan{}, err
 	}
-	return MySQLUpgradePrecheckPlan{CurrentVersion: currentVersion, TargetVersion: targetPackage.Version, CurrentPackage: instance.PackageName, TargetPackage: targetPackage.FileName, Checker: "MySQL Shell Upgrade Checker（优先）/ mysqlcheck --check-upgrade（回退）", Task: detail}, nil
+	return MySQLUpgradePrecheckPlan{CurrentVersion: currentVersion, TargetVersion: targetPackage.Version, CurrentPackage: instance.PackageName, TargetPackage: targetPackage.FileName, Checker: checkerName, Task: detail}, nil
 }
 
-func (s *TaskService) validateMySQLUpgradePrecheck(ctx context.Context, taskID, machineID string, port int, packageName string) error {
+func (s *TaskService) validateMySQLUpgradePrecheck(ctx context.Context, taskID, machineID string, port int, packageName, parentTaskID string) error {
 	if strings.TrimSpace(taskID) == "" {
 		return errors.New("请先完成升级预检")
 	}
@@ -998,8 +1285,15 @@ func (s *TaskService) validateMySQLUpgradePrecheck(ctx context.Context, taskID, 
 	if task.Status != taskdomain.StatusSuccess || task.MachineID != machineID || spec.Operation != "mysql_upgrade_precheck" || spec.Port != port || spec.PackageName != packageName {
 		return errors.New("预检未通过，或报告与当前实例/目标版本不匹配")
 	}
-	if time.Since(task.CreatedAt) > 30*time.Minute {
-		return errors.New("预检报告已超过 30 分钟，请重新检查")
+	maxAge := 30 * time.Minute
+	if parentTaskID != "" {
+		if task.ParentTaskID != parentTaskID {
+			return errors.New("预检报告不属于当前集群滚动升级任务")
+		}
+		maxAge = 12 * time.Hour
+	}
+	if time.Since(task.CreatedAt) > maxAge {
+		return fmt.Errorf("预检报告已超过 %s，请重新检查", maxAge)
 	}
 	return nil
 }
@@ -1021,7 +1315,7 @@ func (s *TaskService) CreateMySQLUpgradeTask(ctx context.Context, req MySQLUpgra
 		return MySQLUpgradePlan{}, errors.New(reason)
 	}
 	if !req.Force {
-		if err := s.validateMySQLUpgradePrecheck(ctx, req.PrecheckTaskID, machine.ID, instance.Port, targetPackage.FileName); err != nil {
+		if err := s.validateMySQLUpgradePrecheck(ctx, req.PrecheckTaskID, machine.ID, instance.Port, targetPackage.FileName, req.ParentTaskID); err != nil {
 			return MySQLUpgradePlan{}, err
 		}
 	}
@@ -1031,12 +1325,17 @@ func (s *TaskService) CreateMySQLUpgradeTask(ctx context.Context, req MySQLUpgra
 	if unit == "" {
 		unit = fmt.Sprintf("mysqld-%d", instance.Port)
 	}
-	targetDir := filepath.Join(filepath.Dir(baseDir), strings.TrimSuffix(targetPackage.FileName, ".tar.xz"))
+	targetName, tarExtractFlag, err := mysqlUpgradeArchiveLayout(targetPackage.FileName)
+	if err != nil {
+		return MySQLUpgradePlan{}, err
+	}
+	targetDir := filepath.Join(filepath.Dir(baseDir), fmt.Sprintf("%s-%d", targetName, instance.Port))
 	archive := filepath.Join("/tmp", targetPackage.FileName)
 	stateDir := fmt.Sprintf("/var/lib/gmha/mysql-upgrade-%d", instance.Port)
 	client := fmt.Sprintf("%s/bin/mysql --defaults-extra-file=%s --protocol=tcp --host=127.0.0.1 --port=%d --batch --raw --skip-column-names", upgradeShellQuote(baseDir), mysqlDefaultsFilePlaceholder, instance.Port)
 	downloadURL := "__GMHA_MANAGER_URL__/api/v1/software/mysql/" + url.PathEscape(targetPackage.FileName)
 	q := upgradeShellQuote
+	restoreReadOnly := mysqlUpgradeRestoreReadOnlyCommand(client, stateDir)
 	commands := []taskdomain.ExecCommandStep{
 		{Name: "执行前安全复核", Command: strings.Join([]string{
 			fmt.Sprintf("echo force_upgrade=%t precheck_task=%s", req.Force, q(req.PrecheckTaskID)),
@@ -1047,23 +1346,23 @@ func (s *TaskService) CreateMySQLUpgradeTask(ctx context.Context, req MySQLUpgra
 			"echo machine_arch=$(uname -m) glibc=$(ldd --version 2>&1 | head -1)",
 			"df -h " + q(filepath.Dir(baseDir)),
 		}, " && ")},
-		{Name: "暂停数据库写入", Command: "mkdir -p " + q(stateDir) + " && readlink -f " + q(baseDir) + " > " + q(stateDir+"/old_target") + " && " + client + " --execute=" + q("SELECT @@global.read_only") + " > " + q(stateDir+"/read_only") + " && " + client + " --execute=" + q("SET GLOBAL super_read_only=ON; SET GLOBAL read_only=ON;") + " && for i in $(seq 1 60); do n=$(" + client + " --execute=" + q("SELECT COUNT(*) FROM information_schema.innodb_trx") + "); [ \"${n:-1}\" = 0 ] && break; sleep 1; done; [ \"${n:-1}\" = 0 ]"},
+		{Name: "暂停数据库写入", Command: "rm -rf " + q(stateDir) + " && mkdir -p " + q(stateDir) + " && readlink -f " + q(baseDir) + " > " + q(stateDir+"/old_target") + " && " + client + " --execute=" + q("SELECT CONCAT(@@global.read_only, ' ', @@global.super_read_only)") + " > " + q(stateDir+"/read_only") + " && " + client + " --execute=" + q("SET GLOBAL super_read_only=ON; SET GLOBAL read_only=ON;") + " && for i in $(seq 1 60); do n=$(" + client + " --execute=" + q("SELECT COUNT(*) FROM information_schema.innodb_trx") + "); [ \"${n:-1}\" = 0 ] && break; sleep 1; done; [ \"${n:-1}\" = 0 ]"},
 		{Name: "下载目标安装包", Command: "rm -f " + q(archive) + " && if command -v curl >/dev/null 2>&1; then curl -fL --retry 3 -o " + q(archive) + " " + q(downloadURL) + "; else wget -O " + q(archive) + " " + q(downloadURL) + "; fi && test -s " + q(archive)},
-		{Name: "解压并检查新版本", Command: "rm -rf " + q(targetDir) + " && tar -xJf " + q(archive) + " -C " + q(filepath.Dir(baseDir)) + " && test -x " + q(targetDir+"/bin/mysqld") + " && " + q(targetDir+"/bin/mysqld") + " --version && chown -R " + q(instance.MySQLUser+":"+instance.MySQLUser) + " " + q(targetDir)},
+		{Name: "解压并检查新版本", Command: "rm -rf " + q(targetDir) + " && mkdir -p " + q(targetDir) + " && tar " + tarExtractFlag + " " + q(archive) + " -C " + q(targetDir) + " --strip-components=1 && test -x " + q(targetDir+"/bin/mysqld") + " && " + q(targetDir+"/bin/mysqld") + " --version | tee /dev/stderr | grep -F " + q("Ver "+targetPackage.Version) + " >/dev/null && chown -R " + q(instance.MySQLUser+":"+instance.MySQLUser) + " " + q(targetDir)},
 		{Name: "停止数据库服务", Command: "systemctl stop " + q(unit) + " && ! systemctl is-active --quiet " + q(unit)},
 		{Name: "原子切换软连接", Command: "ln -sfn " + q(targetDir) + " " + q(baseDir+".gmha-next") + " && mv -Tf " + q(baseDir+".gmha-next") + " " + q(baseDir) + " && test \"$(readlink -f " + q(baseDir) + ")\" = " + q(targetDir)},
-		{Name: "校验升级后配置", Command: q(baseDir+"/bin/mysqld") + " --defaults-file=" + q(myCnf) + " --validate-config"},
-		{Name: "启动与数据字典升级", Command: "systemctl start " + q(unit) + " && touch " + q(stateDir+"/new_server_started") + " && for i in $(seq 1 120); do " + client + " --execute=" + q("SELECT 1") + " >/dev/null 2>&1 && break; sleep 1; done && " + client + " --execute=" + q("SELECT CONCAT('upgraded_version=', @@version); SELECT TABLE_SCHEMA, COUNT(*) FROM information_schema.tables GROUP BY TABLE_SCHEMA ORDER BY TABLE_SCHEMA;")},
+		{Name: "校验升级后配置", Command: mysqlUpgradeValidateConfigCommand(baseDir+"/bin/mysqld", myCnf, targetPackage.Version)},
+		{Name: "启动与数据字典升级", Command: "systemctl start " + q(unit) + " && touch " + q(stateDir+"/new_server_started") + " && for i in $(seq 1 120); do " + client + " --execute=" + q("SELECT 1") + " >/dev/null 2>&1 && break; sleep 1; done && if [ -x " + q(baseDir+"/bin/mysql_upgrade") + " ]; then " + q(baseDir+"/bin/mysql_upgrade") + " --defaults-extra-file=" + mysqlDefaultsFilePlaceholder + fmt.Sprintf(" --protocol=tcp --host=127.0.0.1 --port=%d --force; fi && ", instance.Port) + client + " --execute=" + q("SELECT CONCAT('upgraded_version=', @@version); SELECT TABLE_SCHEMA, COUNT(*) FROM information_schema.tables GROUP BY TABLE_SCHEMA ORDER BY TABLE_SCHEMA;")},
 		{Name: "数据库完整性检查", Command: fmt.Sprintf("%s/bin/mysqlcheck --defaults-extra-file=%s --protocol=tcp --host=127.0.0.1 --port=%d --all-databases --check-upgrade", q(baseDir), mysqlDefaultsFilePlaceholder, instance.Port)},
 		{Name: "主从复制检查与修复", Command: client + " --execute=" + q("START REPLICA") + " 2>/dev/null || " + client + " --execute=" + q("START SLAVE") + " 2>/dev/null || true; " + client + " --execute=" + q("SELECT CHANNEL_NAME, SERVICE_STATE, LAST_ERROR_NUMBER, LAST_ERROR_MESSAGE FROM performance_schema.replication_connection_status; SELECT CHANNEL_NAME, SERVICE_STATE, LAST_ERROR_NUMBER, LAST_ERROR_MESSAGE FROM performance_schema.replication_applier_status_by_coordinator;")},
-		{Name: "恢复业务访问", Command: "old_read_only=$(cat " + q(stateDir+"/read_only") + "); if [ \"$old_read_only\" = 0 ]; then " + client + " --execute=" + q("SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;") + "; fi; " + client + " --execute=" + q("SELECT @@version, @@global.read_only, @@global.super_read_only;") + " && rm -rf " + q(stateDir)},
+		{Name: "恢复业务访问", Command: restoreReadOnly + "; " + client + " --execute=" + q("SELECT @@version, @@global.read_only, @@global.super_read_only;") + " && rm -rf " + q(stateDir)},
 	}
-	rollback := "old_target=$(cat " + q(stateDir+"/old_target") + " 2>/dev/null || true); if [ -e " + q(stateDir+"/new_server_started") + " ]; then echo 'SAFEGUARD: 新版本已启动并可能升级数据字典，不自动切回旧二进制；实例保持新版本并需要人工检查或从备份恢复'; systemctl start " + q(unit) + " || true; else systemctl stop " + q(unit) + " || true; if [ -n \"$old_target\" ] && [ -x \"$old_target/bin/mysqld\" ]; then ln -sfn \"$old_target\" " + q(baseDir+".gmha-rollback") + " && mv -Tf " + q(baseDir+".gmha-rollback") + " " + q(baseDir) + "; fi; systemctl start " + q(unit) + " || true; echo rollback_target=$(readlink -f " + q(baseDir) + "); fi"
+	rollback := "old_target=$(cat " + q(stateDir+"/old_target") + " 2>/dev/null || true); if [ -z \"$old_target\" ]; then echo 'rollback=no_mutation'; elif [ -e " + q(stateDir+"/new_server_started") + " ]; then echo 'SAFEGUARD: 新版本已启动并可能升级数据字典，不自动切回旧二进制；实例保持新版本并需要人工检查或从备份恢复'; systemctl start " + q(unit) + " || true; else current_target=$(readlink -f " + q(baseDir) + " 2>/dev/null || true); if [ \"$current_target\" != \"$old_target\" ] || ! systemctl is-active --quiet " + q(unit) + "; then systemctl stop " + q(unit) + " || true; if [ -x \"$old_target/bin/mysqld\" ]; then ln -sfn \"$old_target\" " + q(baseDir+".gmha-rollback") + " && mv -Tf " + q(baseDir+".gmha-rollback") + " " + q(baseDir) + "; fi; systemctl start " + q(unit) + " || true; for i in $(seq 1 60); do " + client + " --execute=" + q("SELECT 1") + " >/dev/null 2>&1 && break; sleep 1; done; fi; " + restoreReadOnly + " || true; echo rollback_target=$(readlink -f " + q(baseDir) + "); fi"
 	displayName := fmt.Sprintf("MySQL %s 升级到 %s", currentVersion, targetPackage.Version)
 	if req.Force {
 		displayName = "[强制] " + displayName
 	}
-	detail, err := s.CreateExecTaskWithOptions(ctx, machine.IP, "", ExecTaskOptions{Operation: "mysql_upgrade", DisplayName: displayName, Port: instance.Port, PackageName: targetPackage.FileName, Commands: commands, RollbackCommand: rollback, TaskType: taskdomain.TypeMySQLUpgrade})
+	detail, err := s.CreateExecTaskWithOptions(ctx, machine.IP, "", ExecTaskOptions{ParentTaskID: req.ParentTaskID, Operation: "mysql_upgrade", DisplayName: displayName, Port: instance.Port, PackageName: targetPackage.FileName, Commands: commands, RollbackCommand: rollback, TaskType: taskdomain.TypeMySQLUpgrade})
 	if err != nil {
 		return MySQLUpgradePlan{}, err
 	}
@@ -1072,6 +1371,33 @@ func (s *TaskService) CreateMySQLUpgradeTask(ctx context.Context, req MySQLUpgra
 
 func upgradeShellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+func mysqlUpgradeArchiveLayout(packageName string) (targetName, extractFlag string, err error) {
+	packageName = filepath.Base(strings.TrimSpace(packageName))
+	switch {
+	case strings.HasSuffix(packageName, ".tar.xz"):
+		return strings.TrimSuffix(packageName, ".tar.xz"), "-xJf", nil
+	case strings.HasSuffix(packageName, ".tar.gz"):
+		return strings.TrimSuffix(packageName, ".tar.gz"), "-xzf", nil
+	case strings.HasSuffix(packageName, ".tgz"):
+		return strings.TrimSuffix(packageName, ".tgz"), "-xzf", nil
+	default:
+		return "", "", fmt.Errorf("unsupported MySQL upgrade package archive: %s", packageName)
+	}
+}
+
+func mysqlUpgradeValidateConfigCommand(mysqldPath, configPath, version string) string {
+	mysqld := upgradeShellQuote(mysqldPath)
+	command := mysqld + " --defaults-file=" + upgradeShellQuote(configPath)
+	return "if " + mysqld + " --no-defaults --verbose --help 2>/dev/null | grep -q -- '--validate-config'; then " + command + " --validate-config; else " + command + " --verbose --help >/dev/null; fi"
+}
+
+func mysqlUpgradeRestoreReadOnlyCommand(client, stateDir string) string {
+	q := upgradeShellQuote
+	return "old_state=$(cat " + q(filepath.Join(stateDir, "read_only")) + " 2>/dev/null || echo '1 1'); set -- $old_state; " +
+		"if [ \"${2:-1}\" = 0 ]; then " + client + " --execute=" + q("SET GLOBAL super_read_only=OFF;") + "; fi; " +
+		"if [ \"${1:-1}\" = 0 ]; then " + client + " --execute=" + q("SET GLOBAL read_only=OFF;") + "; fi"
 }
 
 // CreateClusterMySQLInstallTasks 为集群内所有机器创建 MySQL 安装任务。
@@ -1171,6 +1497,9 @@ func (s *TaskService) CreateClusterMySQLUninstallTasks(ctx context.Context, req 
 	if err != nil {
 		return ClusterMySQLUninstallResult{}, err
 	}
+	if err := s.validateClusterMySQLUninstallSafety(ctx, cluster, machines); err != nil {
+		return ClusterMySQLUninstallResult{}, err
+	}
 
 	result := ClusterMySQLUninstallResult{Cluster: cluster}
 	var parent TaskDetail
@@ -1219,6 +1548,49 @@ func (s *TaskService) CreateClusterMySQLUninstallTasks(ctx context.Context, req 
 	}
 	result.Parent, _ = s.GetTaskDetail(ctx, parent.Task.ID)
 	return result, nil
+}
+
+func (s *TaskService) validateClusterMySQLUninstallSafety(ctx context.Context, cluster string, machines []machinedomain.Machine) error {
+	if s.clusterHA != nil {
+		configs, err := s.clusterHA.ListVIPConfigs(ctx, cluster)
+		if err != nil {
+			return fmt.Errorf("检查集群 VIP 失败：%w", err)
+		}
+		if len(configs) > 0 {
+			return fmt.Errorf("集群 %s 仍有 %d 个业务 VIP；批量卸载 MySQL 前必须先安全撤销 VIP", cluster, len(configs))
+		}
+	}
+	if s.clusterBackup != nil {
+		policies, err := s.clusterBackup.ListPolicies(ctx, cluster)
+		if err != nil {
+			return fmt.Errorf("检查备份策略失败：%w", err)
+		}
+		if len(policies) > 0 {
+			return fmt.Errorf("集群 %s 仍有 %d 个备份策略；批量卸载 MySQL 前必须先删除或迁移策略", cluster, len(policies))
+		}
+	}
+	machineIDs := make(map[string]bool)
+	for _, machine := range machines {
+		if machine.Cluster == cluster {
+			machineIDs[machine.ID] = true
+		}
+	}
+	tasks, err := s.ListTasks(ctx, 500)
+	if err != nil {
+		return fmt.Errorf("检查集群活动任务失败：%w", err)
+	}
+	for _, task := range tasks {
+		if task.Type == taskdomain.TypeAIWorkflow {
+			continue
+		}
+		if task.Status != taskdomain.StatusPending && task.Status != taskdomain.StatusSent && task.Status != taskdomain.StatusRunning {
+			continue
+		}
+		if task.MachineID == cluster || machineIDs[task.MachineID] {
+			return fmt.Errorf("集群 %s 仍有进行中任务 %s（%s）；批量卸载已阻止", cluster, task.ID, task.Status)
+		}
+	}
+	return nil
 }
 
 func (s *TaskService) collectMachineInfoBeforeInstall(ctx context.Context, machine string) error {
@@ -1513,6 +1885,12 @@ func (s *TaskService) HandleReport(ctx context.Context, report taskdomain.Report
 }
 
 func (s *TaskService) applyTerminalTaskSideEffects(ctx context.Context, task taskdomain.Task, report taskdomain.ReportEnvelope, now time.Time) error {
+	if task.Type == taskdomain.TypeFlameGraph && s.flameGraphs != nil &&
+		(report.Status == taskdomain.StatusSuccess || report.Status == taskdomain.StatusFailed) {
+		if err := s.flameGraphs.SaveFlameGraphTaskResult(ctx, task, report, now); err != nil {
+			return err
+		}
+	}
 	if report.Status != taskdomain.StatusSuccess {
 		return nil
 	}
@@ -2042,7 +2420,7 @@ func taskForDisplay(task taskdomain.Task) taskdomain.Task {
 			return task
 		}
 		display = spec
-	case taskdomain.TypeBatchOperation, taskdomain.TypeClusterBootstrap, taskdomain.TypeArchitecture:
+	case taskdomain.TypeBatchOperation, taskdomain.TypeClusterBootstrap, taskdomain.TypeArchitecture, taskdomain.TypeMySQLClusterUpgrade, taskdomain.TypeAIWorkflow:
 		var spec map[string]any
 		if json.Unmarshal(task.SpecJSON, &spec) != nil {
 			task.SpecJSON = json.RawMessage(`{}`)
@@ -2052,6 +2430,7 @@ func taskForDisplay(task taskdomain.Task) taskdomain.Task {
 			"operation": spec["operation"], "display_name": spec["display_name"], "target": spec["target"],
 			"cluster": spec["cluster"], "architecture": spec["architecture"], "targets": spec["targets"],
 			"created": spec["created"], "creation_failures": spec["creation_failures"], "run_id": spec["run_id"],
+			"workflow_id": spec["workflow_id"],
 		}
 	default:
 		// 未知任务类型默认不暴露规格，新增类型必须显式声明可展示字段。

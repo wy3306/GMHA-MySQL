@@ -180,14 +180,14 @@ func defaultMySQLUninstallSpec(port int) taskdomain.MySQLUninstallSpec {
 		RedoDir:         instanceDir + "/redo",
 		UndoDir:         instanceDir + "/undo",
 		TmpDir:          instanceDir + "/tmp",
-		BaseDir:         "/usr/local/mysql",
-		SystemdUnitName: "mysqld",
+		BaseDir:         fmt.Sprintf("/usr/local/mysql-%d", port),
+		SystemdUnitName: mysqlSystemdUnitName(port),
 		MyCnfPath:       instanceDir + "/my.cnf",
 		SocketPath:      dataDir + "/mysql.sock",
 		ExtraPaths: []string{
-			"/etc/profile.d/mysql.sh",
-			"/etc/security/limits.d/mysql.conf",
-			"/etc/sysctl.d/99-gmha-mysql.conf",
+			fmt.Sprintf("/etc/profile.d/mysql-%d.sh", port),
+			fmt.Sprintf("/etc/security/limits.d/mysql-%d.conf", port),
+			fmt.Sprintf("/etc/sysctl.d/99-gmha-mysql-%d.conf", port),
 		},
 	}
 }

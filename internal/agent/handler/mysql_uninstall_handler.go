@@ -160,12 +160,12 @@ func removePackageCommand(spec taskdomain.MySQLUninstallSpec) string {
 	if name == "" || name == "." || name == "/" {
 		return "true"
 	}
-	return fmt.Sprintf("rm -f -- %s", shellEscape(filepath.Join("/tmp", name)))
+	return fmt.Sprintf("rm -f -- %s %s", shellEscape(filepath.Join("/tmp", name)), shellEscape(filepath.Join("/tmp", fmt.Sprintf("gmha-mysql-%d-%s", spec.Port, name))))
 }
 
 func uninstallBaseDirCommand(spec taskdomain.MySQLUninstallSpec) string {
 	baseDir := filepath.Clean(spec.BaseDir)
-	installDir := mysqlPackageInstallDir(baseDir, spec.PackageName)
+	installDir := mysqlPackageInstallDir(baseDir, spec.PackageName, spec.Port, spec.SystemdUnitName)
 	if installDir == "" {
 		return fmt.Sprintf(
 			"target=''; if [ -L %s ]; then target=$(readlink -f %s 2>/dev/null || true); rm -f -- %s; elif [ -d %s ] && [ -z \"$(ls -A %s)\" ]; then rmdir -- %s; fi; if [ -n \"$target\" ] && [ \"$target\" != %s ] && [ -d \"$target\" ]; then rm -rf -- \"$target\"; fi",
@@ -208,7 +208,7 @@ func removeExtraPathsCommand(spec taskdomain.MySQLUninstallSpec) string {
 
 func verifyUninstallCommand(spec taskdomain.MySQLUninstallSpec) string {
 	baseDir := filepath.Clean(spec.BaseDir)
-	installDir := mysqlPackageInstallDir(baseDir, spec.PackageName)
+	installDir := mysqlPackageInstallDir(baseDir, spec.PackageName, spec.Port, spec.SystemdUnitName)
 	checks := make([]string, 0, 8)
 	for _, path := range uniqueUninstallPaths(spec) {
 		checks = append(checks, "test ! -e "+shellEscape(path))
@@ -223,12 +223,17 @@ func verifyUninstallCommand(spec taskdomain.MySQLUninstallSpec) string {
 	return strings.Join(checks, " && ")
 }
 
-func mysqlPackageInstallDir(baseDir, packageName string) string {
+func mysqlPackageInstallDir(baseDir, packageName string, port int, systemdUnit string) string {
 	name := strings.TrimSuffix(filepath.Base(packageName), ".tar.xz")
 	name = strings.TrimSuffix(name, ".tgz")
 	name = strings.TrimSuffix(name, ".tar.gz")
 	if strings.TrimSpace(name) == "" || name == "." {
 		return ""
 	}
-	return filepath.Join(filepath.Dir(filepath.Clean(baseDir)), name)
+	// Instances created before port-scoped units used a shared, unsuffixed
+	// package directory. Preserve that cleanup path for legacy records.
+	if strings.TrimSpace(systemdUnit) == "mysqld" {
+		return filepath.Join(filepath.Dir(filepath.Clean(baseDir)), name)
+	}
+	return filepath.Join(filepath.Dir(filepath.Clean(baseDir)), fmt.Sprintf("%s-%d", name, port))
 }

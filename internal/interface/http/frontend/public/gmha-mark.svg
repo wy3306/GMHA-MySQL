@@ -1,8 +1,10 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="GMHA">
-  <rect width="32" height="32" rx="7" fill="#00ADD8"/>
-  <path d="M8.25 10.25a10 10 0 0 1 15.5 1.5M8.25 21.75a10 10 0 0 0 15.5-1.5" fill="none" stroke="#DDF8FF" stroke-linecap="round" stroke-width="2.25"/>
-  <ellipse cx="16" cy="11" rx="5.25" ry="2.25" fill="#fff"/>
-  <path d="M10.75 11v7.75c0 1.25 2.35 2.25 5.25 2.25s5.25-1 5.25-2.25V11" fill="#fff"/>
-  <path d="M10.75 15.05c0 1.25 2.35 2.25 5.25 2.25s5.25-1 5.25-2.25" fill="none" stroke="#007D9D" stroke-width="1.5"/>
-  <path d="m21.25 21.9 1.45 1.45 2.8-3.25" fill="none" stroke="#fff" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.7"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="GMHA 主备数据库">
+  <rect width="32" height="32" rx="7" fill="#739DD8"/>
+  <ellipse cx="10.2" cy="11.1" rx="3.6" ry="1.6" fill="#FFFFFF"/>
+  <path d="M6.6 11.1v6.3c0 .9 1.6 1.6 3.6 1.6s3.6-.7 3.6-1.6v-6.3c0 .9-1.6 1.6-3.6 1.6s-3.6-.7-3.6-1.6Z" fill="#FFFFFF"/>
+  <path d="M6.6 14.2c0 .9 1.6 1.6 3.6 1.6s3.6-.7 3.6-1.6" fill="none" stroke="#6990C6" stroke-width="1"/>
+  <ellipse cx="21.8" cy="14.6" rx="3.6" ry="1.6" fill="#DCE9F8"/>
+  <path d="M18.2 14.6v6.3c0 .9 1.6 1.6 3.6 1.6s3.6-.7 3.6-1.6v-6.3c0 .9-1.6 1.6-3.6 1.6s-3.6-.7-3.6-1.6Z" fill="#DCE9F8"/>
+  <path d="M18.2 17.7c0 .9 1.6 1.6 3.6 1.6s3.6-.7 3.6-1.6" fill="none" stroke="#7A9BC2" stroke-width="1"/>
+  <path d="M13.7 9h5.6l-1.5-1.5M18.3 23h-5.6l1.5 1.5" fill="none" stroke="#FFFFFF" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>

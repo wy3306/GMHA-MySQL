@@ -11,17 +11,20 @@ import (
 type Type string
 
 const (
-	TypeExec               Type = "exec"
-	TypeCollectMachineInfo Type = "collect_machine_info"
-	TypeCollectStaticInfo  Type = "collect_static_info"
-	TypeMySQLInstall       Type = "mysql_install"
-	TypeMySQLUninstall     Type = "mysql_uninstall"
-	TypeMySQLTopology      Type = "mysql_topology"
-	TypeMySQLUpgrade       Type = "mysql_upgrade"
-	TypeArchitecture       Type = "architecture_adjustment"
-	TypeClusterBootstrap   Type = "mysql_cluster_bootstrap"
-	TypeBatchOperation     Type = "batch_operation"
-	TypePlatformOperation  Type = "platform_operation"
+	TypeExec                Type = "exec"
+	TypeCollectMachineInfo  Type = "collect_machine_info"
+	TypeCollectStaticInfo   Type = "collect_static_info"
+	TypeMySQLInstall        Type = "mysql_install"
+	TypeMySQLUninstall      Type = "mysql_uninstall"
+	TypeMySQLTopology       Type = "mysql_topology"
+	TypeMySQLUpgrade        Type = "mysql_upgrade"
+	TypeMySQLClusterUpgrade Type = "mysql_cluster_upgrade"
+	TypeArchitecture        Type = "architecture_adjustment"
+	TypeClusterBootstrap    Type = "mysql_cluster_bootstrap"
+	TypeBatchOperation      Type = "batch_operation"
+	TypeAIWorkflow          Type = "ai_workflow"
+	TypePlatformOperation   Type = "platform_operation"
+	TypeFlameGraph          Type = "flamegraph"
 )
 
 type Status string
@@ -133,6 +136,25 @@ type ListQuery struct {
 type ExecCommandStep struct {
 	Name    string `json:"name"`
 	Command string `json:"command"`
+}
+
+// FlameGraphSpec is intentionally tool-agnostic. "auto" lets the Linux Agent
+// use perf when available and fall back to procfs for PID/process captures.
+type FlameGraphSpec struct {
+	ProfileID   string `json:"profile_id"`
+	TargetType  string `json:"target_type"`
+	Target      string `json:"target,omitempty"`
+	DurationSec int    `json:"duration_seconds"`
+	FrequencyHz int    `json:"frequency_hz"`
+	Backend     string `json:"backend"`
+}
+
+type FlameGraphResult struct {
+	ProfileID    string `json:"profile_id"`
+	Backend      string `json:"backend"`
+	SampleCount  int64  `json:"sample_count"`
+	StackCount   int    `json:"stack_count"`
+	FoldedStacks string `json:"folded_stacks"`
 }
 
 // CapabilityMySQLDefaultsFile marks Agents that can replace the Manager-side
@@ -303,6 +325,7 @@ type MySQLTopologyNodeSpec struct {
 	MachineName              string `json:"machine_name"`
 	IP                       string `json:"ip"`
 	Port                     int    `json:"port"`
+	Version                  string `json:"version"`
 	Role                     string `json:"role"`
 	ServerID                 int    `json:"server_id"`
 	AutoIncrementOffset      int    `json:"auto_increment_offset"`

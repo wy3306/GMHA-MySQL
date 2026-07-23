@@ -79,7 +79,7 @@ type mysqlInstallRunner struct {
 }
 
 func (r *mysqlInstallRunner) run() error {
-	packagePath := filepath.Join("/tmp", r.spec.PackageName)
+	packagePath := filepath.Join("/tmp", fmt.Sprintf("gmha-mysql-%d-%s", r.spec.Port, filepath.Base(r.spec.PackageName)))
 	steps := []func(taskdomain.DispatchStep) error{
 		func(step taskdomain.DispatchStep) error {
 			return r.runShellStep(step, "检查安装环境", r.checkEnvCommand())
@@ -132,7 +132,9 @@ func (r *mysqlInstallRunner) run() error {
 	}
 	steps = append(steps,
 		func(step taskdomain.DispatchStep) error {
-			return r.runShellStep(step, "校验配置并初始化 MySQL", fmt.Sprintf("%s/bin/mysqld --defaults-file=%s --validate-config && %s/bin/mysqld --defaults-file=%s --initialize-insecure --user=%s", shellEscape(r.spec.BaseDir), shellEscape(r.spec.MyCnfPath), shellEscape(r.spec.BaseDir), shellEscape(r.spec.MyCnfPath), shellEscape(r.spec.MySQLUser)))
+			validate := mysqlConfigValidationCommand(filepath.Join(r.spec.BaseDir, "bin", "mysqld"), r.spec.MyCnfPath, r.spec.Version)
+			initialize := fmt.Sprintf("%s/bin/mysqld --defaults-file=%s --initialize-insecure --user=%s", shellEscape(r.spec.BaseDir), shellEscape(r.spec.MyCnfPath), shellEscape(r.spec.MySQLUser))
+			return r.runShellStep(step, "校验配置并初始化 MySQL", validate+" && "+initialize)
 		},
 		func(step taskdomain.DispatchStep) error {
 			prefix := ""
@@ -267,18 +269,25 @@ func querySuffix(query string) string {
 func (r *mysqlInstallRunner) extractPackageStep(step taskdomain.DispatchStep, packagePath string) error {
 	installDir := r.packageInstallDir()
 	command := fmt.Sprintf(
-		"test -s %s && mkdir -p %s && rm -rf %s && tar -xJf %s -C %s && test -x %s/bin/mysqld && chown -R %s:%s %s",
+		"test -s %s && mkdir -p %s && rm -rf %s && mkdir -p %s && tar -xf %s -C %s --strip-components=1 && test -x %s/bin/mysqld && chown -R %s:%s %s",
 		shellEscape(packagePath),
 		shellEscape(filepath.Dir(installDir)),
 		shellEscape(installDir),
+		shellEscape(installDir),
 		shellEscape(packagePath),
-		shellEscape(filepath.Dir(installDir)),
+		shellEscape(installDir),
 		shellEscape(installDir),
 		shellEscape(r.spec.MySQLUser),
 		shellEscape(r.spec.MySQLUser),
 		shellEscape(installDir),
 	)
 	return r.runShellStep(step, "解压 MySQL", command)
+}
+
+func mysqlConfigValidationCommand(mysqldPath, configPath, version string) string {
+	mysqld := shellEscape(mysqldPath)
+	config := shellEscape(configPath)
+	return fmt.Sprintf("if %s --no-defaults --verbose --help 2>/dev/null | grep -q -- '--validate-config'; then %s --defaults-file=%s --validate-config; else %s --defaults-file=%s --verbose --help >/dev/null; fi", mysqld, mysqld, config, mysqld, config)
 }
 
 func (r *mysqlInstallRunner) createSymlinkStep(step taskdomain.DispatchStep) error {
@@ -309,13 +318,16 @@ func (r *mysqlInstallRunner) checkEnvCommand() string {
 	dataDir := filepath.Clean(r.spec.DataDir)
 	baseDir := filepath.Clean(r.spec.BaseDir)
 	baseParent := filepath.Dir(baseDir)
+	installDir := r.packageInstallDir()
 	return strings.Join([]string{
 		`test "$(id -u)" = "0" || { echo 'mysql install must run as root'; exit 1; }`,
 		`command -v tar >/dev/null 2>&1 || { echo 'missing tar'; exit 1; }`,
 		`command -v systemctl >/dev/null 2>&1 || { echo 'missing systemctl'; exit 1; }`,
 		`command -v apt-get >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1 || { echo 'missing supported package manager: apt-get/dnf/yum'; exit 1; }`,
 		fmt.Sprintf(`if systemctl list-unit-files %s 2>/dev/null | awk '{print $1}' | grep -qx %s || [ -e %s ] || [ -e %s ]; then echo 'mysql systemd unit already exists, uninstall before reinstall'; exit 1; fi`, shellEscape(service), shellEscape(service), shellEscape("/etc/systemd/system/"+service), shellEscape("/usr/lib/systemd/system/"+service)),
+		fmt.Sprintf(`if command -v ss >/dev/null 2>&1 && ss -ltnH 2>/dev/null | awk '{print $4}' | grep -Eq '(^|:)%d$'; then echo 'mysql port %d is already listening'; exit 1; fi`, r.spec.Port, r.spec.Port),
 		fmt.Sprintf(`if [ -d %s ]; then echo 'mysql data directory is already initialized, uninstall before reinstall'; exit 1; fi`, shellEscape(filepath.Join(dataDir, "mysql"))),
+		fmt.Sprintf(`if [ -L %s ] && [ "$(readlink -f %s 2>/dev/null || true)" != %s ]; then echo 'base_dir symlink is already used by another mysql instance'; exit 1; fi`, shellEscape(baseDir), shellEscape(baseDir), shellEscape(installDir)),
 		fmt.Sprintf(`if [ -e %s ] && [ ! -L %s ]; then if [ -d %s ] && [ -z "$(find %s -mindepth 1 -maxdepth 1 2>/dev/null | head -n 1)" ]; then :; else echo 'base_dir exists and is not an empty directory or symlink'; exit 1; fi; fi`, shellEscape(baseDir), shellEscape(baseDir), shellEscape(baseDir), shellEscape(baseDir)),
 		fmt.Sprintf(`mkdir -p %s %s`, shellEscape(instanceDir), shellEscape(baseParent)),
 		fmt.Sprintf(`test -w %s || { echo 'instance parent is not writable'; exit 1; }`, shellEscape(filepath.Dir(instanceDir))),
@@ -337,7 +349,7 @@ func installDependenciesCommand() string {
 	return strings.Join([]string{
 		`run_with_timeout() { if command -v timeout >/dev/null 2>&1; then timeout 300 "$@"; else "$@"; fi; }`,
 		`missing=""`,
-		`if command -v apt-get >/dev/null 2>&1; then for p in xz-utils libncurses6 numactl openssl perl curl ca-certificates; do dpkg -s "$p" >/dev/null 2>&1 || missing="$missing $p"; done; dpkg -s libaio1 >/dev/null 2>&1 || dpkg -s libaio1t64 >/dev/null 2>&1 || missing="$missing libaio1"; if [ -n "$missing" ]; then DEBIAN_FRONTEND=noninteractive run_with_timeout apt-get -y install --no-install-recommends $missing libaio-dev || { DEBIAN_FRONTEND=noninteractive run_with_timeout apt-get update && DEBIAN_FRONTEND=noninteractive run_with_timeout apt-get -y install --no-install-recommends xz-utils libaio1t64 libaio-dev libncurses6 numactl openssl perl curl ca-certificates; }; else echo "dependencies already installed"; fi`,
+		`if command -v apt-get >/dev/null 2>&1; then for p in xz-utils libncurses6 numactl openssl perl curl ca-certificates; do dpkg -s "$p" >/dev/null 2>&1 || missing="$missing $p"; done; dpkg -s libaio1 >/dev/null 2>&1 || dpkg -s libaio1t64 >/dev/null 2>&1 || missing="$missing libaio1"; if [ -n "$missing" ]; then DEBIAN_FRONTEND=noninteractive run_with_timeout apt-get -y install --no-install-recommends $missing libaio-dev || { DEBIAN_FRONTEND=noninteractive run_with_timeout apt-get update && DEBIAN_FRONTEND=noninteractive run_with_timeout apt-get -y install --no-install-recommends xz-utils libaio1t64 libaio-dev libncurses6 numactl openssl perl curl ca-certificates; }; else echo "dependencies already installed"; fi; dpkg -s libncurses5 >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive run_with_timeout apt-get -y install --no-install-recommends libncurses5 >/dev/null 2>&1 || true`,
 		`elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then rpm -qa >/dev/null || { echo "rpmdb is broken, run: rpm --rebuilddb"; exit 1; }; pm=dnf; command -v dnf >/dev/null 2>&1 || pm=yum; for p in xz libaio numactl-libs openssl perl curl ca-certificates; do rpm -q "$p" >/dev/null 2>&1 || missing="$missing $p"; done; rpm -q libaio-devel >/dev/null 2>&1 || missing="$missing libaio-devel"; if ! rpm -q ncurses-compat-libs >/dev/null 2>&1 && ! rpm -q ncurses >/dev/null 2>&1; then missing="$missing ncurses-compat-libs"; fi; if [ -n "$missing" ]; then run_with_timeout $pm -y install $missing || run_with_timeout $pm -y install xz libaio libaio-devel numactl-libs ncurses openssl perl curl ca-certificates; else echo "dependencies already installed"; fi`,
 		`fi`,
 		`if ! ldconfig -p 2>/dev/null | grep -q "libaio.so.1 "; then for p in /usr/lib/*/libaio.so.1t64 /lib/*/libaio.so.1t64; do if [ -e "$p" ]; then ln -sfn "$p" "$(dirname "$p")/libaio.so.1"; fi; done; ldconfig 2>/dev/null || true; fi`,
@@ -348,27 +360,27 @@ func installDependenciesCommand() string {
 func installPTToolsCommand(mysqlBaseDir, packageName, packageURL string) string {
 	return strings.Join([]string{
 		fmt.Sprintf(`mysql_version=$(%s/bin/mysql --version 2>/dev/null | sed -nE 's/.*(Distrib|Ver)[[:space:]]+([0-9]+\.[0-9]+).*/\2/p' | head -1)`, shellEscape(mysqlBaseDir)),
-		`case "$mysql_version" in 8.*) min_pt_version=3.7.0 ;; *) echo "unsupported MySQL version for automatic PT installation: $mysql_version" >&2; exit 1 ;; esac`,
-		`run_with_timeout() { if command -v timeout >/dev/null 2>&1; then timeout 600 "$@"; else "$@"; fi; }`,
+		`case "$mysql_version" in 5.7) min_pt_version=3.5.0 ;; 8.*|9.*) min_pt_version=3.7.1 ;; *) echo "unsupported MySQL version for automatic PT installation: $mysql_version" >&2; exit 1 ;; esac`,
 		`download() { if command -v curl >/dev/null 2>&1; then curl -fsSLo "$2" "$1"; elif command -v wget >/dev/null 2>&1; then wget -qO "$2" "$1"; else echo "curl or wget is required" >&2; return 1; fi; }`,
 		fmt.Sprintf(`pt_package_name=%s`, shellEscape(packageName)),
 		fmt.Sprintf(`pt_package_url=%s`, shellEscape(packageURL)),
 		`[ -n "$pt_package_name" ] && [ -n "$pt_package_url" ] || { echo "local Percona Toolkit package is not configured" >&2; exit 1; }`,
-		`if command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive run_with_timeout apt-get update && DEBIAN_FRONTEND=noninteractive run_with_timeout apt-get -y install --no-install-recommends perl libdbi-perl libdbd-mysql-perl libio-socket-ssl-perl libterm-readkey-perl libdigest-md5-perl libtime-hires-perl`,
-		`elif command -v dnf >/dev/null 2>&1; then run_with_timeout dnf -y install perl perl-DBI perl-DBD-MySQL perl-IO-Socket-SSL perl-TermReadKey perl-Digest-MD5 perl-Time-HiRes`,
-		`elif command -v yum >/dev/null 2>&1; then run_with_timeout yum -y install perl perl-DBI perl-DBD-MySQL perl-IO-Socket-SSL perl-TermReadKey perl-Digest-MD5 perl-Time-HiRes`,
-		`else echo "unsupported package manager for Percona Toolkit dependencies" >&2; exit 1; fi`,
-		`pt_archive="/tmp/$pt_package_name"; pt_dir=/tmp/gmha-percona-toolkit`,
+		`pt_archive="/tmp/$pt_package_name"; pt_stage=/tmp/gmha-percona-toolkit; pt_install=/opt/gmha-tools/percona-toolkit`,
 		`download "$pt_package_url" "$pt_archive"`,
-		`test -s "$pt_archive" && rm -rf "$pt_dir" && mkdir -p "$pt_dir" && tar -xzf "$pt_archive" -C "$pt_dir" --strip-components=1`,
-		`test -f "$pt_dir/bin/pt-table-sync" && test -f "$pt_dir/bin/pt-table-checksum" && install -m 0755 "$pt_dir"/bin/pt-* /usr/local/bin/`,
+		`test -s "$pt_archive" && rm -rf "$pt_stage" && mkdir -p "$pt_stage" && tar -xzf "$pt_archive" -C "$pt_stage"`,
+		`pt_source=$(find "$pt_stage" -type f -path '*/bin/pt-table-sync' -print -quit); [ -n "$pt_source" ] || { echo "invalid offline PT bundle: bin/pt-table-sync not found" >&2; exit 1; }; pt_source=$(dirname "$(dirname "$pt_source")")`,
+		`pt_packages=$(find "$pt_stage" -type d -name packages -print -quit); if [ -n "$pt_packages" ]; then debs=$(find "$pt_packages" -type f -name '*.deb' -print); rpms=$(find "$pt_packages" -type f -name '*.rpm' -print); apks=$(find "$pt_packages" -type f -name '*.apk' -print); archpkgs=$(find "$pt_packages" -type f \( -name '*.pkg.tar.zst' -o -name '*.pkg.tar.xz' \) -print); if [ -n "$debs" ] && command -v dpkg >/dev/null 2>&1; then dpkg -i $debs; elif [ -n "$rpms" ] && command -v rpm >/dev/null 2>&1; then rpm -Uvh --replacepkgs $rpms; elif [ -n "$apks" ] && command -v apk >/dev/null 2>&1; then apk add --no-network --allow-untrusted $apks; elif [ -n "$archpkgs" ] && command -v pacman >/dev/null 2>&1; then pacman -U --noconfirm $archpkgs; fi; fi`,
+		`command -v perl >/dev/null 2>&1 || { echo "offline PT bundle does not contain a Perl package compatible with this Linux distribution" >&2; exit 1; }`,
+		`rm -rf "$pt_install" && mkdir -p "$(dirname "$pt_install")" && cp -a "$pt_source" "$pt_install"`,
+		`pt_perl5lib="$pt_install/vendor/perl5:$pt_install/lib/perl5:$pt_install/lib"; export PERL5LIB="$pt_perl5lib${PERL5LIB:+:$PERL5LIB}"`,
+		`perl -MDBI -MDBD::mysql -MIO::Socket::SSL -MTerm::ReadKey -MDigest::MD5 -MTime::HiRes -e 1 || { echo "offline PT dependencies are incomplete; bundle vendor/perl5 or native packages under packages/" >&2; exit 1; }`,
+		`for pt_script in "$pt_install"/bin/pt-*; do [ -f "$pt_script" ] || continue; pt_cmd=$(basename "$pt_script"); printf '#!/bin/sh\nPT_HOME=%s\nexport PERL5LIB="$PT_HOME/vendor/perl5:$PT_HOME/lib/perl5:$PT_HOME/lib${PERL5LIB:+:$PERL5LIB}"\nexec perl "$PT_HOME/bin/%s" "$@"\n' "$pt_install" "$pt_cmd" > "/usr/local/bin/$pt_cmd" && chmod 0755 "/usr/local/bin/$pt_cmd"; done`,
 		`hash -r`,
 		`pt_version=$(pt-table-sync --version 2>/dev/null | sed -nE 's/.* ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -1)`,
 		`[ -n "$pt_version" ] || { echo "unable to determine Percona Toolkit version" >&2; exit 1; }`,
 		`[ "$(printf '%s\n%s\n' "$min_pt_version" "$pt_version" | sort -V | head -1)" = "$min_pt_version" ] || { echo "Percona Toolkit $pt_version is incompatible; MySQL $mysql_version requires >= $min_pt_version" >&2; exit 1; }`,
-		`perl -MDBI -MDBD::mysql -MIO::Socket::SSL -MTerm::ReadKey -MDigest::MD5 -MTime::HiRes -e 1`,
-		`for pt_cmd in pt-table-sync pt-table-checksum pt-online-schema-change pt-query-digest pt-replica-restart; do command -v "$pt_cmd" >/dev/null 2>&1 && "$pt_cmd" --version >/dev/null || { echo "Percona Toolkit validation failed: $pt_cmd" >&2; exit 1; }; done`,
-		`pt-table-sync --version; pt-table-checksum --version; pt-online-schema-change --version; pt-query-digest --version`,
+		`for pt_cmd in pt-table-sync pt-table-checksum pt-online-schema-change pt-archiver pt-query-digest pt-replica-restart; do command -v "$pt_cmd" >/dev/null 2>&1 && "$pt_cmd" --version >/dev/null || { echo "Percona Toolkit validation failed: $pt_cmd" >&2; exit 1; }; done`,
+		`pt-table-sync --version; pt-table-checksum --version; pt-online-schema-change --version; pt-archiver --version; pt-query-digest --version`,
 	}, "; ")
 }
 
@@ -392,10 +404,11 @@ func configureTCMallocCommand(mysqlBaseDir, systemdUnit string) string {
 func installXtraBackupCommand(mysqlVersion, packageName, packageURL string) string {
 	return strings.Join([]string{
 		fmt.Sprintf(`mysql_series=$(printf '%%s' %s | sed -nE 's/^([0-9]+\.[0-9]+).*/\1/p')`, shellEscape(mysqlVersion)),
+		`case "$mysql_series" in 5.7) xbk_series=2.4 ;; *) xbk_series="$mysql_series" ;; esac`,
 		fmt.Sprintf(`xbk_package_name=%s`, shellEscape(packageName)),
 		fmt.Sprintf(`xbk_package_url=%s`, shellEscape(packageURL)),
 		`[ -n "$mysql_series" ] && [ -n "$xbk_package_name" ] && [ -n "$xbk_package_url" ] || { echo "XtraBackup package metadata is incomplete" >&2; exit 1; }`,
-		`case "$xbk_package_name" in *xtrabackup-"$mysql_series".*|*XtraBackup-"$mysql_series".*) ;; *) echo "XtraBackup package $xbk_package_name does not match MySQL $mysql_series" >&2; exit 1 ;; esac`,
+		`case "$xbk_package_name" in *xtrabackup-"$xbk_series".*|*XtraBackup-"$xbk_series".*) ;; *) echo "XtraBackup package $xbk_package_name does not match MySQL $mysql_series (required XtraBackup $xbk_series)" >&2; exit 1 ;; esac`,
 		`run_with_timeout() { if command -v timeout >/dev/null 2>&1; then timeout 900 "$@"; else "$@"; fi; }`,
 		`download() { if command -v curl >/dev/null 2>&1; then curl -fsSLo "$2" "$1"; elif command -v wget >/dev/null 2>&1; then wget -qO "$2" "$1"; else echo "curl or wget is required" >&2; return 1; fi; }`,
 		`if command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive run_with_timeout apt-get update; DEBIAN_FRONTEND=noninteractive run_with_timeout apt-get -y install --no-install-recommends libev4 libgcrypt20 libcurl4 openssl zlib1g rsync lz4 zstd libaio1 || DEBIAN_FRONTEND=noninteractive run_with_timeout apt-get -y install --no-install-recommends libev4 libgcrypt20 libcurl4t64 openssl zlib1g rsync lz4 zstd libaio1t64`,
@@ -406,11 +419,11 @@ func installXtraBackupCommand(mysqlVersion, packageName, packageURL string) stri
 		`download "$xbk_package_url" "$xbk_archive" && test -s "$xbk_archive"`,
 		`rm -rf "$xbk_stage" && mkdir -p "$xbk_stage" "$xbk_root" && tar -xzf "$xbk_archive" -C "$xbk_stage"`,
 		`xbk_bin=$(find "$xbk_stage" -type f -path '*/bin/xtrabackup' -perm -u+x -print -quit); [ -n "$xbk_bin" ] || { echo "xtrabackup binary not found in archive" >&2; exit 1; }`,
-		`xbk_source=$(dirname "$(dirname "$xbk_bin")"); xbk_version=$("$xbk_bin" --version 2>&1 | sed -nE 's/.*version ([0-9]+\.[0-9]+\.[0-9]+[^ ]*).*/\1/p' | head -1); [ -n "$xbk_version" ] || xbk_version="$mysql_series"`,
+		`xbk_source=$(dirname "$(dirname "$xbk_bin")"); xbk_version=$("$xbk_bin" --version 2>&1 | sed -nE 's/.*version ([0-9]+\.[0-9]+\.[0-9]+[^ ]*).*/\1/p' | head -1); [ -n "$xbk_version" ] || xbk_version="$xbk_series"`,
 		`xbk_install="$xbk_root/percona-xtrabackup-$xbk_version"; rm -rf "$xbk_install" && mv "$xbk_source" "$xbk_install"`,
 		`for xbk_cmd in xtrabackup xbstream xbcloud xbcloud_osenv xbcrypt; do if [ -x "$xbk_install/bin/$xbk_cmd" ]; then ln -sfn "$xbk_install/bin/$xbk_cmd" "/usr/local/bin/$xbk_cmd"; fi; done`,
 		`hash -r; command -v xtrabackup >/dev/null; command -v xbstream >/dev/null; ! ldd "$xbk_install/bin/xtrabackup" 2>/dev/null | grep -q 'not found'`,
-		`xtrabackup --version 2>&1 | grep -E "version $mysql_series\\.|based on MySQL server $mysql_series\\." >/dev/null || { echo "installed XtraBackup does not match MySQL $mysql_series" >&2; exit 1; }`,
+		`xtrabackup --version 2>&1 | grep -E "version $xbk_series\\.|based on MySQL server $mysql_series\\." >/dev/null || { echo "installed XtraBackup $xbk_series does not match MySQL $mysql_series" >&2; exit 1; }`,
 		`xtrabackup --version; echo "XtraBackup dependencies and binaries verified"`,
 	}, "; ")
 }
@@ -495,6 +508,7 @@ func (r *mysqlInstallRunner) initAccountsStep(step taskdomain.DispatchStep) erro
 	initializer := mysqlapp.AccountInitializer{
 		Socket:       r.spec.SocketPath,
 		RootPassword: r.spec.RootPassword,
+		Version:      r.spec.Version,
 		Timeout:      5 * time.Second,
 	}
 	if err := initializer.WaitReady(r.ctx, 30, time.Second); err != nil {
@@ -716,7 +730,7 @@ func (r *mysqlInstallRunner) packageInstallDir() string {
 	if name == "" {
 		name = "mysql"
 	}
-	return filepath.Join(filepath.Dir(filepath.Clean(r.spec.BaseDir)), name)
+	return filepath.Join(filepath.Dir(filepath.Clean(r.spec.BaseDir)), fmt.Sprintf("%s-%d", name, r.spec.Port))
 }
 
 func (r *mysqlInstallRunner) writeFileStep(step taskdomain.DispatchStep, path, content string) error {

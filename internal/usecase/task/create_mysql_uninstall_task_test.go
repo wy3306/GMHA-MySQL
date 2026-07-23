@@ -18,7 +18,7 @@ func TestMySQLUninstallSpecFillsAdoptedInstanceMetadata(t *testing.T) {
 	if spec.InstanceDir != "/data/3306" {
 		t.Fatalf("InstanceDir = %q, want /data/3306", spec.InstanceDir)
 	}
-	if spec.BaseDir != "/usr/local/mysql" || spec.MyCnfPath != "/data/3306/my.cnf" {
+	if spec.BaseDir != "/usr/local/mysql-3306" || spec.MyCnfPath != "/data/3306/my.cnf" {
 		t.Fatalf("missing safe defaults: %+v", spec)
 	}
 	for name, value := range map[string]string{

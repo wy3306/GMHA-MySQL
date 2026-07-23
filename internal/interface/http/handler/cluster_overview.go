@@ -18,14 +18,33 @@ type clusterOverviewView struct {
 	RangeMinutes int                      `json:"range_minutes"`
 	HasHistory   bool                     `json:"has_history"`
 	DataSource   string                   `json:"data_source"`
+	Instance     string                   `json:"instance"`
 	Summary      clusterOverviewSummary   `json:"summary"`
 	Series       []clusterOverviewPoint   `json:"series"`
 	Machines     []clusterOverviewMachine `json:"machines"`
+	Storage      []clusterOverviewStorage `json:"storage"`
 }
 
 type clusterOverviewSummary struct {
 	QPS                  float64 `json:"qps"`
 	TPS                  float64 `json:"tps"`
+	ConnectedSessions    float64 `json:"connected_sessions"`
+	ActiveSessions       float64 `json:"active_sessions"`
+	RunningThreads       float64 `json:"running_threads"`
+	SleepSessions        float64 `json:"sleep_sessions"`
+	ConnectionUsage      float64 `json:"connection_usage_percent"`
+	LockWaitSessions     float64 `json:"lock_wait_sessions"`
+	BlockedSessions      float64 `json:"blocked_sessions"`
+	RowLockWaits         float64 `json:"row_lock_waits"`
+	MetadataLockWaits    float64 `json:"metadata_lock_waits"`
+	ActiveTransactions   float64 `json:"active_transactions"`
+	LongestTransaction   float64 `json:"longest_transaction_seconds"`
+	SlowQueriesPerMinute float64 `json:"slow_queries_per_min"`
+	DeadlocksPerMinute   float64 `json:"deadlocks_per_min"`
+	ReplicationLag       float64 `json:"replication_lag_seconds"`
+	BufferPoolHitRatio   float64 `json:"buffer_pool_hit_ratio"`
+	TableScanRatio       float64 `json:"table_scan_ratio"`
+	TmpDiskTableRatio    float64 `json:"tmp_disk_table_ratio"`
 	CPUPercent           float64 `json:"cpu_percent"`
 	IOBusyPercent        float64 `json:"io_busy_percent"`
 	IOReadBytes          float64 `json:"io_read_bytes_sec"`
@@ -40,12 +59,32 @@ type clusterOverviewSummary struct {
 	Architecture         string  `json:"architecture"`
 	InstanceCount        int     `json:"instance_count"`
 	MachineCount         int     `json:"machine_count"`
+	bufferPoolHitSum     float64
+	bufferPoolHitCount   int
+	connectionUsageSum   float64
+	connectionUsageCount int
+	tableScanRatioSum    float64
+	tableScanRatioCount  int
+	tmpDiskRatioSum      float64
+	tmpDiskRatioCount    int
 }
 
 type clusterOverviewPoint struct {
 	Timestamp            string  `json:"timestamp"`
 	QPS                  float64 `json:"qps"`
 	TPS                  float64 `json:"tps"`
+	ConnectedSessions    float64 `json:"connected_sessions"`
+	ActiveSessions       float64 `json:"active_sessions"`
+	RunningThreads       float64 `json:"running_threads"`
+	LockWaitSessions     float64 `json:"lock_wait_sessions"`
+	BlockedSessions      float64 `json:"blocked_sessions"`
+	MetadataLockWaits    float64 `json:"metadata_lock_waits"`
+	ActiveTransactions   float64 `json:"active_transactions"`
+	LongestTransaction   float64 `json:"longest_transaction_seconds"`
+	SlowQueriesPerMinute float64 `json:"slow_queries_per_min"`
+	DeadlocksPerMinute   float64 `json:"deadlocks_per_min"`
+	ReplicationLag       float64 `json:"replication_lag_seconds"`
+	BufferPoolHitRatio   float64 `json:"buffer_pool_hit_ratio"`
 	CPUPercent           float64 `json:"cpu_percent"`
 	IOBusyPercent        float64 `json:"io_busy_percent"`
 	IOReadBytes          float64 `json:"io_read_bytes_sec"`
@@ -66,10 +105,38 @@ type clusterOverviewMachine struct {
 	Status          string  `json:"status"`
 }
 
+type clusterOverviewStorage struct {
+	ID             string   `json:"id"`
+	MachineID      string   `json:"machine_id"`
+	MachineName    string   `json:"machine_name"`
+	IP             string   `json:"ip"`
+	Mount          string   `json:"mount"`
+	Source         string   `json:"source,omitempty"`
+	FSType         string   `json:"fs_type,omitempty"`
+	Purposes       []string `json:"purposes"`
+	Paths          []string `json:"paths"`
+	Ports          []int    `json:"ports,omitempty"`
+	TotalBytes     uint64   `json:"total_bytes"`
+	UsedBytes      uint64   `json:"used_bytes"`
+	AvailableBytes uint64   `json:"available_bytes"`
+	UsedPercent    float64  `json:"used_percent"`
+	Available      bool     `json:"available"`
+}
+
+type overviewStorageUsage struct {
+	path, mount, source, fsType           string
+	totalBytes, usedBytes, availableBytes uint64
+	usedPercent                           float64
+	available                             bool
+}
+
 type overviewBucket struct {
 	at                                                   time.Time
 	qps, tps, cpu, ioBusy, ioRead, ioWrite, netRX, netTX map[string]*overviewAverage
-	disk                                                 float64
+	connected, active, running, lockWait, blocked, metadataLock,
+	activeTransactions, longestTransaction, replicationLag, bufferPoolHit map[string]*overviewAverage
+	slowQueriesPerMinute, deadlocksPerMinute map[string]*overviewAverage
+	disk                                     float64
 }
 type overviewAverage struct {
 	sum   float64
@@ -80,8 +147,12 @@ type overviewCounter struct {
 	at    time.Time
 }
 
-func (h *ClusterTopologyHandler) buildOverview(ctx context.Context, cluster string, nodes []clusterTopologyNode, rangeMinutes int, now time.Time) clusterOverviewView {
-	view := clusterOverviewView{GeneratedAt: now.Local().Format("2006-01-02 15:04:05"), RangeMinutes: rangeMinutes, DataSource: "waiting", Series: []clusterOverviewPoint{}, Machines: []clusterOverviewMachine{}}
+func (h *ClusterTopologyHandler) buildOverview(ctx context.Context, cluster string, nodes []clusterTopologyNode, rangeMinutes int, now time.Time, instanceSelectors ...string) clusterOverviewView {
+	instanceSelector := ""
+	if len(instanceSelectors) > 0 {
+		instanceSelector = strings.TrimSpace(instanceSelectors[0])
+	}
+	view := clusterOverviewView{GeneratedAt: now.Local().Format("2006-01-02 15:04:05"), RangeMinutes: rangeMinutes, DataSource: "waiting", Instance: instanceSelector, Series: []clusterOverviewPoint{}, Machines: []clusterOverviewMachine{}, Storage: []clusterOverviewStorage{}}
 	view.Summary.InstanceCount = len(nodes)
 	roles := map[string]int{}
 	machineNodes := map[string]clusterTopologyNode{}
@@ -95,6 +166,11 @@ func (h *ClusterTopologyHandler) buildOverview(ctx context.Context, cluster stri
 		for _, machine := range machines {
 			if machine.Cluster != cluster {
 				continue
+			}
+			if instanceSelector != "" {
+				if _, selected := machineNodes[machine.ID]; !selected {
+					continue
+				}
 			}
 			if existing, ok := machineNodes[machine.ID]; ok {
 				existing.Name, existing.IP = machine.Name, machine.IP
@@ -118,6 +194,8 @@ func (h *ClusterTopologyHandler) buildOverview(ctx context.Context, cluster stri
 
 	// Capacity and current host gauges come from the latest heartbeat cache, so
 	// a fresh installation has useful cards before enough history is accumulated.
+	hostFilesystems := make(map[string][]overviewStorageUsage, len(machineNodes))
+	storageByKey := make(map[string]*clusterOverviewStorage)
 	for _, node := range machineNodes {
 		machine := clusterOverviewMachine{MachineID: node.MachineID, Name: node.Name, IP: node.IP, Status: node.Heartbeat}
 		metrics, err := h.machines.GetMachineDynamicMetrics(ctx, node.IP)
@@ -127,6 +205,21 @@ func (h *ClusterTopologyHandler) buildOverview(ctx context.Context, cluster stri
 			}
 			for _, metric := range metrics.Metrics {
 				applyCurrentHostMetric(&view.Summary, &machine, metric)
+				switch metric.Name {
+				case "filesystem_usage":
+					hostFilesystems[node.MachineID] = overviewStorageUsages(metric.Value)
+				case "swap_usage":
+					for _, usage := range overviewStorageUsages(metric.Value) {
+						if usage.mount == "" {
+							usage.mount = "swap"
+						}
+						if usage.source == "" {
+							usage.source = "/proc/swaps"
+						}
+						usage.fsType = "swap"
+						addOverviewStorage(storageByKey, node, usage, "Swap", "", 0)
+					}
+				}
 			}
 		}
 		view.Machines = append(view.Machines, machine)
@@ -138,23 +231,114 @@ func (h *ClusterTopologyHandler) buildOverview(ctx context.Context, cluster stri
 		}
 		view.Summary.CPUPercent = roundOverview(cpu / float64(len(view.Machines)))
 	}
+	machinesByID := make(map[string]*clusterOverviewMachine, len(view.Machines))
+	for i := range view.Machines {
+		machinesByID[view.Machines[i].MachineID] = &view.Machines[i]
+	}
 	for _, node := range nodes {
 		metrics, err := h.machines.GetMySQLDynamicMetrics(ctx, topologyEndpoint(node.IP, node.Port))
 		if err != nil {
 			continue
 		}
 		for _, metric := range metrics.Metrics {
-			applyCurrentMySQLMetric(&view.Summary, metric)
+			applyCurrentMySQLMetric(&view.Summary, machinesByID[node.MachineID], metric)
+			purpose := overviewStoragePurpose(metric.Name)
+			if purpose == "" || !metric.Success {
+				continue
+			}
+			usage, ok := overviewSingleStorageUsage(metric.Value)
+			if !ok {
+				continue
+			}
+			path := usage.path
+			if filesystem, found := overviewFilesystemForPath(hostFilesystems[node.MachineID], path); found {
+				usage = filesystem
+				usage.path = path
+			}
+			addOverviewStorage(storageByKey, machineNodes[node.MachineID], usage, purpose, path, node.Port)
 		}
+	}
+	if h.backup != nil {
+		if policies, err := h.backup.ListPolicies(ctx, cluster); err == nil {
+			for _, policy := range policies {
+				node, ok := machineNodes[policy.MachineID]
+				if !ok {
+					continue
+				}
+				if instanceSelector != "" && !overviewPolicyMatchesNodes(policy.MachineID, policy.Port, nodes) {
+					continue
+				}
+				usage := overviewStorageUsage{path: policy.BackupLocation}
+				if filesystem, found := overviewFilesystemForPath(hostFilesystems[policy.MachineID], policy.BackupLocation); found {
+					usage = filesystem
+					usage.path = policy.BackupLocation
+				}
+				addOverviewStorage(storageByKey, node, usage, "备份/NAS", policy.BackupLocation, policy.Port)
+			}
+		}
+	}
+	for machineID, filesystems := range hostFilesystems {
+		node := machineNodes[machineID]
+		for _, usage := range filesystems {
+			key := overviewStorageKey(machineID, usage)
+			item := storageByKey[key]
+			switch {
+			case usage.mount == "/":
+				addOverviewStorage(storageByKey, node, usage, "系统", usage.mount, 0)
+			case overviewNetworkFilesystem(usage.fsType) && item == nil:
+				addOverviewStorage(storageByKey, node, usage, "NAS", usage.mount, 0)
+			case item == nil:
+				addOverviewStorage(storageByKey, node, usage, "其他挂载", usage.mount, 0)
+			}
+		}
+	}
+	for _, item := range storageByKey {
+		sort.Strings(item.Purposes)
+		sort.Strings(item.Paths)
+		sort.Ints(item.Ports)
+		view.Storage = append(view.Storage, *item)
+	}
+	sort.Slice(view.Storage, func(i, j int) bool {
+		leftPriority := overviewStoragePriority(view.Storage[i])
+		rightPriority := overviewStoragePriority(view.Storage[j])
+		if leftPriority != rightPriority {
+			return leftPriority < rightPriority
+		}
+		if view.Storage[i].Mount != view.Storage[j].Mount {
+			return view.Storage[i].Mount < view.Storage[j].Mount
+		}
+		if view.Storage[i].MachineName != view.Storage[j].MachineName {
+			return view.Storage[i].MachineName < view.Storage[j].MachineName
+		}
+		if view.Storage[i].UsedPercent != view.Storage[j].UsedPercent {
+			return view.Storage[i].UsedPercent > view.Storage[j].UsedPercent
+		}
+		return view.Storage[i].ID < view.Storage[j].ID
+	})
+	if view.Summary.bufferPoolHitCount > 0 {
+		view.Summary.BufferPoolHitRatio = roundOverview(view.Summary.bufferPoolHitSum / float64(view.Summary.bufferPoolHitCount))
+	}
+	if view.Summary.connectionUsageCount > 0 {
+		view.Summary.ConnectionUsage = roundOverview(view.Summary.connectionUsageSum / float64(view.Summary.connectionUsageCount))
+	}
+	if view.Summary.tableScanRatioCount > 0 {
+		view.Summary.TableScanRatio = roundOverview(view.Summary.tableScanRatioSum / float64(view.Summary.tableScanRatioCount))
+	}
+	if view.Summary.tmpDiskRatioCount > 0 {
+		view.Summary.TmpDiskTableRatio = roundOverview(view.Summary.tmpDiskRatioSum / float64(view.Summary.tmpDiskRatioCount))
 	}
 	if total := view.Summary.DataBytes + view.Summary.IndexBytes; total > 0 {
 		view.Summary.FragmentPercent = roundOverview(100 * view.Summary.FragmentBytes / total)
 	}
 
 	if h.heartbeat != nil {
-		snapshots, err := h.heartbeat.MetricHistory(ctx, cluster, now.Add(-time.Duration(rangeMinutes)*time.Minute), 20000)
+		startAt := now.Add(-time.Duration(rangeMinutes) * time.Minute)
+		snapshots, err := h.heartbeat.MetricHistoryRange(ctx, cluster, startAt, now, 20000)
 		if err == nil {
-			view.Series = aggregateOverviewHistory(snapshots, rangeMinutes)
+			if instanceSelector != "" && len(nodes) == 1 {
+				snapshots = filterOverviewSnapshotsForInstance(snapshots, nodes[0])
+			}
+			view.Series = aggregateOverviewHistory(snapshots, rangeMinutes, startAt, now)
 			view.HasHistory = len(view.Series) > 1
 			if view.HasHistory {
 				view.DataSource = "history"
@@ -165,6 +349,18 @@ func (h *ClusterTopologyHandler) buildOverview(ctx context.Context, cluster stri
 		last := view.Series[len(view.Series)-1]
 		if view.HasHistory {
 			view.Summary.QPS, view.Summary.TPS = last.QPS, last.TPS
+			view.Summary.ConnectedSessions = last.ConnectedSessions
+			view.Summary.ActiveSessions = last.ActiveSessions
+			view.Summary.RunningThreads = last.RunningThreads
+			view.Summary.LockWaitSessions = last.LockWaitSessions
+			view.Summary.BlockedSessions = last.BlockedSessions
+			view.Summary.MetadataLockWaits = last.MetadataLockWaits
+			view.Summary.ActiveTransactions = last.ActiveTransactions
+			view.Summary.LongestTransaction = last.LongestTransaction
+			view.Summary.SlowQueriesPerMinute = last.SlowQueriesPerMinute
+			view.Summary.DeadlocksPerMinute = last.DeadlocksPerMinute
+			view.Summary.ReplicationLag = last.ReplicationLag
+			view.Summary.BufferPoolHitRatio = last.BufferPoolHitRatio
 		}
 		if last.CPUPercent > 0 {
 			view.Summary.CPUPercent = last.CPUPercent
@@ -228,9 +424,6 @@ func applyCurrentHostMetric(summary *clusterOverviewSummary, machine *clusterOve
 		summary.IOBusyPercent = math.Max(summary.IOBusyPercent, busy)
 		summary.IOReadBytes += read
 		summary.IOWriteBytes += write
-	case "filesystem_usage":
-		machine.DiskUsedPercent = overviewDisk(metric.Value)
-		summary.DiskUsedPercent = math.Max(summary.DiskUsedPercent, machine.DiskUsedPercent)
 	case "network_throughput":
 		rx, tx := overviewNetwork(metric.Value)
 		machine.NetworkBytes = rx + tx
@@ -239,7 +432,7 @@ func applyCurrentHostMetric(summary *clusterOverviewSummary, machine *clusterOve
 	}
 }
 
-func applyCurrentMySQLMetric(summary *clusterOverviewSummary, metric dynamicdomain.MetricResult) {
+func applyCurrentMySQLMetric(summary *clusterOverviewSummary, machine *clusterOverviewMachine, metric dynamicdomain.MetricResult) {
 	if !metric.Success {
 		return
 	}
@@ -257,12 +450,80 @@ func applyCurrentMySQLMetric(summary *clusterOverviewSummary, metric dynamicdoma
 		if ok {
 			summary.FragmentBytes += value
 		}
-	case "mysql_data_disk_usage", "mysql_binlog_disk_usage", "mysql_redo_disk_usage", "mysql_tmp_disk_usage", "mysql_undo_disk_usage":
-		summary.DiskUsedPercent = math.Max(summary.DiskUsedPercent, overviewDisk(metric.Value))
+	case "mysql_data_disk_usage":
+		usedPercent := overviewDisk(metric.Value)
+		summary.DiskUsedPercent = math.Max(summary.DiskUsedPercent, usedPercent)
+		if machine != nil {
+			machine.DiskUsedPercent = math.Max(machine.DiskUsedPercent, usedPercent)
+		}
+	case "mysql_threads_connected":
+		if ok {
+			summary.ConnectedSessions += value
+		}
+	case "mysql_active_connections":
+		if ok {
+			summary.ActiveSessions += value
+		}
+	case "mysql_threads_running":
+		if ok {
+			summary.RunningThreads += value
+		}
+	case "mysql_sleep_connections":
+		if ok {
+			summary.SleepSessions += value
+		}
+	case "mysql_connection_usage_percent":
+		if ok {
+			summary.connectionUsageSum += value
+			summary.connectionUsageCount++
+		}
+	case "mysql_lock_wait_sessions":
+		if ok {
+			summary.LockWaitSessions += value
+		}
+	case "mysql_blocked_sessions":
+		if ok {
+			summary.BlockedSessions += value
+		}
+	case "mysql_row_lock_waits_current":
+		if ok {
+			summary.RowLockWaits += value
+		}
+	case "mysql_metadata_lock_waits":
+		if ok {
+			summary.MetadataLockWaits += value
+		}
+	case "mysql_active_transactions":
+		if ok {
+			summary.ActiveTransactions += value
+		}
+	case "mysql_longest_transaction_seconds":
+		if ok {
+			summary.LongestTransaction = math.Max(summary.LongestTransaction, value)
+		}
+	case "mysql_replication_lag":
+		if ok {
+			summary.ReplicationLag = math.Max(summary.ReplicationLag, value)
+		}
+	case "mysql_buffer_pool_hit_ratio":
+		if ok {
+			summary.bufferPoolHitSum += value
+			summary.bufferPoolHitCount++
+		}
+	case "mysql_table_scan_ratio":
+		if ok {
+			summary.tableScanRatioSum += value
+			summary.tableScanRatioCount++
+		}
+	case "mysql_tmp_disk_table_ratio":
+		if ok {
+			summary.tmpDiskRatioSum += value
+			summary.tmpDiskRatioCount++
+		}
 	}
 }
 
-func aggregateOverviewHistory(snapshots []heartbeatdomain.MetricSnapshot, rangeMinutes int) []clusterOverviewPoint {
+func aggregateOverviewHistory(snapshots []heartbeatdomain.MetricSnapshot, rangeMinutes int, bounds ...time.Time) []clusterOverviewPoint {
 	if len(snapshots) == 0 {
 		return []clusterOverviewPoint{}
 	}
@@ -280,6 +541,12 @@ func aggregateOverviewHistory(snapshots []heartbeatdomain.MetricSnapshot, rangeM
 	counters := map[string]overviewCounter{}
 	for _, snapshot := range snapshots {
 		at := snapshot.CollectedAt
+		if len(bounds) >= 1 && at.Before(bounds[0]) {
+			continue
+		}
+		if len(bounds) >= 2 && at.After(bounds[1]) {
+			continue
+		}
 		bucketAt := at.Truncate(bucketSize)
 		bucket := buckets[bucketAt.Unix()]
 		if bucket == nil {
@@ -326,12 +593,54 @@ func aggregateOverviewHistory(snapshots []heartbeatdomain.MetricSnapshot, rangeM
 				addOverviewAverage(bucket.ioBusy, key, busy)
 				addOverviewAverage(bucket.ioRead, key, read)
 				addOverviewAverage(bucket.ioWrite, key, write)
-			case "filesystem_usage":
+			case "mysql_data_disk_usage":
 				bucket.disk = math.Max(bucket.disk, overviewDisk(metric.Value))
 			case "network_throughput":
 				rx, tx := overviewNetwork(metric.Value)
 				addOverviewAverage(bucket.netRX, key, rx)
 				addOverviewAverage(bucket.netTX, key, tx)
+			case "mysql_threads_connected":
+				addOverviewMetric(bucket.connected, key, metric.Value)
+			case "mysql_active_connections":
+				addOverviewMetric(bucket.active, key, metric.Value)
+			case "mysql_threads_running":
+				addOverviewMetric(bucket.running, key, metric.Value)
+			case "mysql_lock_wait_sessions", "mysql_row_lock_waits_current":
+				addOverviewMetric(bucket.lockWait, key, metric.Value)
+			case "mysql_blocked_sessions":
+				addOverviewMetric(bucket.blocked, key, metric.Value)
+			case "mysql_metadata_lock_waits":
+				addOverviewMetric(bucket.metadataLock, key, metric.Value)
+			case "mysql_active_transactions":
+				addOverviewMetric(bucket.activeTransactions, key, metric.Value)
+			case "mysql_longest_transaction_seconds":
+				addOverviewMetric(bucket.longestTransaction, key, metric.Value)
+			case "mysql_replication_lag":
+				addOverviewMetric(bucket.replicationLag, key, metric.Value)
+			case "mysql_buffer_pool_hit_ratio":
+				addOverviewMetric(bucket.bufferPoolHit, key, metric.Value)
+			case "mysql_slow_queries_per_min", "mysql_deadlocks":
+				value, ok := overviewNumber(metric.Value)
+				if !ok {
+					continue
+				}
+				counterKey := key + ":" + metric.Name
+				metricAt := metric.CollectedAt
+				if metricAt.IsZero() {
+					metricAt = at
+				}
+				previous, found := counters[counterKey]
+				if found && metricAt.After(previous.at) && value >= previous.value {
+					perMinute := 60 * (value - previous.value) / metricAt.Sub(previous.at).Seconds()
+					if metric.Name == "mysql_slow_queries_per_min" {
+						addOverviewAverage(bucket.slowQueriesPerMinute, key, perMinute)
+					} else {
+						addOverviewAverage(bucket.deadlocksPerMinute, key, perMinute)
+					}
+				}
+				if !found || metricAt.After(previous.at) {
+					counters[counterKey] = overviewCounter{value: value, at: metricAt}
+				}
 			}
 		}
 	}
@@ -343,13 +652,38 @@ func aggregateOverviewHistory(snapshots []heartbeatdomain.MetricSnapshot, rangeM
 	out := make([]clusterOverviewPoint, 0, len(keys))
 	for _, key := range keys {
 		bucket := buckets[key]
-		out = append(out, clusterOverviewPoint{Timestamp: bucket.at.Format(time.RFC3339), QPS: sumOverviewAverages(bucket.qps), TPS: sumOverviewAverages(bucket.tps), CPUPercent: averageOverviewAverages(bucket.cpu), IOBusyPercent: maxOverviewAverages(bucket.ioBusy), IOReadBytes: sumOverviewAverages(bucket.ioRead), IOWriteBytes: sumOverviewAverages(bucket.ioWrite), DiskUsedPercent: roundOverview(bucket.disk), NetworkReceiveBytes: sumOverviewAverages(bucket.netRX), NetworkTransmitBytes: sumOverviewAverages(bucket.netTX)})
+		out = append(out, clusterOverviewPoint{
+			Timestamp: bucket.at.Format(time.RFC3339), QPS: sumOverviewAverages(bucket.qps), TPS: sumOverviewAverages(bucket.tps),
+			ConnectedSessions: sumOverviewAverages(bucket.connected), ActiveSessions: sumOverviewAverages(bucket.active),
+			RunningThreads: sumOverviewAverages(bucket.running), LockWaitSessions: sumOverviewAverages(bucket.lockWait),
+			BlockedSessions: sumOverviewAverages(bucket.blocked), MetadataLockWaits: sumOverviewAverages(bucket.metadataLock),
+			ActiveTransactions: sumOverviewAverages(bucket.activeTransactions), LongestTransaction: maxOverviewAverages(bucket.longestTransaction),
+			SlowQueriesPerMinute: sumOverviewAverages(bucket.slowQueriesPerMinute), DeadlocksPerMinute: sumOverviewAverages(bucket.deadlocksPerMinute),
+			ReplicationLag: maxOverviewAverages(bucket.replicationLag), BufferPoolHitRatio: averageOverviewAverages(bucket.bufferPoolHit),
+			CPUPercent: averageOverviewAverages(bucket.cpu), IOBusyPercent: maxOverviewAverages(bucket.ioBusy),
+			IOReadBytes: sumOverviewAverages(bucket.ioRead), IOWriteBytes: sumOverviewAverages(bucket.ioWrite),
+			DiskUsedPercent: roundOverview(bucket.disk), NetworkReceiveBytes: sumOverviewAverages(bucket.netRX),
+			NetworkTransmitBytes: sumOverviewAverages(bucket.netTX),
+		})
 	}
 	return out
 }
 
 func newOverviewBucket(at time.Time) *overviewBucket {
-	return &overviewBucket{at: at, qps: map[string]*overviewAverage{}, tps: map[string]*overviewAverage{}, cpu: map[string]*overviewAverage{}, ioBusy: map[string]*overviewAverage{}, ioRead: map[string]*overviewAverage{}, ioWrite: map[string]*overviewAverage{}, netRX: map[string]*overviewAverage{}, netTX: map[string]*overviewAverage{}}
+	return &overviewBucket{
+		at: at, qps: map[string]*overviewAverage{}, tps: map[string]*overviewAverage{}, cpu: map[string]*overviewAverage{},
+		ioBusy: map[string]*overviewAverage{}, ioRead: map[string]*overviewAverage{}, ioWrite: map[string]*overviewAverage{},
+		netRX: map[string]*overviewAverage{}, netTX: map[string]*overviewAverage{}, connected: map[string]*overviewAverage{},
+		active: map[string]*overviewAverage{}, running: map[string]*overviewAverage{}, lockWait: map[string]*overviewAverage{},
+		blocked: map[string]*overviewAverage{}, metadataLock: map[string]*overviewAverage{}, activeTransactions: map[string]*overviewAverage{},
+		longestTransaction: map[string]*overviewAverage{}, replicationLag: map[string]*overviewAverage{}, bufferPoolHit: map[string]*overviewAverage{},
+		slowQueriesPerMinute: map[string]*overviewAverage{}, deadlocksPerMinute: map[string]*overviewAverage{},
+	}
+}
+func addOverviewMetric(values map[string]*overviewAverage, key string, raw any) {
+	if value, ok := overviewNumber(raw); ok {
+		addOverviewAverage(values, key, value)
+	}
 }
 func addOverviewAverage(values map[string]*overviewAverage, key string, value float64) {
 	item := values[key]
@@ -437,6 +771,240 @@ func overviewDisk(value any) float64 {
 	}
 	return roundOverview(max)
 }
+
+func overviewStoragePurpose(metricName string) string {
+	switch metricName {
+	case "mysql_data_disk_usage":
+		return "数据"
+	case "mysql_binlog_disk_usage":
+		return "Binlog"
+	case "mysql_redo_disk_usage":
+		return "Redo"
+	case "mysql_undo_disk_usage":
+		return "Undo"
+	case "mysql_tmp_disk_usage":
+		return "临时目录"
+	default:
+		return ""
+	}
+}
+
+func overviewStoragePriority(item clusterOverviewStorage) int {
+	priority := 5
+	for _, purpose := range item.Purposes {
+		candidate := 5
+		switch purpose {
+		case "数据":
+			candidate = 0
+		case "备份/NAS", "NAS":
+			candidate = 1
+		case "Binlog", "Redo", "Undo", "临时目录":
+			candidate = 2
+		case "系统":
+			candidate = 3
+		case "Swap":
+			candidate = 4
+		}
+		if candidate < priority {
+			priority = candidate
+		}
+	}
+	return priority
+}
+
+func overviewPolicyMatchesNodes(machineID string, port int, nodes []clusterTopologyNode) bool {
+	for _, node := range nodes {
+		if node.MachineID == machineID && node.Port == port {
+			return true
+		}
+	}
+	return false
+}
+
+func filterOverviewSnapshotsForInstance(snapshots []heartbeatdomain.MetricSnapshot, node clusterTopologyNode) []heartbeatdomain.MetricSnapshot {
+	out := make([]heartbeatdomain.MetricSnapshot, 0, len(snapshots))
+	expectedPort := strconv.Itoa(node.Port)
+	for _, snapshot := range snapshots {
+		if snapshot.MachineID != node.MachineID {
+			continue
+		}
+		filtered := snapshot
+		filtered.Metrics = make([]dynamicdomain.MetricResult, 0, len(snapshot.Metrics))
+		for _, metric := range snapshot.Metrics {
+			if strings.HasPrefix(metric.Name, "mysql_") {
+				port := strings.TrimSpace(metric.Labels["mysql_port"])
+				if port == "" {
+					port = "3306"
+				}
+				if port != expectedPort {
+					continue
+				}
+			}
+			filtered.Metrics = append(filtered.Metrics, metric)
+		}
+		if len(filtered.Metrics) > 0 {
+			out = append(out, filtered)
+		}
+	}
+	return out
+}
+
+func overviewStorageUsages(value any) []overviewStorageUsage {
+	out := []overviewStorageUsage{}
+	visitOverviewMaps(value, func(item map[string]any) {
+		_, hasTotal := item["total_bytes"]
+		_, hasPercent := item["used_percent"]
+		if !hasTotal && !hasPercent {
+			return
+		}
+		usage := overviewStorageUsage{
+			path:      overviewString(item["path"]),
+			mount:     overviewString(item["mount"]),
+			source:    overviewString(item["source"]),
+			fsType:    overviewString(item["fs_type"]),
+			available: true,
+		}
+		if enabled, ok := item["enabled"].(bool); ok && !enabled {
+			usage.available = false
+		}
+		if available, ok := item["available"].(bool); ok {
+			usage.available = available
+		}
+		usage.totalBytes, _ = overviewUint64(item["total_bytes"])
+		usage.usedBytes, _ = overviewUint64(item["used_bytes"])
+		usage.availableBytes, _ = overviewUint64(item["available_bytes"])
+		usage.usedPercent, _ = overviewNumber(item["used_percent"])
+		if usage.totalBytes == 0 && usage.fsType != "swap" {
+			usage.available = false
+		}
+		out = append(out, usage)
+	})
+	return out
+}
+
+func overviewSingleStorageUsage(value any) (overviewStorageUsage, bool) {
+	items := overviewStorageUsages(value)
+	if len(items) == 0 {
+		return overviewStorageUsage{}, false
+	}
+	return items[0], true
+}
+
+func overviewFilesystemForPath(filesystems []overviewStorageUsage, target string) (overviewStorageUsage, bool) {
+	target = strings.TrimSpace(target)
+	bestLength := -1
+	var best overviewStorageUsage
+	for _, item := range filesystems {
+		mount := strings.TrimRight(strings.TrimSpace(item.mount), "/")
+		if mount == "" {
+			mount = "/"
+		}
+		matches := mount == "/" && strings.HasPrefix(target, "/")
+		if mount != "/" {
+			matches = target == mount || strings.HasPrefix(target, mount+"/")
+		}
+		if matches && len(mount) > bestLength {
+			best, bestLength = item, len(mount)
+		}
+	}
+	return best, bestLength >= 0
+}
+
+func addOverviewStorage(items map[string]*clusterOverviewStorage, node clusterTopologyNode, usage overviewStorageUsage, purpose, path string, port int) {
+	key := overviewStorageKey(node.MachineID, usage)
+	item := items[key]
+	if item == nil {
+		item = &clusterOverviewStorage{
+			ID:          key,
+			MachineID:   node.MachineID,
+			MachineName: node.Name,
+			IP:          node.IP,
+			Mount:       usage.mount,
+			Source:      usage.source,
+			FSType:      usage.fsType,
+			Purposes:    []string{},
+			Paths:       []string{},
+			Ports:       []int{},
+		}
+		items[key] = item
+	}
+	if item.Mount == "" {
+		item.Mount = usage.mount
+	}
+	if item.Source == "" {
+		item.Source = usage.source
+	}
+	if item.FSType == "" {
+		item.FSType = usage.fsType
+	}
+	if usage.totalBytes > 0 || !item.Available {
+		item.TotalBytes = usage.totalBytes
+		item.UsedBytes = usage.usedBytes
+		item.AvailableBytes = usage.availableBytes
+		item.UsedPercent = roundOverview(usage.usedPercent)
+		item.Available = usage.available
+	}
+	item.Purposes = appendUniqueString(item.Purposes, purpose)
+	item.Paths = appendUniqueString(item.Paths, strings.TrimSpace(path))
+	if port > 0 {
+		item.Ports = appendUniqueInt(item.Ports, port)
+	}
+}
+
+func overviewStorageKey(machineID string, usage overviewStorageUsage) string {
+	location := strings.TrimSpace(usage.mount)
+	if location == "" {
+		location = strings.TrimSpace(usage.path)
+	}
+	if location == "" {
+		location = usage.fsType
+	}
+	return machineID + ":" + location
+}
+
+func overviewNetworkFilesystem(fsType string) bool {
+	switch strings.ToLower(strings.TrimSpace(fsType)) {
+	case "nfs", "nfs4", "cifs", "smb3", "sshfs", "fuse.sshfs", "ceph", "glusterfs":
+		return true
+	default:
+		return false
+	}
+}
+
+func overviewString(value any) string {
+	text, _ := value.(string)
+	return strings.TrimSpace(text)
+}
+
+func overviewUint64(value any) (uint64, bool) {
+	number, ok := overviewNumber(value)
+	if !ok || number < 0 {
+		return 0, false
+	}
+	return uint64(number), true
+}
+
+func appendUniqueString(values []string, value string) []string {
+	if value == "" {
+		return values
+	}
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func appendUniqueInt(values []int, value int) []int {
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
 func overviewIO(value any) (busy, read, write float64) {
 	visitOverviewMaps(value, func(item map[string]any) {
 		if v, ok := overviewNumber(item["busy_ratio"]); ok {

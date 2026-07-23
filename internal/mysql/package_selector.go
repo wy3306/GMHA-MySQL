@@ -216,10 +216,20 @@ type version struct {
 
 // parsePackage 解析 MySQL 安装包文件名，提取版本号、架构和 glibc 版本信息。
 func parsePackage(name string) (Package, bool) {
-	if !strings.HasPrefix(name, "mysql-") || !strings.HasSuffix(name, ".tar.xz") {
+	if !strings.HasPrefix(name, "mysql-") {
 		return Package{}, false
 	}
-	trimmed := strings.TrimSuffix(name, ".tar.xz")
+	trimmed := name
+	switch {
+	case strings.HasSuffix(name, ".tar.xz"):
+		trimmed = strings.TrimSuffix(name, ".tar.xz")
+	case strings.HasSuffix(name, ".tar.gz"):
+		trimmed = strings.TrimSuffix(name, ".tar.gz")
+	case strings.HasSuffix(name, ".tgz"):
+		trimmed = strings.TrimSuffix(name, ".tgz")
+	default:
+		return Package{}, false
+	}
 	parts := strings.Split(trimmed, "-")
 	if len(parts) < 5 {
 		return Package{}, false

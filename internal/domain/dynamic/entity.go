@@ -65,26 +65,30 @@ type MetricBatchResult struct {
 // MySQL 指标由独立的多实例采集器负责，不能在没有已登记实例时按默认 3306 采集。
 func BuildDefaultDynamicCollectConfig() DynamicCollectConfig {
 	now := time.Now().UTC()
-	names := []string{
-		"cpu_usage_percent",
-		"mem_usage_percent",
-		"agent_cpu_usage_percent",
-		"agent_memory_rss_mb",
-		"io_status",
-		"filesystem_usage",
-		"network_throughput",
-		"load_average",
-		"ntp_offset_ms",
-		"ssh_probe",
-		"inode_usage",
+	names := []struct {
+		name, displayName, category string
+	}{
+		{"cpu_usage_percent", "CPU 使用率", "cpu"},
+		{"mem_usage_percent", "内存使用率", "memory"},
+		{"host_memory_detail", "机器内存明细", "memory"},
+		{"swap_usage", "Swap 使用情况", "memory"},
+		{"agent_cpu_usage_percent", "Agent CPU 使用率", "agent"},
+		{"agent_memory_rss_mb", "Agent 内存占用", "agent"},
+		{"io_status", "磁盘 IO 状态", "disk_io"},
+		{"filesystem_usage", "文件系统空间使用", "filesystem"},
+		{"network_throughput", "网络吞吐", "network"},
+		{"load_average", "系统负载", "load"},
+		{"ntp_offset_ms", "时钟偏移", "system"},
+		{"ssh_probe", "SSH 服务探测", "system"},
+		{"inode_usage", "Inode 使用率", "filesystem"},
 	}
 	tasks := make([]CollectTaskSpec, 0, len(names))
-	for _, name := range names {
+	for _, item := range names {
 		interval := 5
-		switch name {
-		case "agent_cpu_usage_percent", "agent_memory_rss_mb":
+		switch item.name {
+		case "agent_cpu_usage_percent", "agent_memory_rss_mb", "host_memory_detail":
 			interval = 15
-		case "filesystem_usage":
+		case "filesystem_usage", "swap_usage":
 			interval = 30
 		case "ntp_offset_ms":
 			interval = 60
@@ -92,11 +96,13 @@ func BuildDefaultDynamicCollectConfig() DynamicCollectConfig {
 			interval = 30
 		}
 		tasks = append(tasks, CollectTaskSpec{
-			Name:            name,
+			Name:            item.name,
 			Enabled:         true,
 			Type:            TaskTypeBuiltin,
+			Category:        item.category,
 			IntervalSeconds: interval,
 			TimeoutSeconds:  1,
+			Labels:          map[string]string{"display_name": item.displayName},
 		})
 	}
 	return DynamicCollectConfig{
@@ -285,6 +291,7 @@ func BuildDefaultMySQLDynamicCollectConfig() DynamicCollectConfig {
 	add("mysql_redo_disk_usage", "storage", 30, "Redo盘使用率", nil)
 	add("mysql_tmp_disk_usage", "storage", 30, "临时盘使用率", nil)
 	add("mysql_undo_disk_usage", "storage", 30, "Undo盘使用率", nil)
+	add("mysql_memory_modules", "memory", 60, "数据库内存模块明细", nil)
 
 	add("mysql_tablespace_fragment_total_bytes", "storage", 300, "所有表空间总碎片大小", map[string]string{"query": "select coalesce(sum(data_free),0) from information_schema.tables where table_schema not in ('mysql','information_schema','performance_schema','sys')"})
 	add("mysql_index_data_total_bytes", "storage", 300, "所有索引数据量大小", map[string]string{"query": "select coalesce(sum(index_length),0) from information_schema.tables where table_schema not in ('mysql','information_schema','performance_schema','sys')"})
@@ -342,12 +349,54 @@ func mysqlImplementedNoParamCollectors() map[string]bool {
 		"mysql_table_cache_overflow_ratio",
 		"mysql_internal_tmp_disk_table_ratio",
 		"mysql_memory_tmp_to_disk_ratio",
+		"mysql_memory_modules",
 		"mysql_thread_cache_hit_ratio",
 		"mysql_data_disk_usage",
 		"mysql_binlog_disk_usage",
 		"mysql_redo_disk_usage",
 		"mysql_tmp_disk_usage",
 		"mysql_undo_disk_usage",
+		"mysql_background_flush_pressure",
+		"mysql_blocking_chain_length",
+		"mysql_checkpoint_pressure",
+		"mysql_crash_recovery_keyword_count",
+		"mysql_disk_full_keyword_count",
+		"mysql_error_code_stats",
+		"mysql_error_log_growth",
+		"mysql_error_log_growth_per_min",
+		"mysql_error_log_size",
+		"mysql_gtid_sync_status",
+		"mysql_history_list_length",
+		"mysql_join_buffer_pressure",
+		"mysql_last_replication_error_time",
+		"mysql_master_binlog_rate",
+		"mysql_master_role_change",
+		"mysql_max_blocking_seconds",
+		"mysql_oom_keyword_count",
+		"mysql_permission_failed_keyword_count",
+		"mysql_purge_backlog_length",
+		"mysql_read_buffer_pressure",
+		"mysql_read_rnd_buffer_pressure",
+		"mysql_recent_error_count",
+		"mysql_recent_warning_count",
+		"mysql_relay_log_backlog",
+		"mysql_relay_log_growth_rate",
+		"mysql_relay_log_replay_rate",
+		"mysql_replica_catchup_status",
+		"mysql_replication_error_count",
+		"mysql_replication_error_keyword_count",
+		"mysql_replication_lag_change_rate",
+		"mysql_slow_query_log_growth",
+		"mysql_slow_sql_hot_db_stats",
+		"mysql_slow_sql_hot_table_stats",
+		"mysql_slow_sql_topn_trend",
+		"mysql_slow_sql_total_seconds",
+		"mysql_slowest_sql_seconds",
+		"mysql_sort_buffer_pressure",
+		"mysql_table_corruption_keyword_count",
+		"mysql_table_definition_cache_usage",
+		"mysql_tmp_dir_space_change",
+		"mysql_undo_growth_rate",
 	} {
 		out[name] = true
 	}

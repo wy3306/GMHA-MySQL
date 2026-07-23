@@ -49,3 +49,54 @@ func TestMySQLPortFromCommand(t *testing.T) {
 		}
 	}
 }
+
+func TestReplaceExecCommandPlaceholdersAlsoSupportsRollback(t *testing.T) {
+	command := "mysql --defaults-extra-file=" + mysqlDefaultsFilePlaceholder + " && curl __GMHA_MANAGER_URL__/health"
+	got := replaceExecCommandPlaceholders(command, "http://manager:8080", "/tmp/credentials with space.cnf")
+	if strings.Contains(got, mysqlDefaultsFilePlaceholder) || strings.Contains(got, "__GMHA_MANAGER_URL__") {
+		t.Fatalf("placeholders were not fully replaced: %s", got)
+	}
+	for _, expected := range []string{"http://manager:8080/health", "'/tmp/credentials with space.cnf'"} {
+		if !strings.Contains(got, expected) {
+			t.Fatalf("expected replacement %q in %s", expected, got)
+		}
+	}
+}
+
+func TestPTOnlineProgressParsesCopyPercentage(t *testing.T) {
+	tests := []struct {
+		line string
+		want int
+		ok   bool
+	}{
+		{"Copying `app`.`orders`: 42% 00:12 remain", 42, true},
+		{"PT online copy 100%", 100, true},
+		{"progress unavailable", 0, false},
+		{"Copying: 101%", 101, false},
+	}
+	for _, test := range tests {
+		got, ok := ptOnlineProgress(test.line)
+		if got != test.want || ok != test.ok {
+			t.Fatalf("ptOnlineProgress(%q) = (%d,%v), want (%d,%v)", test.line, got, ok, test.want, test.ok)
+		}
+	}
+}
+
+func TestPTArchiverProgressParsesProcessedRows(t *testing.T) {
+	tests := []struct {
+		line string
+		want int64
+		ok   bool
+	}{
+		{"2026-07-23T09:10:11 12 5000", 5000, true},
+		{"2026-07-23 09:10:11 12 6000", 6000, true},
+		{"SELECT 5000", 0, false},
+		{"2026-07-23T09:10:11 elapsed rows", 0, false},
+	}
+	for _, test := range tests {
+		got, ok := ptArchiverProgress(test.line)
+		if got != test.want || ok != test.ok {
+			t.Fatalf("ptArchiverProgress(%q) = (%d,%v), want (%d,%v)", test.line, got, ok, test.want, test.ok)
+		}
+	}
+}

@@ -2,10 +2,13 @@ package app
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -13,24 +16,33 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	mysqlDriver "github.com/go-sql-driver/mysql"
 	"gmha/internal/buildinfo"
 )
 
 // ManagerRuntimeConfig 是 Manager 运行时配置参数，包含 HTTP/gRPC 监听地址、
 // 数据库路径、SSH 公钥路径、Agent 二进制路径和 Manager 地址等。
 type ManagerRuntimeConfig struct {
-	ListenHTTP       string `json:"listen_http"`
-	ListenGRPC       string `json:"listen_grpc"`
-	DBPath           string `json:"db_path"`
-	DatabaseDriver   string `json:"database_driver"`
-	DatabaseDSN      string `json:"database_dsn"`
-	ManagerPublicKey string `json:"manager_public_key"`
-	AgentBinaryPath  string `json:"agent_binary_path"`
-	ManagerHTTPAddr  string `json:"manager_http_addr"`
-	ManagerGRPCAddr  string `json:"manager_grpc_addr"`
+	ListenHTTP          string `json:"listen_http"`
+	ListenGRPC          string `json:"listen_grpc"`
+	DBPath              string `json:"db_path"`
+	DatabaseDriver      string `json:"database_driver"`
+	DatabaseDSN         string `json:"database_dsn,omitempty"`
+	DatabaseHost        string `json:"database_host,omitempty"`
+	DatabasePort        int    `json:"database_port,omitempty"`
+	DatabaseName        string `json:"database_name,omitempty"`
+	DatabaseUsername    string `json:"database_username,omitempty"`
+	DatabasePassword    string `json:"database_password,omitempty"`
+	DatabaseSSLMode     string `json:"database_ssl_mode,omitempty"`
+	DatabasePasswordSet bool   `json:"database_password_set,omitempty"`
+	ManagerPublicKey    string `json:"manager_public_key"`
+	AgentBinaryPath     string `json:"agent_binary_path"`
+	ManagerHTTPAddr     string `json:"manager_http_addr"`
+	ManagerGRPCAddr     string `json:"manager_grpc_addr"`
 }
 
 // ManagerRuntimeStatus 是 Manager 运行时状态视图，包含是否运行中、PID、启动时间等。
@@ -58,6 +70,22 @@ type ManagerRuntimeService struct {
 	statePath     string
 	defaultConfig ManagerRuntimeConfig
 	healthClient  *http.Client
+	testMu        sync.Mutex
+	databaseTests map[string]databaseTestGrant
+	platformInUse func(context.Context) (bool, error)
+}
+
+type databaseTestGrant struct {
+	Fingerprint string
+	ExpiresAt   time.Time
+}
+
+type DatabaseTestResult struct {
+	OK        bool   `json:"ok"`
+	Message   string `json:"message"`
+	TestToken string `json:"test_token"`
+	Driver    string `json:"driver"`
+	Address   string `json:"address"`
 }
 
 // NewManagerRuntimeService 创建 Manager 运行时服务实例，状态文件保存在 ~/.gmha/ 目录下。
@@ -65,8 +93,9 @@ func NewManagerRuntimeService(cfg Config) *ManagerRuntimeService {
 	home, _ := os.UserHomeDir()
 	base := filepath.Join(home, ".gmha")
 	return &ManagerRuntimeService{
-		statePath:    filepath.Join(base, "manager-runtime.json"),
-		healthClient: &http.Client{Timeout: 1200 * time.Millisecond},
+		statePath:     filepath.Join(base, "manager-runtime.json"),
+		healthClient:  &http.Client{Timeout: 1200 * time.Millisecond},
+		databaseTests: make(map[string]databaseTestGrant),
 		defaultConfig: normalizeManagerRuntimeConfig(ManagerRuntimeConfig{
 			ListenHTTP:       ":8080",
 			ListenGRPC:       ":9100",
@@ -79,6 +108,10 @@ func NewManagerRuntimeService(cfg Config) *ManagerRuntimeService {
 			ManagerGRPCAddr:  cfg.ManagerGRPCAddr,
 		}),
 	}
+}
+
+func (s *ManagerRuntimeService) SetPlatformUsageChecker(checker func(context.Context) (bool, error)) {
+	s.platformInUse = checker
 }
 
 // GetStatus 获取 Manager 的当前运行状态。
@@ -169,17 +202,33 @@ func (s *ManagerRuntimeService) AdoptCurrentProcess() (ManagerRuntimeStatus, err
 }
 
 // TestDatabase 验证所选数据库驱动和连接串，不执行迁移或切换。
-func (s *ManagerRuntimeService) TestDatabase(ctx context.Context, cfg ManagerRuntimeConfig) error {
+func (s *ManagerRuntimeService) TestDatabase(ctx context.Context, cfg ManagerRuntimeConfig) (DatabaseTestResult, error) {
+	current, _, _ := s.loadOrDefault(ManagerRuntimeConfig{})
+	cfg = mergeManagerDatabaseSecrets(cfg, current.Config)
 	cfg = normalizeManagerRuntimeConfig(cfg)
 	if err := validateManagerDatabaseConfig(cfg); err != nil {
-		return err
+		return DatabaseTestResult{}, err
 	}
 	db, _, err := openDatabase(Config{DBPath: cfg.DBPath, DatabaseDriver: cfg.DatabaseDriver, DatabaseDSN: cfg.DatabaseDSN})
 	if err != nil {
-		return fmt.Errorf("数据库连接失败: %w", err)
+		return DatabaseTestResult{}, fmt.Errorf("数据库连接失败: %w", err)
 	}
 	defer db.Close()
-	return db.PingContext(ctx)
+	if err := db.PingContext(ctx); err != nil {
+		return DatabaseTestResult{}, err
+	}
+	tokenBytes := make([]byte, 24)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return DatabaseTestResult{}, err
+	}
+	token := fmt.Sprintf("%x", tokenBytes)
+	s.testMu.Lock()
+	if s.databaseTests == nil {
+		s.databaseTests = make(map[string]databaseTestGrant)
+	}
+	s.databaseTests[token] = databaseTestGrant{Fingerprint: managerDatabaseFingerprint(cfg), ExpiresAt: time.Now().Add(10 * time.Minute)}
+	s.testMu.Unlock()
+	return DatabaseTestResult{OK: true, Message: "数据库连接成功，可以保存配置", TestToken: token, Driver: cfg.DatabaseDriver, Address: managerDatabaseAddress(cfg)}, nil
 }
 
 func (s *ManagerRuntimeService) managerHealthy(ctx context.Context, cfg ManagerRuntimeConfig) bool {
@@ -235,9 +284,32 @@ func managerHealthURL(raw string) (string, error) {
 
 // SaveConfig 保存 Manager 启动配置到磁盘（不重启进程）。
 func (s *ManagerRuntimeService) SaveConfig(ctx context.Context, cfg ManagerRuntimeConfig) error {
+	return s.SaveConfigVerified(ctx, cfg, "")
+}
+
+func (s *ManagerRuntimeService) SaveConfigVerified(ctx context.Context, cfg ManagerRuntimeConfig, testToken string) error {
+	current, _, err := s.loadOrDefault(ManagerRuntimeConfig{})
+	if err != nil {
+		return err
+	}
+	cfg = mergeManagerDatabaseSecrets(cfg, current.Config)
 	cfg = normalizeManagerRuntimeConfig(cfg)
 	if err := validateManagerRuntimeConfig(cfg); err != nil {
 		return err
+	}
+	if managerDatabaseChanged(current.Config, cfg) {
+		if err := s.consumeDatabaseTestGrant(testToken, cfg); err != nil {
+			return err
+		}
+		if s.platformInUse != nil {
+			inUse, checkErr := s.platformInUse(ctx)
+			if checkErr != nil {
+				return fmt.Errorf("检查平台使用状态失败: %w", checkErr)
+			}
+			if inUse {
+				return errors.New("平台已产生业务数据，不能直接切换元数据库；请先执行数据迁移或在全新安装阶段完成配置")
+			}
+		}
 	}
 	state, _, err := s.loadOrDefault(cfg)
 	if err != nil {
@@ -474,7 +546,7 @@ func (s *ManagerRuntimeService) persistState(state managerRuntimeState) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.statePath, data, 0o644)
+	return os.WriteFile(s.statePath, data, 0o600)
 }
 
 func normalizeManagerRuntimeConfig(cfg ManagerRuntimeConfig) ManagerRuntimeConfig {
@@ -498,6 +570,11 @@ func normalizeManagerRuntimeConfig(cfg ManagerRuntimeConfig) ManagerRuntimeConfi
 	if cfg.DatabaseDriver == "postgresql" {
 		cfg.DatabaseDriver = "postgres"
 	}
+	cfg = hydrateManagerDatabaseFields(cfg)
+	if dsn, err := buildManagerDatabaseDSN(cfg); err == nil && dsn != "" {
+		cfg.DatabaseDSN = dsn
+	}
+	cfg.DatabasePasswordSet = strings.TrimSpace(cfg.DatabasePassword) != ""
 	if strings.TrimSpace(cfg.AgentBinaryPath) == "" {
 		cfg.AgentBinaryPath = "./bin/agentd"
 	}
@@ -523,6 +600,15 @@ func sanitizeManagerRuntimeConfig(cfg ManagerRuntimeConfig) ManagerRuntimeConfig
 	}
 	if looksLikePromptGarbage(cfg.DatabaseDSN) {
 		cfg.DatabaseDSN = ""
+	}
+	if looksLikePromptGarbage(cfg.DatabaseHost) {
+		cfg.DatabaseHost = ""
+	}
+	if looksLikePromptGarbage(cfg.DatabaseName) {
+		cfg.DatabaseName = ""
+	}
+	if looksLikePromptGarbage(cfg.DatabaseUsername) {
+		cfg.DatabaseUsername = ""
 	}
 	if looksLikePromptGarbage(cfg.ManagerPublicKey) {
 		cfg.ManagerPublicKey = ""
@@ -596,13 +682,170 @@ func validateManagerDatabaseConfig(cfg ManagerRuntimeConfig) error {
 			return errors.New("SQLite 数据库路径不能为空")
 		}
 	case "mysql", "postgres", "postgresql":
+		if strings.TrimSpace(cfg.DatabaseHost) == "" {
+			return errors.New("数据库地址不能为空")
+		}
+		if cfg.DatabasePort < 1 || cfg.DatabasePort > 65535 {
+			return errors.New("数据库端口必须在 1 到 65535 之间")
+		}
+		if strings.TrimSpace(cfg.DatabaseName) == "" {
+			return errors.New("数据库名称不能为空")
+		}
+		if strings.TrimSpace(cfg.DatabaseUsername) == "" {
+			return errors.New("数据库账号不能为空")
+		}
+		if strings.TrimSpace(cfg.DatabasePassword) == "" {
+			return errors.New("数据库密码不能为空")
+		}
 		if strings.TrimSpace(cfg.DatabaseDSN) == "" {
-			return fmt.Errorf("%s 数据库连接串不能为空", cfg.DatabaseDriver)
+			return fmt.Errorf("%s 数据库配置无法生成连接参数", cfg.DatabaseDriver)
 		}
 	default:
 		return fmt.Errorf("不支持的数据库驱动 %q，可选 sqlite、mysql、postgres", cfg.DatabaseDriver)
 	}
 	return nil
+}
+
+func hydrateManagerDatabaseFields(cfg ManagerRuntimeConfig) ManagerRuntimeConfig {
+	dsn := strings.TrimSpace(cfg.DatabaseDSN)
+	switch cfg.DatabaseDriver {
+	case "mysql":
+		if parsed, err := mysqlDriver.ParseDSN(dsn); err == nil {
+			if cfg.DatabaseUsername == "" {
+				cfg.DatabaseUsername = parsed.User
+			}
+			if cfg.DatabasePassword == "" {
+				cfg.DatabasePassword = parsed.Passwd
+			}
+			if cfg.DatabaseName == "" {
+				cfg.DatabaseName = parsed.DBName
+			}
+			if host, port, err := net.SplitHostPort(parsed.Addr); err == nil {
+				if cfg.DatabaseHost == "" {
+					cfg.DatabaseHost = host
+				}
+				if cfg.DatabasePort == 0 {
+					cfg.DatabasePort, _ = strconv.Atoi(port)
+				}
+			}
+		}
+		if cfg.DatabasePort == 0 {
+			cfg.DatabasePort = 3306
+		}
+	case "postgres":
+		if parsed, err := url.Parse(dsn); err == nil && parsed.Host != "" {
+			if cfg.DatabaseHost == "" {
+				cfg.DatabaseHost = parsed.Hostname()
+			}
+			if cfg.DatabasePort == 0 {
+				cfg.DatabasePort, _ = strconv.Atoi(parsed.Port())
+			}
+			if cfg.DatabaseName == "" {
+				cfg.DatabaseName = strings.TrimPrefix(parsed.Path, "/")
+			}
+			if parsed.User != nil {
+				if cfg.DatabaseUsername == "" {
+					cfg.DatabaseUsername = parsed.User.Username()
+				}
+				if cfg.DatabasePassword == "" {
+					cfg.DatabasePassword, _ = parsed.User.Password()
+				}
+			}
+			if cfg.DatabaseSSLMode == "" {
+				cfg.DatabaseSSLMode = parsed.Query().Get("sslmode")
+			}
+		}
+		if cfg.DatabasePort == 0 {
+			cfg.DatabasePort = 5432
+		}
+		if cfg.DatabaseSSLMode == "" {
+			cfg.DatabaseSSLMode = "disable"
+		}
+	}
+	return cfg
+}
+
+func buildManagerDatabaseDSN(cfg ManagerRuntimeConfig) (string, error) {
+	switch cfg.DatabaseDriver {
+	case "sqlite", "sqlite3":
+		return strings.TrimSpace(cfg.DBPath), nil
+	case "mysql":
+		if cfg.DatabaseHost == "" || cfg.DatabasePort == 0 || cfg.DatabaseName == "" || cfg.DatabaseUsername == "" || cfg.DatabasePassword == "" {
+			return strings.TrimSpace(cfg.DatabaseDSN), nil
+		}
+		mysqlCfg := mysqlDriver.Config{
+			User: cfg.DatabaseUsername, Passwd: cfg.DatabasePassword, Net: "tcp",
+			Addr:   net.JoinHostPort(cfg.DatabaseHost, strconv.Itoa(cfg.DatabasePort)),
+			DBName: cfg.DatabaseName, ParseTime: true, Loc: time.Local,
+		}
+		return mysqlCfg.FormatDSN(), nil
+	case "postgres":
+		if cfg.DatabaseHost == "" || cfg.DatabasePort == 0 || cfg.DatabaseName == "" || cfg.DatabaseUsername == "" || cfg.DatabasePassword == "" {
+			return strings.TrimSpace(cfg.DatabaseDSN), nil
+		}
+		query := url.Values{}
+		query.Set("sslmode", firstNonEmpty(cfg.DatabaseSSLMode, "disable"))
+		u := url.URL{
+			Scheme: "postgres", Host: net.JoinHostPort(cfg.DatabaseHost, strconv.Itoa(cfg.DatabasePort)),
+			Path:     "/" + strings.TrimPrefix(cfg.DatabaseName, "/"),
+			User:     url.UserPassword(cfg.DatabaseUsername, cfg.DatabasePassword),
+			RawQuery: query.Encode(),
+		}
+		return u.String(), nil
+	default:
+		return "", fmt.Errorf("不支持的数据库驱动 %q", cfg.DatabaseDriver)
+	}
+}
+
+func mergeManagerDatabaseSecrets(next, current ManagerRuntimeConfig) ManagerRuntimeConfig {
+	if strings.EqualFold(strings.TrimSpace(next.DatabaseDriver), strings.TrimSpace(current.DatabaseDriver)) {
+		if next.DatabasePassword == "" {
+			next.DatabasePassword = current.DatabasePassword
+		}
+		if next.DatabaseDSN == "" && next.DatabaseHost == "" {
+			next.DatabaseDSN = current.DatabaseDSN
+		}
+	}
+	return next
+}
+
+func managerDatabaseFingerprint(cfg ManagerRuntimeConfig) string {
+	normalized := normalizeManagerRuntimeConfig(cfg)
+	sum := sha256.Sum256([]byte(normalized.DatabaseDriver + "\x00" + firstNonEmpty(normalized.DatabaseDSN, normalized.DBPath)))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func managerDatabaseAddress(cfg ManagerRuntimeConfig) string {
+	if cfg.DatabaseDriver == "sqlite" {
+		return cfg.DBPath
+	}
+	return net.JoinHostPort(cfg.DatabaseHost, strconv.Itoa(cfg.DatabasePort)) + "/" + cfg.DatabaseName
+}
+
+func managerDatabaseChanged(current, next ManagerRuntimeConfig) bool {
+	return managerDatabaseFingerprint(current) != managerDatabaseFingerprint(next)
+}
+
+func (s *ManagerRuntimeService) consumeDatabaseTestGrant(token string, cfg ManagerRuntimeConfig) error {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return errors.New("数据库配置已变更，请先点击“检测连接”并在检测成功后保存")
+	}
+	s.testMu.Lock()
+	defer s.testMu.Unlock()
+	grant, ok := s.databaseTests[token]
+	delete(s.databaseTests, token)
+	if !ok || time.Now().After(grant.ExpiresAt) || grant.Fingerprint != managerDatabaseFingerprint(cfg) {
+		return errors.New("数据库检测结果已失效，请重新检测连接")
+	}
+	return nil
+}
+
+func (cfg ManagerRuntimeConfig) Redacted() ManagerRuntimeConfig {
+	cfg.DatabaseDSN = ""
+	cfg.DatabasePasswordSet = strings.TrimSpace(cfg.DatabasePassword) != ""
+	cfg.DatabasePassword = ""
+	return cfg
 }
 
 func processRunning(pid int) bool {
@@ -633,7 +876,7 @@ func (s *ManagerRuntimeService) DescribeStatus(ctx context.Context) (map[string]
 		"gRPC监听":   status.Config.ListenGRPC,
 		"HTTP地址":   status.Config.ManagerHTTPAddr,
 		"gRPC地址":   status.Config.ManagerGRPCAddr,
-		"数据库":      status.Config.DatabaseDriver + ": " + firstNonEmpty(status.Config.DatabaseDSN, status.Config.DBPath),
+		"数据库":      status.Config.DatabaseDriver + ": " + managerDatabaseAddress(status.Config),
 		"Agent二进制": status.Config.AgentBinaryPath,
 		"日志文件":     emptyStringAsDash(status.LogPath),
 	}, nil

@@ -1,0 +1,84 @@
+.flamegraph-panel { padding: 16px 0 28px; }
+.flamegraph-toolbar { display:flex; align-items:center; justify-content:space-between; gap:20px; padding:20px; border:1px solid #dce5ef; border-radius:10px 10px 0 0; background:#fff; }
+.flamegraph-toolbar b { display:block; color:#263d56; font-size:18px; }
+.flamegraph-toolbar span { display:block; margin-top:5px; color:#7a8ca1; font-size:12px; }
+.flamegraph-actions { display:flex; gap:8px; }
+.flamegraph-sections { display:flex; gap:24px; padding:0 20px; border:1px solid #dce5ef; border-top:0; background:#fff; }
+.flamegraph-sections button { height:50px; border:0; border-bottom:2px solid transparent; background:transparent; color:#61758d; font:inherit; font-size:13px; cursor:pointer; }
+.flamegraph-sections button.active { border-bottom-color:#ef6138; color:#263d56; font-weight:700; }
+.flamegraph-sections em { margin-left:5px; padding:2px 6px; border-radius:9px; background:#eef2f7; font-size:10px; font-style:normal; }
+.flamegraph-message { display:flex; align-items:center; gap:10px; margin-top:12px; padding:10px 14px; border:1px solid #cfe2d7; border-radius:7px; background:#f2fbf5; color:#2d7c50; font-size:12px; }
+.flamegraph-message.error { border-color:#f0c7ca; background:#fff5f6; color:#b7434b; }
+.flamegraph-message span { flex:1; }
+.flamegraph-message button { border:0; background:transparent; color:inherit; cursor:pointer; }
+.flamegraph-layout { display:grid; grid-template-columns:300px minmax(0,1fr); min-height:580px; margin-top:14px; overflow:hidden; border:1px solid #dce5ef; border-radius:10px; background:#fff; }
+.flamegraph-history { overflow-y:auto; max-height:720px; padding:10px; border-right:1px solid #e3e9f0; background:#f7f9fc; }
+.flamegraph-history article { position:relative; margin-bottom:8px; padding:13px 30px 13px 13px; border:1px solid #dfe6ee; border-radius:7px; background:#fff; cursor:pointer; }
+.flamegraph-history article:hover,.flamegraph-history article.active { border-color:#f09a7e; box-shadow:0 0 0 2px #fff0eb; }
+.flamegraph-history article header { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+.flamegraph-history article header b { overflow:hidden; color:#314960; font-size:12px; text-overflow:ellipsis; white-space:nowrap; }
+.flamegraph-history article em { padding:3px 7px; border-radius:9px; background:#edf2f7; color:#667b92; font-size:9px; font-style:normal; white-space:nowrap; }
+.flamegraph-history article em.success { background:#e4f7ec; color:#188053; }
+.flamegraph-history article em.failed { background:#ffe8ea; color:#bd3f49; }
+.flamegraph-history article em.running,.flamegraph-history article em.sent { background:#fff0df; color:#b66a26; }
+.flamegraph-history article p { margin:7px 0 3px; color:#64788f; font-size:10px; }
+.flamegraph-history article small { color:#929faf; font-size:9px; }
+.flamegraph-history article > button { position:absolute; top:38px; right:8px; width:20px; height:20px; border:0; border-radius:50%; background:transparent; color:#a8b1bd; cursor:pointer; }
+.flamegraph-history article > button:hover { background:#feecee; color:#c54b54; }
+.flamegraph-viewer { min-width:0; }
+.flamegraph-viewer-head { display:flex; min-height:98px; align-items:center; justify-content:space-between; gap:16px; padding:17px 20px; border-bottom:1px solid #e8edf3; }
+.flamegraph-viewer-head p { margin:0 0 3px; color:#df5a34; font-size:10px; font-weight:800; letter-spacing:.5px; }
+.flamegraph-viewer-head h4 { margin:0; color:#263d56; font-size:18px; }
+.flamegraph-viewer-head span { display:block; margin-top:5px; color:#8190a2; font-size:10px; }
+.flamegraph-viewer-head > div:last-child { display:flex; gap:7px; }
+.flamegraph-canvas-wrap { padding:14px; }
+.flamegraph-search { display:flex; align-items:end; justify-content:space-between; gap:16px; margin-bottom:10px; }
+.flamegraph-search label { color:#5d7188; font-size:10px; }
+.flamegraph-search input { display:block; width:240px; height:34px; margin-top:4px; padding:0 10px; border:1px solid #d8e1ea; border-radius:5px; font:inherit; font-size:11px; }
+.flamegraph-search span { color:#8997a8; font-size:10px; }
+.flamegraph-zoom-path { margin-bottom:8px; padding:7px 10px; border-radius:5px; background:#fff4ed; color:#a95334; font-size:10px; }
+.flamegraph-scroll { overflow-x:auto; padding:8px; border:1px solid #e1e7ee; border-radius:7px; background:#fffaf8; }
+.flamegraph-scroll svg { display:block; width:100%; }
+.flamegraph-scroll rect { stroke:#fff6f1; stroke-width:.8; cursor:pointer; transition:filter .12s; }
+.flamegraph-scroll rect:hover { filter:brightness(.9); stroke:#8b3520; }
+.flamegraph-scroll rect.matched { stroke:#24384e; stroke-width:3; filter:saturate(1.5); }
+.flamegraph-scroll text { overflow:hidden; fill:#3c261f; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:10px; pointer-events:auto; cursor:pointer; }
+.flamegraph-waiting,.flamegraph-empty { display:flex; min-height:230px; align-items:center; justify-content:center; flex-direction:column; color:#8494a7; text-align:center; }
+.flamegraph-waiting { min-height:430px; }
+.flamegraph-waiting > span,.flamegraph-empty > span { color:#e27451; font-size:34px; }
+.flamegraph-waiting.running > span,.flamegraph-waiting.sent > span { animation:flamegraph-spin 1.2s linear infinite; }
+.flamegraph-waiting.failed > span { color:#cb4650; }
+.flamegraph-waiting b,.flamegraph-empty b { margin-top:8px; color:#4b6077; font-size:13px; }
+.flamegraph-waiting p,.flamegraph-empty small { max-width:520px; margin:5px 0 0; color:#8b99aa; font-size:10px; line-height:17px; }
+.flamegraph-empty.large { min-height:420px; }
+@keyframes flamegraph-spin { to { transform:rotate(360deg); } }
+.flamegraph-schedule-list { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin-top:14px; }
+.flamegraph-schedule-list > article { border:1px solid #dce5ef; border-radius:9px; background:#fff; }
+.flamegraph-schedule-list > article > header { display:flex; align-items:center; justify-content:space-between; padding:14px 16px; border-bottom:1px solid #e9eef4; }
+.flamegraph-schedule-list header b { color:#314860; font-size:13px; }
+.flamegraph-schedule-list header span { margin-left:8px; padding:3px 7px; border-radius:9px; background:#e5f7ec; color:#1b8255; font-size:9px; }
+.flamegraph-schedule-list header span.disabled { background:#edf1f5; color:#7c8999; }
+.flamegraph-schedule-list header em { color:#de633e; font-size:11px; font-style:normal; }
+.flamegraph-schedule-list dl { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin:0; padding:15px 16px; }
+.flamegraph-schedule-list dt { color:#8998aa; font-size:9px; }
+.flamegraph-schedule-list dd { margin:4px 0 0; color:#405870; font-size:11px; }
+.flamegraph-schedule-list footer { display:flex; align-items:center; justify-content:space-between; padding:10px 16px; border-top:1px solid #edf1f5; }
+.flamegraph-schedule-list footer small { color:#8d9aab; font-size:9px; }
+.flamegraph-schedule-list footer button { border:0; background:transparent; color:#2774ce; font:inherit; font-size:10px; cursor:pointer; }
+.flamegraph-schedule-list footer .danger-link { color:#c74d55; }
+.flamegraph-modal-mask { z-index:50; }
+.flamegraph-modal { width:min(640px,calc(100vw - 32px)); }
+.flamegraph-modal.wide { width:min(780px,calc(100vw - 32px)); }
+.flamegraph-form-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:13px; }
+.flamegraph-form-grid label { color:#52677f; font-size:11px; }
+.flamegraph-form-grid input,.flamegraph-form-grid select { width:100%; height:38px; margin-top:6px; padding:0 10px; border:1px solid #d8e1ed; border-radius:5px; background:#fff; color:#304760; font:inherit; font-size:11px; }
+@media (max-width:1000px) {
+  .flamegraph-layout { grid-template-columns:1fr; }
+  .flamegraph-history { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); max-height:none; border-right:0; border-bottom:1px solid #e3e9f0; }
+  .flamegraph-schedule-list { grid-template-columns:1fr; }
+}
+@media (max-width:680px) {
+  .flamegraph-toolbar,.flamegraph-viewer-head,.flamegraph-search { align-items:flex-start; flex-direction:column; }
+  .flamegraph-actions { flex-wrap:wrap; }
+  .flamegraph-history,.flamegraph-form-grid { grid-template-columns:1fr; }
+}

@@ -77,15 +77,19 @@ func TestDashboardMetricSnapshotFiltersAndThrottles(t *testing.T) {
 	service := &HeartbeatService{metricSnapshotAt: make(map[string]time.Time)}
 	now := time.Now().UTC()
 	items := service.dashboardMetricSnapshot("agent-1", []dynamicdomain.MetricResult{
-		{Name: "cpu_usage_percent", Value: 20}, {Name: "mysql_qps", Value: 100}, {Name: "mysql_threads_connected", Value: 8},
+		{Name: "cpu_usage_percent", Value: 20},
+		{Name: "mysql_qps", Value: 100},
+		{Name: "mysql_data_disk_usage", Value: map[string]any{"path": "/srv/mysql/data", "used_percent": 72}},
+		{Name: "filesystem_usage", Value: []any{map[string]any{"mount": "/", "used_percent": 99}}},
+		{Name: "mysql_threads_connected", Value: 8},
 	}, now)
-	if len(items) != 2 || items[0].Name != "cpu_usage_percent" || items[1].Name != "mysql_qps" {
+	if len(items) != 4 || items[0].Name != "cpu_usage_percent" || items[1].Name != "mysql_qps" || items[2].Name != "mysql_data_disk_usage" || items[3].Name != "mysql_threads_connected" {
 		t.Fatalf("unexpected overview snapshot: %+v", items)
 	}
 	if second := service.dashboardMetricSnapshot("agent-1", items, now.Add(10*time.Second)); len(second) != 0 {
 		t.Fatalf("snapshot must be throttled, got %+v", second)
 	}
-	if third := service.dashboardMetricSnapshot("agent-1", items, now.Add(15*time.Second)); len(third) != 2 {
+	if third := service.dashboardMetricSnapshot("agent-1", items, now.Add(15*time.Second)); len(third) != 4 {
 		t.Fatalf("snapshot should resume after 15 seconds, got %+v", third)
 	}
 }

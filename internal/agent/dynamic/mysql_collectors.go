@@ -243,6 +243,10 @@ func diskUsageValue(base map[string]any, path string) (map[string]any, bool) {
 		base["error"] = "disk total is zero"
 		return base, false
 	}
+	used := total - free
+	base["total_bytes"] = total
+	base["used_bytes"] = used
+	base["available_bytes"] = free
 	base["used_percent"] = round2(100 * float64(total-free) / float64(total))
 	return base, true
 }

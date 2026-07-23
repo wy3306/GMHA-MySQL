@@ -92,6 +92,13 @@ func (u *CreateMySQLTopologyTaskUsecase) Execute(ctx context.Context, req Create
 	if err != nil {
 		return CreateMySQLTopologyTaskResult{}, err
 	}
+	if req.UseClone {
+		for _, item := range resolved {
+			if !mysqlapp.SupportsCloneForVersion(item.spec.Version) {
+				return CreateMySQLTopologyTaskResult{}, fmt.Errorf("MySQL Clone is unavailable on MySQL %s node %s; Clone requires MySQL 8.0.17 or newer, so disable use_clone and initialize the replica from a physical backup", item.spec.Version, item.machine.Name)
+			}
+		}
+	}
 	ensureUniqueTopologyServerIDs(resolved)
 	if err := assignTopologySources(req.Topology, req.Port, req.PrimaryMachine, resolved); err != nil {
 		return CreateMySQLTopologyTaskResult{}, err
@@ -248,6 +255,10 @@ func (u *CreateMySQLTopologyTaskUsecase) resolveTopologyNodes(ctx context.Contex
 		if serverID <= 0 {
 			serverID = i + 1
 		}
+		version := strings.TrimSpace(instance.Version)
+		if version == "" {
+			version, _ = mysqlapp.PackageVersion(instance.PackageName)
+		}
 		out = append(out, resolvedTopologyNode{
 			machine:         machine,
 			agent:           agent,
@@ -257,6 +268,7 @@ func (u *CreateMySQLTopologyTaskUsecase) resolveTopologyNodes(ctx context.Contex
 				MachineName:              machine.Name,
 				IP:                       machine.IP,
 				Port:                     instance.Port,
+				Version:                  version,
 				Role:                     role,
 				ServerID:                 serverID,
 				ReplicationDelaySeconds:  max(node.DelaySeconds, 0),

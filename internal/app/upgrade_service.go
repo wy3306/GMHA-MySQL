@@ -247,6 +247,100 @@ func (s *UpgradeService) StartManagerUpgrade(packageName string) (UpgradeJob, er
 	return job, nil
 }
 
+// StartManagerRebuild recompiles the Manager kernel from a local source tree,
+// validates the candidate, atomically installs it and then uses the same
+// restart/health-check path as a package upgrade.
+func (s *UpgradeService) StartManagerRebuild(sourceDir string) (UpgradeJob, error) {
+	sourceDir = strings.TrimSpace(sourceDir)
+	if sourceDir == "" {
+		sourceDir = "."
+	}
+	absolute, err := filepath.Abs(sourceDir)
+	if err != nil {
+		return UpgradeJob{}, err
+	}
+	if info, err := os.Stat(filepath.Join(absolute, "go.mod")); err != nil || info.IsDir() {
+		return UpgradeJob{}, errors.New("源码目录中找不到 go.mod")
+	}
+	s.mu.RLock()
+	for _, existing := range s.jobs {
+		if (existing.Component == "manager" || existing.Component == "manager-build") && (existing.Status == "pending" || existing.Status == "running") {
+			s.mu.RUnlock()
+			return UpgradeJob{}, errors.New("已有 Manager 升级或重编译任务正在执行")
+		}
+	}
+	s.mu.RUnlock()
+	pkg := PackageItem{Name: "本地源码重编译", Version: buildinfo.CurrentVersion(), Arch: runtime.GOARCH}
+	job := s.newJob("manager-build", []string{"local"}, pkg, buildinfo.CurrentVersion(), []string{"源码与工具链预检", "编译 Manager 内核", "候选程序自检", "备份并原子安装", "重启与健康后检"})
+	go s.runManagerRebuild(job.ID, absolute)
+	return job, nil
+}
+
+func (s *UpgradeService) runManagerRebuild(id, sourceDir string) {
+	s.step(id, 0, "running", "检查 Go 工具链、源码模块和当前程序写权限")
+	goPath, err := exec.LookPath("go")
+	if err != nil {
+		s.fail(id, 0, errors.New("未找到 Go 工具链，无法重编译 Manager"))
+		return
+	}
+	exePath, err := os.Executable()
+	if err != nil {
+		s.fail(id, 0, err)
+		return
+	}
+	info, err := os.Stat(exePath)
+	if err != nil {
+		s.fail(id, 0, err)
+		return
+	}
+	s.step(id, 0, "success", fmt.Sprintf("源码 %s；工具链 %s", sourceDir, goPath))
+
+	candidate := exePath + ".rebuild.candidate"
+	_ = os.Remove(candidate)
+	s.step(id, 1, "running", "执行 go build -trimpath ./cmd/gmha")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	defer cancel()
+	command := exec.CommandContext(ctx, goPath, "build", "-trimpath", "-o", candidate, "./cmd/gmha")
+	command.Dir = sourceDir
+	output, err := command.CombinedOutput()
+	if err != nil {
+		s.fail(id, 1, fmt.Errorf("Manager 编译失败: %s", strings.TrimSpace(string(output))))
+		return
+	}
+	defer os.Remove(candidate)
+	if err := os.Chmod(candidate, info.Mode().Perm()|0o111); err != nil {
+		s.fail(id, 1, err)
+		return
+	}
+	s.step(id, 1, "success", "Manager 内核编译完成")
+
+	s.step(id, 2, "running", "执行候选程序 --version 并检查可执行性")
+	versionOutput, err := exec.Command(candidate, "--version").CombinedOutput()
+	if err != nil || strings.TrimSpace(string(versionOutput)) == "" {
+		s.fail(id, 2, fmt.Errorf("候选程序自检失败: %s", strings.TrimSpace(string(versionOutput))))
+		return
+	}
+	s.step(id, 2, "success", "候选程序自检通过，版本 "+strings.TrimSpace(string(versionOutput)))
+
+	backup := exePath + ".backup-rebuild-" + time.Now().UTC().Format("20060102T150405")
+	s.step(id, 3, "running", "备份当前程序并原子安装重编译内核")
+	if err := copyExecutable(exePath, backup, info.Mode()); err != nil {
+		s.fail(id, 3, err)
+		return
+	}
+	if err := os.Rename(candidate, exePath); err != nil {
+		s.fail(id, 3, err)
+		return
+	}
+	s.step(id, 3, "success", "新内核已安装；回退文件 "+backup)
+
+	s.step(id, 4, "running", "重启 Manager 并等待健康检查")
+	if _, err := s.runtime.RestartCurrentProcess(jobRuntimeConfig(s.runtime)); err != nil {
+		_ = copyExecutable(backup, exePath, info.Mode())
+		s.fail(id, 4, fmt.Errorf("重启失败，已恢复旧程序: %w", err))
+	}
+}
+
 func (s *UpgradeService) resolvePackage(category, name string) (PackageItem, string, error) {
 	if name == "" {
 		return PackageItem{}, "", errors.New("package_name is required")
@@ -556,7 +650,7 @@ func (s *UpgradeService) reconcileManagerRestart() {
 	s.mu.RLock()
 	ids := make([]string, 0)
 	for id, job := range s.jobs {
-		if job.Component == "manager" && job.Status == "running" && len(job.Steps) > 4 && job.Steps[4].Status == "running" && strings.EqualFold(job.TargetVersion, buildinfo.CurrentVersion()) {
+		if (job.Component == "manager" || job.Component == "manager-build") && job.Status == "running" && len(job.Steps) > 4 && job.Steps[4].Status == "running" && strings.EqualFold(job.TargetVersion, buildinfo.CurrentVersion()) {
 			ids = append(ids, id)
 		}
 	}

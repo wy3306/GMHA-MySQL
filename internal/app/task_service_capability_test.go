@@ -18,6 +18,9 @@ func TestMachineCapabilityRejectsLegacyAgent(t *testing.T) {
 	if ok, reason := service.MachineCapability("db-1", taskdomain.CapabilityMySQLDefaultsFile); ok || reason == "" {
 		t.Fatalf("legacy Agent must be rejected with a reason, got ok=%v reason=%q", ok, reason)
 	}
+	if ok, reason := service.MachineAgentReady("db-1"); !ok || reason != "" {
+		t.Fatalf("connected legacy Agent should remain available for non-MySQL-specific actions, got ok=%v reason=%q", ok, reason)
+	}
 }
 
 func TestMachineCapabilityAcceptsSecureCredentialAgent(t *testing.T) {

@@ -24,9 +24,13 @@ innodb_log_group_home_dir = {{ .RedoDir }}
 innodb_undo_directory = {{ .UndoDir }}
 binlog_format = {{ .BinlogFormat }}
 sync_binlog = {{ .SyncBinlog }}
-binlog_expire_logs_seconds = {{ .BinlogExpireSeconds }}
+{{ if .Legacy57 }}expire_logs_days = {{ .BinlogExpireDays }}
+{{ else }}binlog_expire_logs_seconds = {{ .BinlogExpireSeconds }}
+{{ end }}
 binlog_rows_query_log_events = {{ .BinlogRowsQueryEvents }}
-log_replica_updates = {{ .LogReplicaUpdates }}
+{{ if .LegacyReplicationNames }}log_slave_updates = {{ .LogReplicaUpdates }}
+{{ else }}log_replica_updates = {{ .LogReplicaUpdates }}
+{{ end }}
 gtid_mode = {{ .GTIDMode }}
 enforce_gtid_consistency = {{ .EnforceGTIDConsistency }}
 relay_log_recovery = {{ .RelayLogRecovery }}
@@ -49,7 +53,9 @@ slow_query_log_file = {{ .SlowQueryLogFile }}
 long_query_time = {{ .LongQueryTime }}
 min_examined_row_limit = {{ .MinExaminedRowLimit }}
 log_slow_admin_statements = {{ .LogSlowAdminStatements }}
-log_slow_replica_statements = {{ .LogSlowReplicaStmts }}
+{{ if .LegacyReplicationNames }}log_slow_slave_statements = {{ .LogSlowReplicaStmts }}
+{{ else }}log_slow_replica_statements = {{ .LogSlowReplicaStmts }}
+{{ end }}
 log_throttle_queries_not_using_indexes = {{ .LogThrottleNoIndex }}
 
 default_storage_engine = {{ .DefaultStorageEngine }}
@@ -57,7 +63,10 @@ innodb_data_file_path = {{ .InnodbDataFilePath }}
 innodb_temp_data_file_path = {{ .InnodbTempDataFilePath }}
 innodb_buffer_pool_size = {{ .BufferPoolSize }}
 innodb_buffer_pool_instances = {{ .BufferPoolInstances }}
-innodb_redo_log_capacity = {{ .RedoLogCapacity }}
+{{ if .LegacyRedoLog }}innodb_log_file_size = {{ .InnodbLogFileSize }}
+innodb_log_files_in_group = {{ .InnodbLogFilesInGroup }}
+{{ else }}innodb_redo_log_capacity = {{ .RedoLogCapacity }}
+{{ end }}
 innodb_flush_log_at_trx_commit = {{ .InnodbFlushLogAtCommit }}
 innodb_lock_wait_timeout = {{ .InnodbLockWaitTimeout }}
 innodb_file_per_table = {{ .InnodbFilePerTable }}

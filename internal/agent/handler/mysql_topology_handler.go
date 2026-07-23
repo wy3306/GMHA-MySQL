@@ -9,6 +9,7 @@ import (
 
 	agentcore "gmha/internal/agent/core"
 	taskdomain "gmha/internal/domain/task"
+	mysqlapp "gmha/internal/mysql"
 )
 
 // MySQLTopologyHandler 是 MySQL 拓扑配置任务处理器，负责配置 MySQL 复制拓扑关系。
@@ -46,6 +47,7 @@ func mysqlInstallSpecFromTopology(spec taskdomain.MySQLTopologySpec) taskdomain.
 	node := spec.Node
 	return taskdomain.MySQLInstallSpec{
 		Port:            spec.Port,
+		Version:         node.Version,
 		ServerID:        node.ServerID,
 		BaseDir:         node.BaseDir,
 		DataDir:         node.DataDir,
@@ -123,25 +125,34 @@ func topologyConfigureMyCNFCommand(spec taskdomain.MySQLTopologySpec) string {
 		"binlog_format=ROW",
 		"gtid_mode=ON",
 		"enforce_gtid_consistency=ON",
-		"log_replica_updates=ON",
-		"skip_replica_start=ON",
 		fmt.Sprintf("auto_increment_offset=%d", node.AutoIncrementOffset),
 		fmt.Sprintf("auto_increment_increment=%d", node.AutoIncrementIncrement),
-		fmt.Sprintf("replica_parallel_type=%s", spec.ParallelType),
-		fmt.Sprintf("replica_parallel_workers=%d", spec.ParallelWorkers),
 		fmt.Sprintf("read_only=%s", readOnly),
 		fmt.Sprintf("super_read_only=%s", superReadOnly),
+	}
+	capabilities, _ := mysqlapp.CapabilitiesForVersion(node.Version)
+	if capabilities.LegacyReplicationNames {
+		lines = append(lines,
+			"log_slave_updates=ON",
+			"skip_slave_start=ON",
+			fmt.Sprintf("slave_parallel_type=%s", spec.ParallelType),
+			fmt.Sprintf("slave_parallel_workers=%d", spec.ParallelWorkers),
+		)
+	} else {
+		lines = append(lines,
+			"log_replica_updates=ON",
+			"skip_replica_start=ON",
+			fmt.Sprintf("replica_parallel_type=%s", spec.ParallelType),
+			fmt.Sprintf("replica_parallel_workers=%d", spec.ParallelWorkers),
+		)
 	}
 	configLines := make([]string, 0, len(lines))
 	for _, line := range lines {
 		configLines = append(configLines, line)
 	}
-	mysqlUser := strings.TrimSpace(node.MySQLUser)
-	if mysqlUser == "" {
-		mysqlUser = "mysql"
-	}
 	managedBlock := "# gmha topology managed\n" + strings.Join(configLines, "\n") + "\n"
-	managedKeys := "server_id|binlog_format|gtid_mode|enforce_gtid_consistency|log_replica_updates|skip_replica_start|skip_slave_start|auto_increment_offset|auto_increment_increment|replica_parallel_type|replica_parallel_workers|slave_parallel_type|slave_parallel_workers|read_only|super_read_only"
+	managedKeys := "server_id|binlog_format|gtid_mode|enforce_gtid_consistency|log_replica_updates|log_slave_updates|skip_replica_start|skip_slave_start|auto_increment_offset|auto_increment_increment|replica_parallel_type|replica_parallel_workers|slave_parallel_type|slave_parallel_workers|read_only|super_read_only"
+	validate := mysqlConfigValidationCommand(node.BaseDir+"/bin/mysqld", node.MyCnfPath, node.Version)
 	return fmt.Sprintf(`
 set -eu
 cnf=%s
@@ -161,9 +172,9 @@ awk -v keys="^(${managed_keys})[[:space:]]*=" '
 mv "${cnf}.tmp" "$cnf"
 grep -Eq '^[[:space:]]*\[mysqld\][[:space:]]*$' "$cnf" || printf '\n[mysqld]\n' >> "$cnf"
 printf '\n%%s' %s >> "$cnf"
-%s --defaults-file="$cnf" --validate-config --user=%s
+%s
 echo "my.cnf updated, backup=$backup"
-`, shellEscape(node.MyCnfPath), shellEscape(managedKeys), shellEscape(managedBlock), shellEscape(node.BaseDir+"/bin/mysqld"), shellEscape(mysqlUser))
+`, shellEscape(node.MyCnfPath), shellEscape(managedKeys), shellEscape(managedBlock), validate)
 }
 
 func topologyRestartCommand(spec taskdomain.MySQLTopologySpec) string {
@@ -198,27 +209,35 @@ func topologyPrepareAccountsCommand(spec taskdomain.MySQLTopologySpec) string {
 	}
 	mysql := node.BaseDir + "/bin/mysql"
 	sql := fmt.Sprintf(
-		"SET SQL_LOG_BIN=0; CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED BY '%s'; ALTER USER '%s'@'%%' IDENTIFIED BY '%s'; GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '%s'@'%%'; CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED BY '%s'; ALTER USER '%s'@'%%' IDENTIFIED BY '%s'; GRANT BACKUP_ADMIN, CLONE_ADMIN ON *.* TO '%s'@'%%'; FLUSH PRIVILEGES; SET SQL_LOG_BIN=1;",
+		"SET SQL_LOG_BIN=0; CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED BY '%s'; ALTER USER '%s'@'%%' IDENTIFIED BY '%s'; GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '%s'@'%%';",
 		mysqlSQLEscape(spec.ReplicationUser),
 		mysqlSQLEscape(spec.ReplicationPassword),
 		mysqlSQLEscape(spec.ReplicationUser),
 		mysqlSQLEscape(spec.ReplicationPassword),
 		mysqlSQLEscape(spec.ReplicationUser),
-		mysqlSQLEscape(spec.CloneUser),
-		mysqlSQLEscape(spec.ClonePassword),
-		mysqlSQLEscape(spec.CloneUser),
-		mysqlSQLEscape(spec.ClonePassword),
-		mysqlSQLEscape(spec.CloneUser),
 	)
+	if spec.UseClone {
+		sql += fmt.Sprintf(
+			" CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED BY '%s'; ALTER USER '%s'@'%%' IDENTIFIED BY '%s'; GRANT BACKUP_ADMIN, CLONE_ADMIN ON *.* TO '%s'@'%%';",
+			mysqlSQLEscape(spec.CloneUser), mysqlSQLEscape(spec.ClonePassword),
+			mysqlSQLEscape(spec.CloneUser), mysqlSQLEscape(spec.ClonePassword),
+			mysqlSQLEscape(spec.CloneUser),
+		)
+	}
+	sql += " FLUSH PRIVILEGES; SET SQL_LOG_BIN=1;"
+	command := fmt.Sprintf("%s --socket=%s -uroot -p%s -e %s", shellEscape(mysql), shellEscape(node.SocketPath), shellEscape(spec.RootPassword), shellEscape(sql))
+	if !spec.UseClone {
+		return command
+	}
 	pluginSQL := "INSTALL PLUGIN clone SONAME 'mysql_clone.so';"
-	return fmt.Sprintf("%s --socket=%s -uroot -p%s -e %s; %s --socket=%s -uroot -p%s -e %s || true",
-		shellEscape(mysql), shellEscape(node.SocketPath), shellEscape(spec.RootPassword), shellEscape(sql),
-		shellEscape(mysql), shellEscape(node.SocketPath), shellEscape(spec.RootPassword), shellEscape(pluginSQL),
-	)
+	return command + fmt.Sprintf("; %s --socket=%s -uroot -p%s -e %s || true", shellEscape(mysql), shellEscape(node.SocketPath), shellEscape(spec.RootPassword), shellEscape(pluginSQL))
 }
 
 func topologyCloneCommand(spec taskdomain.MySQLTopologySpec) string {
 	node := spec.Node
+	if !mysqlapp.SupportsCloneForVersion(node.Version) && spec.UseClone && node.RequiresClone {
+		return fmt.Sprintf("echo 'MySQL Clone is unavailable on MySQL %s; use a compatible physical backup to seed the replica' >&2; exit 1", node.Version)
+	}
 	if !spec.UseClone || !node.RequiresClone || strings.TrimSpace(node.SourceIP) == "" {
 		return "echo 'clone skipped'"
 	}
@@ -230,6 +249,7 @@ func topologyCloneCommand(spec taskdomain.MySQLTopologySpec) string {
 	}
 	pluginSQL := "INSTALL PLUGIN clone SONAME 'mysql_clone.so';"
 	cleanupSQL := "STOP REPLICA; RESET REPLICA ALL;"
+	cleanupLegacySQL := "STOP SLAVE; RESET SLAVE ALL;"
 	cloneSQL := fmt.Sprintf(
 		"SET GLOBAL clone_valid_donor_list='%s:%d'; CLONE INSTANCE FROM '%s'@'%s':%d IDENTIFIED BY '%s';",
 		mysqlSQLEscape(node.SourceIP),
@@ -239,9 +259,10 @@ func topologyCloneCommand(spec taskdomain.MySQLTopologySpec) string {
 		node.SourcePort,
 		mysqlSQLEscape(spec.ClonePassword),
 	)
-	return fmt.Sprintf(`%s --socket=%s -uroot -p%s -e %s || true; %s --socket=%s -uroot -p%s -e %s || true; clone_out=$(%s --socket=%s -uroot -p%s -e %s 2>&1); clone_rc=$?; printf '%%s\n' "$clone_out"; if [ "$clone_rc" -ne 0 ] && ! printf '%%s\n' "$clone_out" | grep -q 'ERROR 3707'; then exit "$clone_rc"; fi; systemctl start %s || systemctl restart %s; for i in $(seq 1 90); do %s --connect-timeout=2 --socket=%s -uroot -p%s ping >/tmp/gmha-clone-ready.out 2>&1 && cat /tmp/gmha-clone-ready.out && exit 0; sleep 2; done; cat /tmp/gmha-clone-ready.out 2>/dev/null; exit 1`,
+	return fmt.Sprintf(`%s --socket=%s -uroot -p%s -e %s || true; %s --socket=%s -uroot -p%s -e %s || %s --socket=%s -uroot -p%s -e %s || true; clone_out=$(%s --socket=%s -uroot -p%s -e %s 2>&1); clone_rc=$?; printf '%%s\n' "$clone_out"; if [ "$clone_rc" -ne 0 ] && ! printf '%%s\n' "$clone_out" | grep -q 'ERROR 3707'; then exit "$clone_rc"; fi; systemctl start %s || systemctl restart %s; for i in $(seq 1 90); do %s --connect-timeout=2 --socket=%s -uroot -p%s ping >/tmp/gmha-clone-ready.out 2>&1 && cat /tmp/gmha-clone-ready.out && exit 0; sleep 2; done; cat /tmp/gmha-clone-ready.out 2>/dev/null; exit 1`,
 		shellEscape(mysql), shellEscape(node.SocketPath), shellEscape(spec.RootPassword), shellEscape(pluginSQL),
 		shellEscape(mysql), shellEscape(node.SocketPath), shellEscape(spec.RootPassword), shellEscape(cleanupSQL),
+		shellEscape(mysql), shellEscape(node.SocketPath), shellEscape(spec.RootPassword), shellEscape(cleanupLegacySQL),
 		shellEscape(mysql), shellEscape(node.SocketPath), shellEscape(spec.RootPassword), shellEscape(cloneSQL),
 		shellEscape(unit),
 		shellEscape(unit),

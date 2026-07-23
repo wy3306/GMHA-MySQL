@@ -50,24 +50,23 @@ func (h *BackupHandler) HandlePolicies(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, 200, items)
 	case http.MethodPost:
-		var req backupPolicyRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, 400, err)
-			return
-		}
-		enabled := true
-		if req.Enabled != nil {
-			enabled = *req.Enabled
-		}
-		item, err := h.service.SavePolicy(r.Context(), backupdomain.Policy{ID: req.ID, Name: req.Name, Cluster: req.Cluster, MachineID: req.MachineID, Port: req.Port, BackupType: req.BackupType, DiskUsageThreshold: req.DiskUsageThreshold, ScheduleType: req.ScheduleType, Weekdays: req.Weekdays, WeekdayBackupTypes: req.WeekdayBackupTypes, IntervalMinutes: req.IntervalMinutes, StartAt: req.StartAt, RetryCount: req.RetryCount, RetryIntervalSeconds: req.RetryIntervalSeconds, IncludeBinlog: req.IncludeBinlog, BackupLocation: req.BackupLocation, MySQLUser: req.MySQLUser, MySQLPassword: req.MySQLPassword, Enabled: enabled})
-		if err != nil {
-			writeError(w, 400, err)
-			return
-		}
-		writeJSON(w, 201, item)
+		h.savePolicy(w, r, "", http.StatusCreated)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func (h *BackupHandler) HandleTargets(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	items, err := h.service.ListTargets(r.Context(), r.URL.Query().Get("cluster"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
 }
 
 func (h *BackupHandler) HandlePolicyByID(w http.ResponseWriter, r *http.Request) {
@@ -78,10 +77,23 @@ func (h *BackupHandler) HandlePolicyByID(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	id := parts[0]
+	if len(parts) == 1 && r.Method == http.MethodGet {
+		policy, err := h.service.GetPolicy(r.Context(), id)
+		if err != nil {
+			writeBackupLookupError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, policy)
+		return
+	}
+	if len(parts) == 1 && r.Method == http.MethodPut {
+		h.savePolicy(w, r, id, http.StatusOK)
+		return
+	}
 	if len(parts) == 2 && parts[1] == "run" && r.Method == http.MethodPost {
 		run, err := h.service.RunPolicy(r.Context(), id)
 		if err != nil {
-			writeError(w, 400, err)
+			writeBackupError(w, err)
 			return
 		}
 		writeJSON(w, 201, run)
@@ -89,13 +101,52 @@ func (h *BackupHandler) HandlePolicyByID(w http.ResponseWriter, r *http.Request)
 	}
 	if len(parts) == 1 && r.Method == http.MethodDelete {
 		if err := h.service.DeletePolicy(r.Context(), id); err != nil {
-			writeError(w, 400, err)
+			writeBackupError(w, err)
 			return
 		}
 		writeJSON(w, 200, map[string]string{"id": id})
 		return
 	}
 	w.WriteHeader(http.StatusMethodNotAllowed)
+}
+
+func (h *BackupHandler) savePolicy(w http.ResponseWriter, r *http.Request, id string, status int) {
+	if id != "" {
+		if _, err := h.service.GetPolicy(r.Context(), id); err != nil {
+			writeBackupLookupError(w, err)
+			return
+		}
+	}
+	var req backupPolicyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if id != "" {
+		if req.ID != "" && req.ID != id {
+			writeError(w, http.StatusBadRequest, errors.New("请求体策略 ID 与路径不一致"))
+			return
+		}
+		req.ID = id
+	}
+	enabled := true
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
+	item, err := h.service.SavePolicy(r.Context(), backupdomain.Policy{
+		ID: req.ID, Name: req.Name, Cluster: req.Cluster, MachineID: req.MachineID,
+		Port: req.Port, BackupType: req.BackupType, DiskUsageThreshold: req.DiskUsageThreshold,
+		ScheduleType: req.ScheduleType, Weekdays: req.Weekdays, WeekdayBackupTypes: req.WeekdayBackupTypes,
+		IntervalMinutes: req.IntervalMinutes, StartAt: req.StartAt, RetryCount: req.RetryCount,
+		RetryIntervalSeconds: req.RetryIntervalSeconds, IncludeBinlog: req.IncludeBinlog,
+		BackupLocation: req.BackupLocation, MySQLUser: req.MySQLUser,
+		MySQLPassword: req.MySQLPassword, Enabled: enabled,
+	})
+	if err != nil {
+		writeBackupError(w, err)
+		return
+	}
+	writeJSON(w, status, item)
 }
 
 func (h *BackupHandler) HandleRuns(w http.ResponseWriter, r *http.Request) {
@@ -137,6 +188,15 @@ func (h *BackupHandler) HandleClusterRuns(w http.ResponseWriter, r *http.Request
 func (h *BackupHandler) HandleRunByID(w http.ResponseWriter, r *http.Request) {
 	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/backup/runs/"), "/")
 	parts := strings.Split(path, "/")
+	if len(parts) == 1 && parts[0] != "" && r.Method == http.MethodGet {
+		run, err := h.service.GetRun(r.Context(), parts[0])
+		if err != nil {
+			writeBackupLookupError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, run)
+		return
+	}
 	if len(parts) != 2 || parts[1] != "restore" || r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -165,8 +225,24 @@ func (h *BackupHandler) HandleRunByID(w http.ResponseWriter, r *http.Request) {
 		Database: req.Database, Tables: req.Tables, OutputDir: req.OutputDir,
 	})
 	if err != nil {
-		writeError(w, 400, err)
+		writeBackupError(w, err)
 		return
 	}
 	writeJSON(w, 201, task)
+}
+
+func writeBackupError(w http.ResponseWriter, err error) {
+	if errors.Is(err, app.ErrBackupPolicyNotFound) || errors.Is(err, app.ErrBackupRunNotFound) {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	writeError(w, http.StatusBadRequest, err)
+}
+
+func writeBackupLookupError(w http.ResponseWriter, err error) {
+	if errors.Is(err, app.ErrBackupPolicyNotFound) || errors.Is(err, app.ErrBackupRunNotFound) {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	writeError(w, http.StatusInternalServerError, err)
 }

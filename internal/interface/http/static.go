@@ -7,6 +7,8 @@ import (
 )
 
 // frontendFiles 是由 Vue/Vite 构建出的静态资源。资源嵌入管理端二进制，部署时无需 Node.js 或 Web 服务器。
+// static_test.go also verifies that every hashed asset referenced by index.html
+// is present in this embedded filesystem.
 //
 //go:embed frontend/dist/*
 var frontendFiles embed.FS

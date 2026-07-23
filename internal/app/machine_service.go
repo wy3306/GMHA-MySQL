@@ -29,16 +29,18 @@ import (
 // MachineService 是机器管理服务，负责机器纳管、集群管理、SSH 凭据管理、
 // 机器信息采集、静态信息采集和动态指标查询等。
 type MachineService struct {
-	onboard      *machineusecase.OnboardUsecase
-	machineRepo  machinedomain.Repository
-	clusterRepo  clusterdomain.Repository
-	credRepo     credentialdomain.Repository
-	infoRepo     MachineInfoRepository
-	staticRepo   StaticInfoRepository
-	recoveryRepo machineDataCleaner
-	sshClient    machineusecase.SSHClient
-	agentSvc     *AgentService
-	taskSvc      *TaskService
+	onboard       *machineusecase.OnboardUsecase
+	machineRepo   machinedomain.Repository
+	clusterRepo   clusterdomain.Repository
+	credRepo      credentialdomain.Repository
+	infoRepo      MachineInfoRepository
+	staticRepo    StaticInfoRepository
+	recoveryRepo  machineDataCleaner
+	sshClient     machineusecase.SSHClient
+	agentSvc      *AgentService
+	taskSvc       *TaskService
+	clusterHA     *HAService
+	clusterBackup *BackupService
 }
 
 // MachineInfoRepository 定义了机器采集信息的持久化接口。
@@ -76,9 +78,11 @@ type ClusterCleanupMachineResult struct {
 
 // ClusterCleanupResult 是集群清理的总结果，包含每台机器的清理详情。
 type ClusterCleanupResult struct {
-	Cluster string                        `json:"cluster"`
-	Items   []ClusterCleanupMachineResult `json:"items"`
-	Failed  int                           `json:"failed"`
+	Cluster               string                        `json:"cluster"`
+	RemovedVIPs           []string                      `json:"removed_vips,omitempty"`
+	DeletedBackupPolicies []string                      `json:"deleted_backup_policies,omitempty"`
+	Items                 []ClusterCleanupMachineResult `json:"items"`
+	Failed                int                           `json:"failed"`
 }
 
 // DeleteMachineOptions 控制删除机器前是否同步清理目标机上的运行资源。
@@ -187,10 +191,18 @@ func mysqlResidueCleanupCommand() string {
 
 // ClusterView 是集群的展示视图，包含集群名称、描述和所属机器列表。
 type ClusterView struct {
+	ID          string
 	Name        string
 	Description string
 	Machines    []string
 	CreatedAt   string
+}
+
+// MachineListView augments the managed-machine record with inventory fields
+// that are collected separately from the machine lifecycle entity.
+type MachineListView struct {
+	machinedomain.Machine
+	Architecture string `json:"Architecture"`
 }
 
 // DynamicMetricsView 是动态指标的展示视图，关联了机器信息和心跳状态。
@@ -217,6 +229,14 @@ func NewMachineService(onboard *machineusecase.OnboardUsecase, machineRepo machi
 		agentSvc:     agentSvc,
 		taskSvc:      taskSvc,
 	}
+}
+
+// ConfigureClusterDependencies connects the services whose records reference a
+// cluster name. Keeping this guard in MachineService makes Web, CLI, direct API
+// calls and AI actions share the same rename/delete/cleanup invariants.
+func (s *MachineService) ConfigureClusterDependencies(ha *HAService, backup *BackupService) {
+	s.clusterHA = ha
+	s.clusterBackup = backup
 }
 
 // Onboard 纳管一台新机器，自动解析 SSH 凭据并执行 SSH 连接和信任建立。
@@ -644,6 +664,40 @@ func (s *MachineService) ListMachines(ctx context.Context) ([]machinedomain.Mach
 	return items, nil
 }
 
+// ListMachineViews returns machines together with their collected CPU
+// architecture. Machine inventory is the primary source; static information is
+// retained as a fallback for installations that only ran the static collector.
+func (s *MachineService) ListMachineViews(ctx context.Context) ([]MachineListView, error) {
+	items, err := s.ListMachines(ctx)
+	if err != nil {
+		return nil, err
+	}
+	views := make([]MachineListView, 0, len(items))
+	for _, item := range items {
+		view := MachineListView{Machine: item}
+		if s.infoRepo != nil {
+			inventory, found, inventoryErr := s.infoRepo.Get(ctx, item.ID)
+			if inventoryErr != nil {
+				return nil, inventoryErr
+			}
+			if found {
+				view.Architecture = strings.TrimSpace(inventory.Arch)
+			}
+		}
+		if view.Architecture == "" && s.staticRepo != nil {
+			staticInfo, found, staticErr := s.staticRepo.Get(ctx, item.ID)
+			if staticErr != nil {
+				return nil, staticErr
+			}
+			if found {
+				view.Architecture = strings.TrimSpace(staticInfo.Host.Arch)
+			}
+		}
+		views = append(views, view)
+	}
+	return views, nil
+}
+
 // GetMachine 返回单台机器的基础信息，用于 Web 详情视图。
 func (s *MachineService) GetMachine(ctx context.Context, machineID string) (machinedomain.Machine, bool, error) {
 	return s.machineRepo.GetByID(ctx, strings.TrimSpace(machineID))
@@ -674,6 +728,7 @@ func (s *MachineService) ListClusters(ctx context.Context) ([]ClusterView, error
 	out := make([]ClusterView, 0, len(clusters))
 	for _, item := range clusters {
 		out = append(out, ClusterView{
+			ID:          item.Name,
 			Name:        item.Name,
 			Description: item.Description,
 			Machines:    byCluster[item.Name],
@@ -1126,6 +1181,11 @@ func (s *MachineService) UpdateCluster(ctx context.Context, oldName, newName, de
 	if !ok {
 		return errors.New("cluster not found")
 	}
+	if oldName != newName {
+		if err := s.ensureClusterReferencesCanChange(ctx, oldName, "重命名"); err != nil {
+			return err
+		}
+	}
 	if err := s.clusterRepo.Update(ctx, oldName, clusterdomain.Cluster{Name: newName, Description: description}); err != nil {
 		return err
 	}
@@ -1145,10 +1205,79 @@ func (s *MachineService) DeleteCluster(ctx context.Context, name string) error {
 	if !ok {
 		return errors.New("cluster not found")
 	}
+	if err := s.ensureClusterReferencesCanChange(ctx, name, "删除"); err != nil {
+		return err
+	}
 	if err := s.machineRepo.ClearCluster(ctx, name); err != nil {
 		return err
 	}
 	return s.clusterRepo.Delete(ctx, name)
+}
+
+func (s *MachineService) ensureClusterReferencesCanChange(ctx context.Context, name, operation string) error {
+	var blockers []string
+	if s.clusterHA != nil {
+		configs, err := s.clusterHA.ListVIPConfigs(ctx, name)
+		if err != nil {
+			return err
+		}
+		if len(configs) > 0 {
+			blockers = append(blockers, fmt.Sprintf("%d 个业务 VIP", len(configs)))
+		}
+	}
+	if s.clusterBackup != nil {
+		policies, err := s.clusterBackup.ListPolicies(ctx, name)
+		if err != nil {
+			return err
+		}
+		if len(policies) > 0 {
+			blockers = append(blockers, fmt.Sprintf("%d 条备份策略", len(policies)))
+		}
+	}
+	active, err := s.clusterActiveTasks(ctx, name)
+	if err != nil {
+		return err
+	}
+	if len(active) > 0 {
+		blockers = append(blockers, fmt.Sprintf("%d 个进行中任务", len(active)))
+	}
+	if len(blockers) > 0 {
+		return fmt.Errorf("集群 %s 仍有关联资源（%s），不能直接%s；请先处理引用或使用一键清理", name, strings.Join(blockers, "、"), operation)
+	}
+	return nil
+}
+
+func (s *MachineService) clusterActiveTasks(ctx context.Context, name string) ([]string, error) {
+	if s.taskSvc == nil {
+		return nil, nil
+	}
+	machines, err := s.machineRepo.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	members := make(map[string]bool)
+	for _, machine := range machines {
+		if machine.Cluster == name {
+			members[machine.ID] = true
+		}
+	}
+	tasks, err := s.taskSvc.ListTasks(ctx, 200)
+	if err != nil {
+		return nil, err
+	}
+	active := make([]string, 0)
+	for _, task := range tasks {
+		if task.Type == taskdomain.TypeAIWorkflow {
+			continue
+		}
+		if task.Status != taskdomain.StatusPending && task.Status != taskdomain.StatusSent && task.Status != taskdomain.StatusRunning {
+			continue
+		}
+		if task.MachineID == name || members[task.MachineID] {
+			active = append(active, fmt.Sprintf("%s [%s]", task.ID, task.Status))
+		}
+	}
+	return active, nil
 }
 
 // CleanupCluster 清理集群，按顺序卸载每台机器上的 MySQL 实例和 Agent，清理本地数据后删除集群。
@@ -1167,6 +1296,11 @@ func (s *MachineService) CleanupCluster(ctx context.Context, name string) (Clust
 	if s.taskSvc == nil {
 		return ClusterCleanupResult{}, errors.New("task service not configured")
 	}
+	if active, err := s.clusterActiveTasks(ctx, name); err != nil {
+		return ClusterCleanupResult{}, err
+	} else if len(active) > 0 {
+		return ClusterCleanupResult{}, fmt.Errorf("cluster has active tasks: %s", strings.Join(active, ", "))
+	}
 	machines, err := s.machineRepo.List(ctx)
 	if err != nil {
 		return ClusterCleanupResult{}, err
@@ -1177,6 +1311,30 @@ func (s *MachineService) CleanupCluster(ctx context.Context, name string) (Clust
 	}
 
 	result := ClusterCleanupResult{Cluster: name}
+	if s.clusterHA != nil {
+		configs, listErr := s.clusterHA.ListVIPConfigs(ctx, name)
+		if listErr != nil {
+			return result, fmt.Errorf("list cluster VIPs before cleanup: %w", listErr)
+		}
+		for _, cfg := range configs {
+			if removeErr := s.clusterHA.RemoveVIPConfig(ctx, name, cfg.VIPAddress); removeErr != nil {
+				return result, fmt.Errorf("remove VIP %s before cluster cleanup: %w", cfg.VIPAddress, removeErr)
+			}
+			result.RemovedVIPs = append(result.RemovedVIPs, cfg.VIPAddress)
+		}
+	}
+	if s.clusterBackup != nil {
+		policies, listErr := s.clusterBackup.ListPolicies(ctx, name)
+		if listErr != nil {
+			return result, fmt.Errorf("list backup policies before cleanup: %w", listErr)
+		}
+		for _, policy := range policies {
+			if deleteErr := s.clusterBackup.DeletePolicy(ctx, policy.ID); deleteErr != nil {
+				return result, fmt.Errorf("delete backup policy %s before cluster cleanup: %w", policy.Name, deleteErr)
+			}
+			result.DeletedBackupPolicies = append(result.DeletedBackupPolicies, policy.ID)
+		}
+	}
 	for _, machine := range machines {
 		if machine.Cluster != name {
 			continue
@@ -1227,7 +1385,13 @@ func (s *MachineService) CleanupCluster(ctx context.Context, name string) (Clust
 		result.Items = append(result.Items, item)
 	}
 	if len(result.Items) == 0 {
-		return ClusterCleanupResult{}, fmt.Errorf("cluster %s has no machines", name)
+		if err := s.machineRepo.ClearCluster(ctx, name); err != nil {
+			return result, err
+		}
+		if err := s.clusterRepo.Delete(ctx, name); err != nil {
+			return result, err
+		}
+		return result, nil
 	}
 	if result.Failed > 0 {
 		return result, fmt.Errorf("cluster cleanup failed for %d machine(s)", result.Failed)

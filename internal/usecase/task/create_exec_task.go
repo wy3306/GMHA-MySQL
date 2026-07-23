@@ -152,7 +152,7 @@ func taskCreatedEvent(displayName string) string {
 	return displayName + "任务已创建"
 }
 
-// resolveMachine 根据选择器（IP 或名称）解析机器信息。
+// resolveMachine 根据选择器（ID、IP 或名称）解析机器信息。
 func (u *CreateExecTaskUsecase) resolveMachine(ctx context.Context, selector string) (machinedomain.Machine, bool, error) {
 	if item, ok, err := u.machines.GetByIP(ctx, selector); err != nil {
 		return machinedomain.Machine{}, false, err
@@ -164,7 +164,7 @@ func (u *CreateExecTaskUsecase) resolveMachine(ctx context.Context, selector str
 		return machinedomain.Machine{}, false, err
 	}
 	for _, item := range items {
-		if item.Name == selector {
+		if item.ID == selector || item.Name == selector {
 			return item, true, nil
 		}
 	}

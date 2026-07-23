@@ -77,4 +77,7 @@ func TestCalculatorProdProfileGeneratesSafeReadableDefaults(t *testing.T) {
 	if vars.MyCnfPath != "/data/3306/my.cnf" {
 		t.Fatalf("MyCnfPath = %s, want /data/3306/my.cnf", vars.MyCnfPath)
 	}
+	if vars.BaseDir != "/usr/local/mysql-3306" {
+		t.Fatalf("BaseDir = %s, want port-scoped install path", vars.BaseDir)
+	}
 }

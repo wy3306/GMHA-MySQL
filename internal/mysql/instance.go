@@ -11,6 +11,8 @@ const (
 	StatusHeartbeatFailed = "heartbeat_failed"
 	// StatusInstanceError 表示实例发生错误。
 	StatusInstanceError = "instance_error"
+	// StatusStopped 表示实例已由管理端安全关闭。
+	StatusStopped = "stopped"
 )
 
 // Instance 定义 MySQL 实例的完整信息，包括机器 ID、端口、目录路径、状态等。

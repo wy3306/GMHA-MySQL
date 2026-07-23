@@ -248,6 +248,68 @@ func collectMemUsage(ctx context.Context, spec dyndomain.CollectTaskSpec) (any, 
 	if err != nil {
 		return nil, dyndomain.ValueTypeFloat, err
 	}
+	values := parseProcMeminfo(data)
+	total := values["MemTotal"]
+	if total == 0 {
+		return nil, dyndomain.ValueTypeFloat, errors.New("MemTotal is zero")
+	}
+	available := availableMemoryKB(values)
+	return round2(100 * (1 - float64(available)/float64(total))), dyndomain.ValueTypeFloat, nil
+}
+
+func collectHostMemoryDetail(ctx context.Context, spec dyndomain.CollectTaskSpec) (any, string, error) {
+	_ = ctx
+	_ = spec
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return nil, dyndomain.ValueTypeMap, err
+	}
+	values := parseProcMeminfo(data)
+	totalKB := values["MemTotal"]
+	if totalKB == 0 {
+		return nil, dyndomain.ValueTypeMap, errors.New("MemTotal is zero")
+	}
+	availableKB := availableMemoryKB(values)
+	usedKB := uint64(0)
+	if totalKB > availableKB {
+		usedKB = totalKB - availableKB
+	}
+	cacheKB := values["Cached"] + values["SReclaimable"]
+	if cacheKB > values["Shmem"] {
+		cacheKB -= values["Shmem"]
+	} else {
+		cacheKB = 0
+	}
+	swapUsedKB := uint64(0)
+	if values["SwapTotal"] > values["SwapFree"] {
+		swapUsedKB = values["SwapTotal"] - values["SwapFree"]
+	}
+	mysqlRSS, mysqlProcesses := processRSSBytes("mysqld", "mariadbd")
+	toBytes := func(value uint64) uint64 { return value * 1024 }
+	return map[string]any{
+		"total_bytes":              toBytes(totalKB),
+		"used_bytes":               toBytes(usedKB),
+		"available_bytes":          toBytes(availableKB),
+		"free_bytes":               toBytes(values["MemFree"]),
+		"buffers_bytes":            toBytes(values["Buffers"]),
+		"cached_bytes":             toBytes(cacheKB),
+		"anon_bytes":               toBytes(values["AnonPages"]),
+		"slab_bytes":               toBytes(values["Slab"]),
+		"slab_reclaimable_bytes":   toBytes(values["SReclaimable"]),
+		"page_tables_bytes":        toBytes(values["PageTables"]),
+		"kernel_stack_bytes":       toBytes(values["KernelStack"]),
+		"shared_bytes":             toBytes(values["Shmem"]),
+		"active_bytes":             toBytes(values["Active"]),
+		"inactive_bytes":           toBytes(values["Inactive"]),
+		"swap_total_bytes":         toBytes(values["SwapTotal"]),
+		"swap_free_bytes":          toBytes(values["SwapFree"]),
+		"swap_used_bytes":          toBytes(swapUsedKB),
+		"mysql_process_rss_bytes":  mysqlRSS,
+		"mysql_processes_detected": mysqlProcesses,
+	}, dyndomain.ValueTypeMap, nil
+}
+
+func parseProcMeminfo(data []byte) map[string]uint64 {
 	values := map[string]uint64{}
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)
@@ -255,12 +317,102 @@ func collectMemUsage(ctx context.Context, spec dyndomain.CollectTaskSpec) (any, 
 			values[strings.TrimSuffix(fields[0], ":")] = parseUint(fields[1])
 		}
 	}
-	total := values["MemTotal"]
-	available := values["MemAvailable"]
-	if total == 0 {
-		return nil, dyndomain.ValueTypeFloat, errors.New("MemTotal is zero")
+	return values
+}
+
+func availableMemoryKB(values map[string]uint64) uint64 {
+	if available := values["MemAvailable"]; available > 0 {
+		return available
 	}
-	return round2(100 * (1 - float64(available)/float64(total))), dyndomain.ValueTypeFloat, nil
+	// MemAvailable was added in Linux 3.14. Keep older enterprise kernels
+	// useful by using the same conservative components exposed by meminfo.
+	available := values["MemFree"] + values["Buffers"] + values["Cached"] + values["SReclaimable"]
+	if available > values["Shmem"] {
+		available -= values["Shmem"]
+	}
+	if total := values["MemTotal"]; total > 0 && available > total {
+		return total
+	}
+	return available
+}
+
+func processRSSBytes(names ...string) (uint64, int) {
+	wanted := make(map[string]bool, len(names))
+	for _, name := range names {
+		wanted[name] = true
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0, 0
+	}
+	var total uint64
+	count := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if _, err := strconv.Atoi(entry.Name()); err != nil {
+			continue
+		}
+		comm, err := os.ReadFile("/proc/" + entry.Name() + "/comm")
+		if err != nil || !wanted[strings.TrimSpace(string(comm))] {
+			continue
+		}
+		status, err := os.ReadFile("/proc/" + entry.Name() + "/status")
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(status), "\n") {
+			if !strings.HasPrefix(line, "VmRSS:") {
+				continue
+			}
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				total += parseUint(fields[1]) * 1024
+				count++
+			}
+			break
+		}
+	}
+	return total, count
+}
+
+func collectSwapUsage(ctx context.Context, spec dyndomain.CollectTaskSpec) (any, string, error) {
+	_ = ctx
+	_ = spec
+	data, err := os.ReadFile("/proc/swaps")
+	if err != nil {
+		return nil, dyndomain.ValueTypeArray, err
+	}
+	out := []map[string]any{}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 4 || fields[0] == "Filename" {
+			continue
+		}
+		total := parseUint(fields[2]) * 1024
+		used := parseUint(fields[3]) * 1024
+		available := uint64(0)
+		if total > used {
+			available = total - used
+		}
+		usedPercent := float64(0)
+		if total > 0 {
+			usedPercent = round2(100 * float64(used) / float64(total))
+		}
+		out = append(out, map[string]any{
+			"enabled": true, "path": fields[0], "mount": fields[0], "source": fields[0],
+			"fs_type": "swap", "swap_type": fields[1], "total_bytes": total,
+			"used_bytes": used, "available_bytes": available, "used_percent": usedPercent,
+		})
+	}
+	if len(out) == 0 {
+		out = append(out, map[string]any{
+			"enabled": false, "mount": "swap", "source": "/proc/swaps", "fs_type": "swap",
+			"total_bytes": uint64(0), "used_bytes": uint64(0), "available_bytes": uint64(0), "used_percent": float64(0),
+		})
+	}
+	return out, dyndomain.ValueTypeArray, nil
 }
 
 func collectLoadAverage(ctx context.Context, spec dyndomain.CollectTaskSpec) (any, string, error) {
@@ -330,26 +482,27 @@ func collectInodeUsage(ctx context.Context, spec dyndomain.CollectTaskSpec) (any
 func collectFilesystemUsage(ctx context.Context, spec dyndomain.CollectTaskSpec) (any, string, error) {
 	_ = ctx
 	_ = spec
-	mounts, err := mountPoints()
+	mounts, err := mountedFilesystems()
 	if err != nil {
 		return nil, dyndomain.ValueTypeArray, err
 	}
 	out := make([]map[string]any, 0, len(mounts))
 	seen := make(map[string]bool)
-	for _, mount := range mounts {
-		if seen[mount] {
+	for _, item := range mounts {
+		if seen[item.mount] {
 			continue
 		}
-		seen[mount] = true
+		seen[item.mount] = true
 		var st syscall.Statfs_t
-		if err := syscall.Statfs(mount, &st); err != nil || st.Blocks == 0 {
+		if err := syscall.Statfs(item.mount, &st); err != nil || st.Blocks == 0 {
 			continue
 		}
 		total := st.Blocks * uint64(st.Bsize)
 		available := st.Bavail * uint64(st.Bsize)
 		used := total - available
 		out = append(out, map[string]any{
-			"mount": mount, "total_bytes": total, "used_bytes": used,
+			"mount": item.mount, "source": item.source, "fs_type": item.fsType,
+			"total_bytes": total, "used_bytes": used,
 			"available_bytes": available, "used_percent": round2(100 * float64(used) / float64(total)),
 		})
 	}
@@ -416,24 +569,51 @@ func readNetworkStats() (map[string]networkStat, error) {
 	return out, nil
 }
 
-func mountPoints() ([]string, error) {
+type mountedFilesystem struct {
+	source string
+	mount  string
+	fsType string
+}
+
+func mountedFilesystems() ([]mountedFilesystem, error) {
 	data, err := os.ReadFile("/proc/mounts")
 	if err != nil {
 		return nil, err
 	}
-	var out []string
+	var out []mountedFilesystem
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 3 {
 			continue
 		}
 		fs := fields[2]
-		if strings.HasPrefix(fs, "proc") || strings.HasPrefix(fs, "sysfs") || strings.HasPrefix(fs, "tmpfs") || fs == "devtmpfs" {
+		if strings.HasPrefix(fs, "proc") || strings.HasPrefix(fs, "sysfs") || strings.HasPrefix(fs, "tmpfs") || fs == "devtmpfs" || fs == "cgroup" || fs == "cgroup2" {
 			continue
 		}
-		out = append(out, fields[1])
+		out = append(out, mountedFilesystem{
+			source: unescapeMountField(fields[0]),
+			mount:  unescapeMountField(fields[1]),
+			fsType: fs,
+		})
 	}
 	return out, nil
+}
+
+func mountPoints() ([]string, error) {
+	items, err := mountedFilesystems()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		out = append(out, item.mount)
+	}
+	return out, nil
+}
+
+func unescapeMountField(value string) string {
+	replacer := strings.NewReplacer(`\040`, " ", `\011`, "\t", `\012`, "\n", `\134`, `\`)
+	return replacer.Replace(value)
 }
 
 func parseUint(s string) uint64   { v, _ := strconv.ParseUint(strings.TrimSpace(s), 10, 64); return v }

@@ -13,6 +13,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	agentdomain "gmha/internal/domain/agent"
+	dynamicdomain "gmha/internal/domain/dynamic"
 	hbdomain "gmha/internal/domain/heartbeat"
 	machinedomain "gmha/internal/domain/machine"
 	taskdomain "gmha/internal/domain/task"
@@ -39,20 +40,27 @@ type Config struct {
 
 // App 是应用核心结构体，持有所有服务实例。
 type App struct {
-	db               *sql.DB
-	MachineService   *MachineService
-	ClusterService   *ClusterService
-	AgentService     *AgentService
-	HeartbeatService *HeartbeatService
-	RecoveryService  *RecoveryService
-	TaskService      *TaskService
-	MySQLService     *MySQLService
-	HAService        *HAService
-	PackageService   *PackageService
-	BackupService    *BackupService
-	AlertService     *AlertService
-	ManagerRuntime   *ManagerRuntimeService
-	UpgradeService   *UpgradeService
+	db                    *sql.DB
+	MachineService        *MachineService
+	ClusterService        *ClusterService
+	AgentService          *AgentService
+	HeartbeatService      *HeartbeatService
+	RecoveryService       *RecoveryService
+	TaskService           *TaskService
+	ClusterUpgradeService *ClusterUpgradeService
+	MySQLService          *MySQLService
+	HistogramService      *HistogramService
+	BinlogAnalysisService *BinlogAnalysisService
+	HAService             *HAService
+	PackageService        *PackageService
+	BackupService         *BackupService
+	AlertService          *AlertService
+	ManagerRuntime        *ManagerRuntimeService
+	ManagerHA             *ManagerHAService
+	UpgradeService        *UpgradeService
+	SQLDiagnosticService  *SQLDiagnosticService
+	FlameGraphService     *FlameGraphService
+	AIService             *AIService
 }
 
 // New 创建并初始化应用核心实例。
@@ -78,6 +86,10 @@ func New(cfg Config) (*App, error) {
 	backupRepo := sqliteinfra.NewBackupRepository(store)
 	alertRepo := sqliteinfra.NewAlertRepository(store)
 	credentialRepo := sqliteinfra.NewCredentialRepository(store)
+	sqlDiagnosticRepo := sqliteinfra.NewSQLDiagnosticRepository(store)
+	flameGraphRepo := sqliteinfra.NewFlameGraphRepository(store)
+	managerHARepo := sqliteinfra.NewManagerHARepository(store)
+	aiRepo := sqliteinfra.NewAIRepository(store)
 	if err := machineRepo.Migrate(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -134,6 +146,22 @@ func New(cfg Config) (*App, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := sqlDiagnosticRepo.Migrate(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := flameGraphRepo.Migrate(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := managerHARepo.Migrate(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := aiRepo.Migrate(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 
 	sshClient := sshinfra.NewClient(cfg.ManagerPublicKey)
 	trustService, err := sshinfra.NewTrustService(cfg.ManagerPublicKey, sshClient)
@@ -165,12 +193,28 @@ func New(cfg Config) (*App, error) {
 		_ = db.Close()
 		return nil, err
 	} else if ok {
+		var changed bool
+		saved, changed = mergeDynamicCollectConfig(saved, dynamicdomain.BuildDefaultDynamicCollectConfig())
+		if changed {
+			if err := alertRepo.SaveMetricConfig(context.Background(), "host", saved); err != nil {
+				_ = db.Close()
+				return nil, err
+			}
+		}
 		heartbeatService.UpdateDynamicCollectConfig(saved)
 	}
 	if saved, ok, err := alertRepo.LoadMetricConfig(context.Background(), "mysql"); err != nil {
 		_ = db.Close()
 		return nil, err
 	} else if ok {
+		var changed bool
+		saved, changed = mergeDynamicCollectConfig(saved, dynamicdomain.BuildDefaultMySQLDynamicCollectConfig())
+		if changed {
+			if err := alertRepo.SaveMetricConfig(context.Background(), "mysql", saved); err != nil {
+				_ = db.Close()
+				return nil, err
+			}
+		}
 		heartbeatService.UpdateMySQLDynamicCollectConfig(saved)
 	}
 	installAgent := agentusecase.NewInstallAgentUsecase(agentusecase.Dependencies{
@@ -181,11 +225,12 @@ func New(cfg Config) (*App, error) {
 		Waiter:      heartbeatService,
 	})
 	upgradeAgent := agentusecase.NewUpgradeAgentUsecase(agentusecase.UpgradeDependencies{
-		MachineRepo: machinedomain.Repository(machineRepo),
-		AgentRepo:   agentdomain.Repository(agentRepo),
-		SSHClient:   sshClient,
-		Renderer:    renderer,
-		Heartbeat:   heartbeatService,
+		MachineRepo:    machinedomain.Repository(machineRepo),
+		AgentRepo:      agentdomain.Repository(agentRepo),
+		CredentialRepo: credentialRepo,
+		SSHClient:      sshClient,
+		Renderer:       renderer,
+		Heartbeat:      heartbeatService,
 	})
 	uninstallAgent := agentusecase.NewUninstallAgentUsecase(agentusecase.UninstallDependencies{
 		MachineRepo: machinedomain.Repository(machineRepo),
@@ -222,31 +267,75 @@ func New(cfg Config) (*App, error) {
 	createMySQLTopologyTask := taskusecase.NewCreateMySQLTopologyTaskUsecase(machineRepo, agentRepo, mysqlInstanceRepo)
 	taskService := NewTaskService(taskdomain.Repository(taskRepo), createExecTask, createCollectTask, createStaticTask, createMySQLInstallTask, createMySQLUninstallTask, createMySQLTopologyTask, machineInfoRepo, staticInfoRepo, machineRepo, mysqlInstanceRepo)
 	mysqlService := NewMySQLService(mysqlInstanceRepo, machinedomain.Repository(machineRepo), heartbeatService, mysqlAccountPresetRepo)
+	histogramService := NewHistogramService(mysqlInstanceRepo, machinedomain.Repository(machineRepo), mysqlAccountPresetRepo)
+	binlogAnalysisService := NewBinlogAnalysisService(mysqlInstanceRepo, machinedomain.Repository(machineRepo), mysqlAccountPresetRepo)
+	sqlDiagnosticService, err := NewSQLDiagnosticService(sqlDiagnosticRepo, mysqlInstanceRepo, machinedomain.Repository(machineRepo), mysqlAccountPresetRepo)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	sqlDiagnosticService.Start()
 	haService := NewHAService(haRepo, machinedomain.Repository(machineRepo), mysqlInstanceRepo, mysqlAccountPresetRepo)
 	haService.ConfigureArchitectureExecutor(taskService)
+	clusterUpgradeService := NewClusterUpgradeService(taskService, haService)
+	if err := clusterUpgradeService.RecoverInterrupted(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	clusterService := NewClusterService(clusterRepo)
 	agentService := NewAgentService(agentRepo, machineRepo, sshClient, heartbeatService, recoveryService, installAgent, upgradeAgent, uninstallAgent, taskService, mysqlService, cfg.AgentBinaryPath, cfg.ManagerHTTPAddr, cfg.ManagerGRPCAddr)
+	agentService.SetCredentialRepository(credentialRepo)
 	machineService := NewMachineService(onboard, machineRepo, clusterRepo, credentialRepo, machineInfoRepo, staticInfoRepo, recoveryRepo, sshClient, agentService, taskService)
 	backupService := NewBackupService(backupRepo, taskService, machinedomain.Repository(machineRepo), mysqlInstanceRepo)
+	machineService.ConfigureClusterDependencies(haService, backupService)
+	taskService.ConfigureClusterSafetyDependencies(haService, backupService)
 	backupService.Start()
+	flameGraphService := NewFlameGraphService(flameGraphRepo, taskService, machinedomain.Repository(machineRepo))
+	taskService.SetFlameGraphTaskResultSaver(flameGraphService)
+	flameGraphService.Start()
 
 	managerRuntime := NewManagerRuntimeService(cfg)
+	managerRuntime.SetPlatformUsageChecker(func(ctx context.Context) (bool, error) {
+		var total int
+		err := db.QueryRowContext(ctx, `
+			select
+				(select count(*) from machines) +
+				(select count(*) from clusters) +
+				(select count(*) from tasks)
+		`).Scan(&total)
+		return total > 0, err
+	})
 	upgradeService := NewUpgradeService(filepath.Join(home, ".gmha", "upgrade-jobs.json"), packageService, agentService, managerRuntime)
+	managerHAService := NewManagerHAService(managerHARepo, machineRepo, taskService, managerRuntime, machineService)
+	aiService, err := NewAIService(aiRepo, alertService, machineService, taskService, filepath.Join(home, ".gmha", "ai-secret.key"))
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	aiService.ConfigurePlatformContext(haService, backupService)
+	aiService.ConfigureClusterOperations(clusterUpgradeService)
 	return &App{
-		db:               db,
-		MachineService:   machineService,
-		ClusterService:   clusterService,
-		AgentService:     agentService,
-		HeartbeatService: heartbeatService,
-		RecoveryService:  recoveryService,
-		TaskService:      taskService,
-		MySQLService:     mysqlService,
-		HAService:        haService,
-		PackageService:   packageService,
-		BackupService:    backupService,
-		AlertService:     alertService,
-		ManagerRuntime:   managerRuntime,
-		UpgradeService:   upgradeService,
+		db:                    db,
+		MachineService:        machineService,
+		ClusterService:        clusterService,
+		AgentService:          agentService,
+		HeartbeatService:      heartbeatService,
+		RecoveryService:       recoveryService,
+		TaskService:           taskService,
+		ClusterUpgradeService: clusterUpgradeService,
+		MySQLService:          mysqlService,
+		HistogramService:      histogramService,
+		BinlogAnalysisService: binlogAnalysisService,
+		HAService:             haService,
+		PackageService:        packageService,
+		BackupService:         backupService,
+		AlertService:          alertService,
+		ManagerRuntime:        managerRuntime,
+		ManagerHA:             managerHAService,
+		UpgradeService:        upgradeService,
+		SQLDiagnosticService:  sqlDiagnosticService,
+		FlameGraphService:     flameGraphService,
+		AIService:             aiService,
 	}, nil
 }
 
@@ -309,6 +398,18 @@ func configureSQLite(db *sql.DB) {
 func (a *App) Close() error {
 	if a.BackupService != nil {
 		a.BackupService.Close()
+	}
+	if a.SQLDiagnosticService != nil {
+		a.SQLDiagnosticService.Close()
+	}
+	if a.FlameGraphService != nil {
+		a.FlameGraphService.Close()
+	}
+	if a.BinlogAnalysisService != nil {
+		a.BinlogAnalysisService.Close()
+	}
+	if a.AIService != nil {
+		a.AIService.Close()
 	}
 	if a.db == nil {
 		return nil

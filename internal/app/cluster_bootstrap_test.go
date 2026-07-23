@@ -74,6 +74,37 @@ func TestValidateClusterBootstrapDualMasterRequiresSecondMaster(t *testing.T) {
 	}
 }
 
+func TestClusterBootstrapPersistsWritableRoleForBothDualMasters(t *testing.T) {
+	req := validClusterBootstrapRequest()
+	req.Architecture = hadomain.ArchitectureDualMaster
+	req.SecondaryMasterMachineID = "machine-2"
+	req.Installs[0].RuntimeParameters = map[string]string{"max_connections": "800", "READ_ONLY": "1", "Super_Read_Only": "1"}
+
+	for _, item := range req.Installs {
+		parameters := clusterBootstrapRuntimeParameters(req, item)
+		if parameters["read_only"] != "0" || parameters["super_read_only"] != "0" {
+			t.Fatalf("dual-master node %s must be installed writable: %+v", item.MachineID, parameters)
+		}
+		if _, exists := parameters["READ_ONLY"]; exists {
+			t.Fatalf("case-insensitive caller override must not compete with the topology role: %+v", parameters)
+		}
+	}
+	if req.Installs[0].RuntimeParameters["READ_ONLY"] != "1" {
+		t.Fatal("bootstrap role overrides must not mutate the caller's runtime parameters")
+	}
+	if got := clusterBootstrapRuntimeParameters(req, req.Installs[0])["max_connections"]; got != "800" {
+		t.Fatalf("unrelated runtime parameter was lost: %q", got)
+	}
+}
+
+func TestClusterBootstrapKeepsReplicaReadOnly(t *testing.T) {
+	req := validClusterBootstrapRequest()
+	parameters := clusterBootstrapRuntimeParameters(req, req.Installs[1])
+	if parameters["read_only"] != "1" || parameters["super_read_only"] != "1" {
+		t.Fatalf("replica must be installed read-only: %+v", parameters)
+	}
+}
+
 func TestValidateClusterBootstrapVIPRequiresAddress(t *testing.T) {
 	req := validClusterBootstrapRequest()
 	req.EnableVIP = true

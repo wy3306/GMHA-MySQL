@@ -118,17 +118,59 @@ func (r *TaskRepository) Migrate() error {
 	}
 	_, err = r.db.Exec(`create index if not exists idx_tasks_parent_created on tasks(parent_task_id, created_at desc)`)
 	if err == nil {
-		_, err = r.db.Exec(`
-			update tasks as child set parent_task_id = coalesce((
-				select parent.id from tasks as parent join task_events as event on event.task_id = parent.id
-				where parent.type = 'mysql_cluster_bootstrap' and instr(event.content, child.id) > 0 limit 1
-			), '') where child.type = 'mysql_install' and child.parent_task_id = ''
-		`)
+		err = r.backfillMySQLInstallTaskParents()
 	}
 	if err == nil {
 		err = r.backfillPlatformTaskParents()
 	}
 	return err
+}
+
+func (r *TaskRepository) backfillMySQLInstallTaskParents() error {
+	rows, err := r.db.Query(`select parent.id, event.content from tasks as parent join task_events as event on event.task_id = parent.id where parent.type = 'mysql_cluster_bootstrap'`)
+	if err != nil {
+		return err
+	}
+	type parentEvent struct{ parentID, content string }
+	events := make([]parentEvent, 0)
+	for rows.Next() {
+		var item parentEvent
+		if err := rows.Scan(&item.parentID, &item.content); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		events = append(events, item)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	children, err := r.db.Query(`select id from tasks where type = 'mysql_install' and parent_task_id = ''`)
+	if err != nil {
+		return err
+	}
+	relations := make(map[string]string)
+	for children.Next() {
+		var childID string
+		if err := children.Scan(&childID); err != nil {
+			_ = children.Close()
+			return err
+		}
+		for _, item := range events {
+			if strings.Contains(item.content, childID) {
+				relations[childID] = item.parentID
+				break
+			}
+		}
+	}
+	if err := children.Close(); err != nil {
+		return err
+	}
+	for childID, parentID := range relations {
+		if _, err := r.db.Exec(`update tasks set parent_task_id = ? where id = ? and parent_task_id = ''`, parentID, childID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *TaskRepository) backfillPlatformTaskParents() error {
@@ -417,31 +459,66 @@ func (r *TaskRepository) DeleteTaskTree(ctx context.Context, taskID string) erro
 	}
 	defer tx.Rollback()
 	var count int
-	if err := tx.QueryRowContext(ctx, `with recursive tree(id) as (
-		select id from tasks where id = ? union all
-		select task.id from tasks task join tree on task.parent_task_id = tree.id
-	) select count(*) from tree`, taskID).Scan(&count); err != nil {
+	if err := tx.QueryRowContext(ctx, `select count(*) from tasks where id = ?`, taskID).Scan(&count); err != nil {
 		return err
 	}
 	if count == 0 {
 		return errors.New("task not found")
 	}
+	ids := []string{taskID}
+	frontier := []string{taskID}
+	seen := map[string]bool{taskID: true}
+	for len(frontier) > 0 {
+		args := make([]any, len(frontier))
+		for i := range frontier {
+			args[i] = frontier[i]
+		}
+		rows, queryErr := tx.QueryContext(ctx, `select id from tasks where parent_task_id in (`+sqlPlaceholders(len(frontier))+`)`, args...)
+		if queryErr != nil {
+			return queryErr
+		}
+		next := make([]string, 0)
+		for rows.Next() {
+			var id string
+			if scanErr := rows.Scan(&id); scanErr != nil {
+				_ = rows.Close()
+				return scanErr
+			}
+			if !seen[id] {
+				seen[id] = true
+				ids = append(ids, id)
+				next = append(next, id)
+			}
+		}
+		if rowsErr := rows.Err(); rowsErr != nil {
+			_ = rows.Close()
+			return rowsErr
+		}
+		_ = rows.Close()
+		frontier = next
+	}
+	args := make([]any, len(ids))
+	for i := range ids {
+		args[i] = ids[i]
+	}
+	placeholders := sqlPlaceholders(len(ids))
 	for _, table := range []string{"task_events", "task_steps"} {
-		query := fmt.Sprintf(`with recursive tree(id) as (
-			select id from tasks where id = ? union all
-			select task.id from tasks task join tree on task.parent_task_id = tree.id
-		) delete from %s where task_id in (select id from tree)`, table)
-		if _, err := tx.ExecContext(ctx, query, taskID); err != nil {
+		query := fmt.Sprintf(`delete from %s where task_id in (%s)`, table, placeholders)
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 			return err
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `with recursive tree(id) as (
-		select id from tasks where id = ? union all
-		select task.id from tasks task join tree on task.parent_task_id = tree.id
-	) delete from tasks where id in (select id from tree)`, taskID); err != nil {
+	if _, err := tx.ExecContext(ctx, `delete from tasks where id in (`+placeholders+`)`, args...); err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+func sqlPlaceholders(count int) string {
+	if count <= 0 {
+		return "NULL"
+	}
+	return strings.TrimSuffix(strings.Repeat("?,", count), ",")
 }
 
 func (r *TaskRepository) DeleteByMachineID(ctx context.Context, machineID string) error {

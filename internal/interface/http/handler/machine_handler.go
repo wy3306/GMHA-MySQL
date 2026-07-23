@@ -99,7 +99,7 @@ type assignClusterMembersRequest struct {
 func (h *MachineHandler) HandleMachines(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		items, err := h.service.ListMachines(r.Context())
+		items, err := h.service.ListMachineViews(r.Context())
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -646,7 +646,7 @@ func (h *MachineHandler) HandleClusterMachines(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusBadRequest, errors.New("cluster name is required"))
 		return
 	}
-	items, err := h.service.ListMachines(r.Context())
+	items, err := h.service.ListMachineViews(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return

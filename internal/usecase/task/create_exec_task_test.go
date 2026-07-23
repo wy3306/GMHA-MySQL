@@ -12,7 +12,10 @@ import (
 
 type execMachineRepo struct{ machine machinedomain.Machine }
 
-func (r execMachineRepo) GetByIP(context.Context, string) (machinedomain.Machine, bool, error) {
+func (r execMachineRepo) GetByIP(_ context.Context, ip string) (machinedomain.Machine, bool, error) {
+	if r.machine.IP != ip {
+		return machinedomain.Machine{}, false, nil
+	}
 	return r.machine, true, nil
 }
 func (r execMachineRepo) List(context.Context) ([]machinedomain.Machine, error) {
@@ -49,6 +52,22 @@ func TestCreateExecTaskPreservesDatabaseOperationMetadata(t *testing.T) {
 	}
 	if len(result.Events) != 1 || result.Events[0].Content != "采集 MySQL 运行数据任务已创建" {
 		t.Fatalf("unexpected task event: %+v", result.Events)
+	}
+}
+
+func TestCreateExecTaskResolvesMachineID(t *testing.T) {
+	machine := machinedomain.Machine{ID: "machine-db315bd06bd5de65", Name: "db-primary", IP: "10.0.0.8"}
+	agent := agentdomain.Agent{ID: "agent-1", MachineID: machine.ID, State: agentdomain.StateOnline}
+	usecase := NewCreateExecTaskUsecase(execMachineRepo{machine: machine}, execAgentRepo{agent: agent})
+
+	result, err := usecase.Execute(context.Background(), CreateExecTaskRequest{
+		Machine: machine.ID, Command: "agent-native-stack-sampling", TaskType: taskdomain.TypeFlameGraph,
+	})
+	if err != nil {
+		t.Fatalf("Execute() with machine ID error = %v", err)
+	}
+	if result.Task.MachineID != machine.ID {
+		t.Fatalf("task machine ID = %q, want %q", result.Task.MachineID, machine.ID)
 	}
 }
 

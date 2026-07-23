@@ -111,7 +111,7 @@ func platformOperationMetadata(method, path string) (string, string, string) {
 	labels := []struct{ fragment, label string }{
 		{"upgrades/manager", "升级 Manager"}, {"upgrades/agent", "按版本升级 Agent"},
 		{"retry-install", "重试安装 Agent"}, {"repair-mysql-config", "修复 Agent MySQL 配置"}, {"agents/upgrade", "升级 Agent"}, {"agents/uninstall", "卸载 Agent"}, {"agents/recover", "恢复 Agent"},
-		{"mysql-install", "部署 MySQL"}, {"mysql-uninstall", "卸载 MySQL"}, {"mysql-upgrade", "升级 MySQL"}, {"mysql-parameters", "维护 MySQL 参数"}, {"mysql-topology", "调整 MySQL 拓扑"},
+		{"mysql-install", "部署 MySQL"}, {"mysql-uninstall", "卸载 MySQL"}, {"mysql-cluster-upgrade", "MySQL 集群滚动升级"}, {"mysql-upgrade", "升级 MySQL"}, {"mysql-parameters", "维护 MySQL 参数"}, {"mysql-topology", "调整 MySQL 拓扑"},
 		{"backup", "备份与恢复操作"}, {"architecture", "调整集群架构"}, {"failover", "集群故障切换"}, {"/vip/", "维护集群 VIP"},
 		{"machines", "维护机器资源"}, {"ssh-credentials", "维护 SSH 凭证"}, {"clusters", "维护集群"}, {"packages", "维护安装包"},
 		{"manager", "维护 Manager"}, {"dynamic-collect", "维护动态采集配置"}, {"account-presets", "维护 MySQL 账号预设"}, {"mysql/instances", "维护 MySQL 实例"},
@@ -178,6 +178,9 @@ func isTrackableTaskID(value string) bool {
 		return true
 	}
 	if strings.HasPrefix(value, "arch-run-") {
+		return true
+	}
+	if strings.HasPrefix(value, "cluster-upgrade-") {
 		return true
 	}
 	if strings.HasPrefix(value, "batch-task-") || strings.HasPrefix(value, "cluster-bootstrap-") {

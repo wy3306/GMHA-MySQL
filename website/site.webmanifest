@@ -1,0 +1,17 @@
+{
+  "name": "GMHA — Go MySQL High Availability",
+  "short_name": "GMHA",
+  "description": "Go 原生的 MySQL 高可用管理平台",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#07111f",
+  "theme_color": "#07111f",
+  "icons": [
+    {
+      "src": "/gmha-mark.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
