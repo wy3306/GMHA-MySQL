@@ -16,6 +16,24 @@ test('AI prompt sends on Enter while preserving IME and multiline input', () => 
   assert.match(source, /Shift \+ Enter 换行/)
 })
 
+test('AI conversations support durable selection, new chat, archive and restore', () => {
+  assert.match(source, /window\.localStorage\.getItem\('gmha\.ai\.session_id'\)/)
+  assert.match(source, /legacyConversationSessions/)
+  assert.match(source, /\(item\.session_id \|\| 'default'\) === sessionID\.value/)
+  assert.match(source, /if \(!hasSessionAPI\) loaded\.sessions = legacyConversationSessions/)
+  assert.match(source, /会话服务尚未加载。当前对话已保留/)
+  assert.match(source, /body: JSON\.stringify\(\{ session_id: sessionID\.value/)
+  assert.match(source, /request\('\/sessions', \{ method: 'POST'/)
+  assert.match(source, /request\('\/sessions\/archive'/)
+  assert.match(source, /request\('\/sessions\/restore'/)
+  assert.match(source, /:class="\{active:item\.id===sessionID\}"/)
+  assert.match(source, /class="mobile-session-action"/)
+  assert.match(source, /已归档 ·/)
+  assert.match(source, /浏览器每次只发送新消息/)
+  assert.match(styles, /\.ai-session-panel/)
+  assert.match(styles, /\.ai-copilot\.withPlan\{grid-template-columns:260px minmax\(520px,1fr\) minmax\(430px,25vw\)\}/)
+})
+
 test('AI high-risk plans open beside the chat and remain readable', () => {
   assert.match(source, /reviewPlan.*approval_required.*blocked/)
   assert.match(source, /selectChatPlan\(reviewPlan\)/)

@@ -236,6 +236,7 @@ export const manualDeepDive = {
     ['读取活动告警与机器摘要', '构造脱敏运维上下文和系统约束', '调用选定模型', '解析 answer/findings/plans', '过滤非白名单或无目标计划', '按固定目录赋予风险与 30 分钟有效期', '审批或精确确认', '创建标准任务并保存审计'],
     [
       ['模型接入与密钥', '支持 OpenAI 兼容 chat/completions 与 Anthropic messages；远程地址必须 HTTPS，仅 localhost/loopback 可用 HTTP。API key 用本机 32 字节密钥和 AES-256-GCM 加密，返回时只显示掩码。'],
+      ['分层会话记忆', '浏览器每轮只发送新增消息和稳定 session_id。Manager 持久化会话、滚动摘要、待确认项及服务端校验的当前意图，并附加最近 16 条、最多 24000 字符的同会话原文；归档只隐藏对话，新建对话隔离上下文，恢复后可继续。'],
       ['最小上下文', '模型上下文只包含告警摘要、最多 50 条 firing 事件及机器 ID、名称、IP、集群、状态和截断错误，不把 SSH/MySQL 密码发送给模型。HTTP 调用超时 45 秒，响应最多读取 2 MiB。'],
       ['服务端动作与 API 目录', 'GET /ai/capabilities 返回固定 actions 和完整 cluster_endpoints。集群登记、成员、VIP、架构、立即备份、滚动升级、批量卸载与清理都映射到真实应用服务；未知动作或空 target_id 被丢弃，每次最多接受 5 个计划，模型不能生成任意 shell。'],
       ['风险不可由模型决定', '风险来自 Manager 固定目录：只读诊断/VIP 复检为 low，元数据与立即备份为 medium，VIP/架构为 high，卸载、滚动升级和清理为 critical；模型给出的风险字段不会覆盖服务端分类。'],

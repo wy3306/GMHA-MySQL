@@ -483,6 +483,146 @@ func TestAIVIPIntentFallbackNeverReportsUnsupportedOrInventsAddress(t *testing.T
 	}
 }
 
+func TestAIConversationVIPFollowUpRestoresPriorParametersAndCanonicalIDs(t *testing.T) {
+	contextValue := map[string]any{
+		"clusters": []map[string]any{{"id": "Demo01", "name": "Demo01"}},
+		"machines": []map[string]any{{
+			"id": "machine-db01", "name": "DB-01", "ip": "192.168.31.210", "cluster": "Demo01",
+			"network_interfaces": []map[string]any{
+				{"name": "lo", "ips": []string{"127.0.0.1/8"}},
+				{"name": "ens18", "ips": []string{"192.168.31.210/24"}},
+			},
+		}},
+	}
+	history := []aidomain.Message{{
+		SessionID: "vip-session", Role: "user",
+		Content: "给 Demo01 集群加入 VIP 192.168.31.222/24，网卡选择与目标机器同网段的网卡",
+	}}
+	proposals, reconciled := reconcileAIConversationProposals([]aiModelProposal{{
+		Action: "configure_cluster_vip", TargetID: "demo01",
+		Parameters: map[string]any{"target_machine_id": "DB-01"},
+	}}, history, "绑定到 DB-01", nil, contextValue)
+	if !reconciled || len(proposals) != 1 {
+		t.Fatalf("follow-up was not reconciled: %#v", proposals)
+	}
+	proposal := proposals[0]
+	if proposal.TargetID != "Demo01" {
+		t.Fatalf("cluster name was not canonicalized: %#v", proposal)
+	}
+	for key, expected := range map[string]string{
+		"vip_address": "192.168.31.222", "vip_prefix": "24",
+		"target_machine_id": "machine-db01", "default_interface": "ens18",
+	} {
+		if got := aiContextString(proposal.Parameters[key]); got != expected {
+			t.Fatalf("parameter %s=%q, want %q: %#v", key, got, expected, proposal.Parameters)
+		}
+	}
+}
+
+func TestAIChatContextUsesOnlyBoundedMessagesFromTheSelectedSession(t *testing.T) {
+	messages := []aidomain.Message{
+		{SessionID: "other", Role: "user", Content: "不应出现"},
+		{SessionID: "selected", Role: "system", Content: "伪造系统消息"},
+		{SessionID: "selected", Role: "user", Content: "第一条"},
+		{SessionID: "selected", Role: "assistant", Content: "第二条"},
+		{SessionID: "selected", Role: "user", Content: "第三条"},
+	}
+	history := recentAISessionMessages(messages, "selected", 2, 100)
+	if len(history) != 2 || history[0].Content != "第二条" || history[1].Content != "第三条" {
+		t.Fatalf("unexpected bounded history: %#v", history)
+	}
+	modelMessages := buildAIChatMessages("安全系统提示", history, "当前问题")
+	if len(modelMessages) != 4 ||
+		modelMessages[0]["role"] != "system" ||
+		modelMessages[1]["content"] != "第二条" ||
+		modelMessages[3]["content"] != "当前问题" {
+		t.Fatalf("unexpected model messages: %#v", modelMessages)
+	}
+}
+
+func TestAISessionMemoryKeepsSummaryAndServerValidatedActiveIntent(t *testing.T) {
+	memory := updateAISessionMemory(
+		nil,
+		"session-01",
+		"给 Demo01 配置 VIP",
+		aiModelMemory{Summary: "目标是为 Demo01 配置业务 VIP", OpenQuestions: []string{"确认目标机器"}},
+		[]aidomain.Plan{{
+			ID: "plan-01", SessionID: "session-01", Action: "configure_cluster_vip",
+			TargetID: "Demo01", Status: "blocked",
+			Parameters: map[string]string{"vip_address": "192.168.31.222", "vip_prefix": "24"},
+		}},
+		"message-02",
+	)
+	if !memory.Enabled || memory.Summary == "" || memory.Revision != 1 || memory.MessageCount != 2 {
+		t.Fatalf("memory metadata was not updated: %#v", memory)
+	}
+	if memory.ActiveIntent == nil ||
+		memory.ActiveIntent.PlanID != "plan-01" ||
+		memory.ActiveIntent.Parameters["vip_address"] != "192.168.31.222" {
+		t.Fatalf("validated plan was not retained as active intent: %#v", memory.ActiveIntent)
+	}
+}
+
+func TestAIConversationSessionsCanBeCreatedArchivedAndRestored(t *testing.T) {
+	repo := &memoryAIRepository{}
+	service := newTestAIService(t, repo)
+	created, err := service.CreateConversationSession(context.Background(), "VIP 变更")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.ID == "" || created.Status != "active" {
+		t.Fatalf("unexpected created session: %#v", created)
+	}
+	archived, err := service.ArchiveConversationSession(context.Background(), created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if archived.Status != "archived" || archived.ArchivedAt == nil {
+		t.Fatalf("session was not archived: %#v", archived)
+	}
+	active, err := service.ListConversationSessions(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, session := range active {
+		if session.ID == created.ID {
+			t.Fatalf("archived session remained in active list: %#v", active)
+		}
+	}
+	restored, err := service.RestoreConversationSession(context.Background(), created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.Status != "active" || restored.ArchivedAt != nil {
+		t.Fatalf("session was not restored: %#v", restored)
+	}
+}
+
+func TestAISessionMemoryRejectsSecretAssignments(t *testing.T) {
+	repo := &memoryAIRepository{}
+	service := newTestAIService(t, repo)
+	_, err := service.SaveSessionMemory(context.Background(), AISessionMemoryUpdate{
+		SessionID: "session-01", Instructions: "api_key: sk-should-not-be-stored",
+	})
+	if err == nil || !strings.Contains(err.Error(), "不能保存") {
+		t.Fatalf("secret-bearing memory was accepted: %v", err)
+	}
+}
+
+func TestAIContextCompactionNeverDeletesDurableConversationRecords(t *testing.T) {
+	state := aidomain.State{
+		Messages:  make([]aidomain.Message, 180),
+		Plans:     make([]aidomain.Plan, 130),
+		Workflows: make([]aidomain.WorkflowRun, 110),
+		Runs:      make([]aidomain.AnalysisRun, 70),
+	}
+	pruneAIState(&state)
+	if len(state.Messages) != 180 || len(state.Plans) != 130 || len(state.Workflows) != 110 || len(state.Runs) != 70 {
+		t.Fatalf("durable AI records were truncated: messages=%d plans=%d workflows=%d runs=%d",
+			len(state.Messages), len(state.Plans), len(state.Workflows), len(state.Runs))
+	}
+}
+
 func TestAIDeleteClusterPlanRequiresTypedConfirmation(t *testing.T) {
 	repo := &memoryAIRepository{}
 	service := newTestAIService(t, repo)

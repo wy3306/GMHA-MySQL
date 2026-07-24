@@ -210,12 +210,112 @@ VIP 对应动作：
 
 AI 调用流程：
 
-1. `POST /ai/chat` 生成白名单计划。
+1. `POST /ai/chat` 生成白名单计划。客户端每轮只发送本次新增消息和稳定的 `session_id`，不需要重新提交完整对话。
 2. 服务端重新读取集群、机器、网卡、复制、VIP、备份、告警和活动任务。
 3. 中高风险计划在 UI 展示审批；高风险和极高风险还要求逐字确认短语。
 4. `POST /ai/plans/execute` 提交审批结果。
 5. Manager 调用内部应用服务执行，不允许模型生成 Shell、SQL 或任意 URL。
 6. 任务状态和实机后置条件通过后，计划才标记成功。
+
+### 7.1 会话与记忆
+
+Manager 采用与 Claude Code 类似的分层记忆方式，但按生产运维安全边界做了收紧：
+
+- `sessions`：服务端持久化对话标识和完整原始消息。新建对话拥有独立上下文；归档只隐藏对话，不删除消息、计划、记忆和审计。模型上下文压缩不会触发原始记录清理。
+- `recent messages`：每轮加载同一会话最近 16 条、最多 24000 个字符的用户/助手原文，不会混入其他会话。
+- `rolling summary`：模型每轮返回简洁的目标、约束、决定、进度和待确认项，Manager 按会话保存；较早原文不必在每轮重复发送。
+- `validated active intent`：当前动作、目标和参数来自服务端已校验计划，独立于模型摘要保存。VIP 地址等执行关键值不会只凭模型记忆进入执行。
+- `instructions`：用户可为会话保存长期说明；密码、Token、API Key、私钥等赋值会被拒绝。
+
+会话接口：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/ai/sessions?include_archived=true` | 查询活动及可选的已归档对话 |
+| POST | `/ai/sessions` | 新建独立对话 |
+| POST | `/ai/sessions/archive` | 归档对话，保留完整审计 |
+| POST | `/ai/sessions/restore` | 恢复已归档对话 |
+| GET | `/ai/memory?session_id={id}` | 查看会话滚动摘要、待确认项和当前受控意图 |
+| PUT | `/ai/memory` | 更新会话长期说明或启停自动记忆 |
+| DELETE | `/ai/memory?session_id={id}` | 清除摘要和会话说明，不删除原始消息或审计 |
+
+新建对话：
+
+```http
+POST /api/v1/ai/sessions
+Content-Type: application/json
+
+{"title":"Demo01 VIP 变更"}
+```
+
+返回的 `id` 用于后续聊天：
+
+```http
+POST /api/v1/ai/chat
+Content-Type: application/json
+
+{
+  "session_id": "session-01",
+  "message": "给 Demo01 集群加入 VIP 192.168.31.222/24"
+}
+```
+
+归档：
+
+```http
+POST /api/v1/ai/sessions/archive
+Content-Type: application/json
+
+{"id":"session-01"}
+```
+
+查看或维护记忆：
+
+```http
+GET /api/v1/ai/memory?session_id=session-01
+```
+
+```http
+PUT /api/v1/ai/memory
+Content-Type: application/json
+
+{
+  "session_id": "session-01",
+  "enabled": true,
+  "instructions": "变更方案优先使用业务网卡；任何高风险动作都先展示影响范围"
+}
+```
+
+连续对话中的参数按以下规则处理：
+
+- 新消息中明确给出的值优先；缺失值可从该会话上一条待处理计划和近期用户消息中继承。
+- 机器名称、管理 IP 或机器 ID 只有唯一匹配时才转换成实际 `machine id`。
+- 用户要求“选择同网段网卡”时，只有目标机器上恰好一个网卡与明确给出的 VIP/前缀同网段，Manager 才会自动选择；零个或多个匹配均保持阻断并要求确认。
+- VIP 地址不会由模型或 Manager 猜测。它必须来自本会话中用户明确提供的 IPv4 地址、已登记 VIP，或受信任的网络规划数据。
+
+例如可以分两轮提交，第二轮会继承第一轮的 VIP 和集群：
+
+```http
+POST /api/v1/ai/chat
+Content-Type: application/json
+
+{
+  "session_id": "vip-demo01",
+  "message": "给 Demo01 集群加入 VIP 192.168.31.222/24，网卡选择与目标机器同网段的网卡"
+}
+```
+
+```http
+POST /api/v1/ai/chat
+Content-Type: application/json
+
+{
+  "session_id": "vip-demo01",
+  "message": "绑定到 DB-01"
+}
+```
+
+当 `DB-01` 在 `Demo01` 内唯一匹配，且其采集到的网卡中只有一个与 `192.168.31.222/24` 同网段时，生成的计划会包含完整的 `vip_address`、`vip_prefix`、`target_machine_id` 和 `default_interface`。若机器名或网卡匹配不唯一，计划状态为 `blocked`。
 
 示例：
 
@@ -224,7 +324,7 @@ POST /api/v1/ai/chat
 Content-Type: application/json
 
 {
-  "session_id": "default",
+  "session_id": "session-01",
   "provider_id": "provider-01",
   "message": "给 prod 集群绑定业务 VIP 10.0.0.100/24，目标 machine-01，网卡 eth0"
 }

@@ -8,7 +8,11 @@ const request = async (path = '', options = {}) => {
   const raw = await response.text()
   let payload = {}
   try { payload = raw ? JSON.parse(raw) : {} } catch (_) { payload = {} }
-  if (!response.ok) throw new Error(payload.error || raw || `请求失败（${response.status}）`)
+  if (!response.ok) {
+    const error = new Error(payload.error || raw || `请求失败（${response.status}）`)
+    error.status = response.status
+    throw error
+  }
   return payload
 }
 
@@ -26,6 +30,24 @@ const providerPresets = {
   custom: { name: '自定义兼容模型', base_url: 'https://', model: '' }
 }
 
+const legacyConversationSessions = messages => {
+  const groups = new Map()
+  for (const message of messages || []) {
+    const id = message.session_id || 'default'
+    const current = groups.get(id) || { id, title: '', status: 'active', message_count: 0, updated_at: message.created_at, legacy: true }
+    current.message_count += 1
+    current.updated_at = message.created_at || current.updated_at
+    if (!current.title && message.role === 'user') current.title = String(message.content || '').trim().slice(0, 28)
+    groups.set(id, current)
+  }
+  if (!groups.size) groups.set('default', { id: 'default', title: '默认对话', status: 'active', message_count: 0, legacy: true })
+  return [...groups.values()].map(item => ({ ...item, title: item.title || (item.id === 'default' ? '默认对话' : '历史对话') }))
+}
+
+const sessionAPIError = error => error?.status === 404
+  ? '会话服务尚未加载。当前对话已保留，请重启 Manager 后再使用新建或归档功能。'
+  : error.message
+
 export default {
   name: 'AIAutomation',
   setup() {
@@ -35,8 +57,9 @@ export default {
     const notice = ref('')
     const tab = ref('workspace')
     const overview = ref({
-      providers: [], settings: {}, messages: [], plans: [], workflows: [], runs: [], actions: [], stats: {}
+      providers: [], settings: {}, sessions: [], messages: [], memories: [], plans: [], workflows: [], runs: [], actions: [], stats: {}
     })
+    const sessionID = ref(window.localStorage.getItem('gmha.ai.session_id') || '')
     const prompt = ref('')
     const showProvider = ref(false)
     const providerForm = ref(emptyProvider())
@@ -55,17 +78,21 @@ export default {
     const defaultProvider = computed(() => (overview.value.providers || []).find(item => item.id === overview.value.settings.default_provider_id || item.is_default))
     const pendingPlans = computed(() => (overview.value.plans || []).filter(item => ['proposed', 'approval_required'].includes(item.status)))
     const recentPlans = computed(() => (overview.value.plans || []).slice(0, 12))
+    const activeSessions = computed(() => (overview.value.sessions || []).filter(item => item.status !== 'archived'))
+    const archivedSessions = computed(() => (overview.value.sessions || []).filter(item => item.status === 'archived'))
+    const currentSession = computed(() => activeSessions.value.find(item => item.id === sessionID.value) || null)
+    const currentMemory = computed(() => (overview.value.memories || []).find(item => item.session_id === sessionID.value) || null)
     const messages = computed(() => [
-      ...(overview.value.messages || []).filter(item => item.session_id === 'default'),
-      ...pendingUserMessages.value
+      ...(overview.value.messages || []).filter(item => (item.session_id || 'default') === sessionID.value),
+      ...pendingUserMessages.value.filter(item => item.session_id === sessionID.value)
     ])
     const activeProviderCount = computed(() => enabledProviders.value.length)
     const automationReady = computed(() => overview.value.settings.enabled && !!defaultProvider.value)
     const activeChatPlan = computed(() => {
       const plans = overview.value.plans || []
-      const selected = plans.find(plan => plan.id === chatPlanID.value)
+      const selected = plans.find(plan => plan.id === chatPlanID.value && (plan.session_id || 'default') === sessionID.value)
       if (selected) return selected
-      return plans.find(plan => plan.session_id === 'default' && ['proposed', 'approval_required'].includes(plan.status)) || null
+      return plans.find(plan => (plan.session_id || 'default') === sessionID.value && ['proposed', 'approval_required'].includes(plan.status)) || null
     })
     const activeChatWorkflow = computed(() => {
       if (!activeChatPlan.value?.workflow_id) return null
@@ -77,13 +104,89 @@ export default {
     async function load(silent = false) {
       if (!silent) loading.value = true
       try {
-        overview.value = await request()
+        const loaded = await request()
+        const hasSessionAPI = Array.isArray(loaded.sessions)
+        if (!hasSessionAPI) loaded.sessions = legacyConversationSessions(loaded.messages)
+        overview.value = loaded
+        let selected = activeSessions.value.find(item => item.id === sessionID.value)
+        if (!selected) selected = activeSessions.value[0]
+        if (!selected && hasSessionAPI) {
+          const created = await request('/sessions', { method: 'POST', body: JSON.stringify({ title: '新对话' }) })
+          overview.value.sessions = [created, ...(overview.value.sessions || [])]
+          selected = created
+        }
+        if (!selected) selected = legacyConversationSessions(overview.value.messages)[0]
+        sessionID.value = selected.id
+        window.localStorage.setItem('gmha.ai.session_id', selected.id)
         settingsDraft.value = JSON.parse(JSON.stringify(overview.value.settings || {}))
         error.value = ''
       } catch (err) {
-        error.value = err.message
+        error.value = sessionAPIError(err)
       } finally {
         loading.value = false
+      }
+    }
+
+    function switchConversation() {
+      window.localStorage.setItem('gmha.ai.session_id', sessionID.value)
+      pendingUserMessages.value = []
+      chatPlanID.value = ''
+      armedPlanID.value = ''
+      scrollChatBottom()
+    }
+
+    async function createConversation() {
+      if (busy.value) return
+      busy.value = 'session'
+      try {
+        const created = await request('/sessions', { method: 'POST', body: JSON.stringify({ title: '新对话' }) })
+        sessionID.value = created.id
+        window.localStorage.setItem('gmha.ai.session_id', created.id)
+        pendingUserMessages.value = []
+        chatPlanID.value = ''
+        await load(true)
+        await scrollChatBottom()
+        flash('已新建独立对话')
+      } catch (err) {
+        error.value = sessionAPIError(err)
+      } finally {
+        busy.value = ''
+      }
+    }
+
+    async function archiveConversation() {
+      if (!currentSession.value || busy.value) return
+      if (!window.confirm(`归档对话“${currentSession.value.title}”？消息、计划和审计记录会保留。`)) return
+      busy.value = 'session'
+      try {
+        await request('/sessions/archive', { method: 'POST', body: JSON.stringify({ id: sessionID.value }) })
+        sessionID.value = ''
+        pendingUserMessages.value = []
+        chatPlanID.value = ''
+        await load(true)
+        await scrollChatBottom()
+        flash('对话已归档')
+      } catch (err) {
+        error.value = sessionAPIError(err)
+      } finally {
+        busy.value = ''
+      }
+    }
+
+    async function restoreConversation(item) {
+      if (!item || busy.value) return
+      busy.value = 'session'
+      try {
+        await request('/sessions/restore', { method: 'POST', body: JSON.stringify({ id: item.id }) })
+        sessionID.value = item.id
+        window.localStorage.setItem('gmha.ai.session_id', item.id)
+        await load(true)
+        await scrollChatBottom()
+        flash('已恢复归档对话')
+      } catch (err) {
+        error.value = sessionAPIError(err)
+      } finally {
+        busy.value = ''
       }
     }
 
@@ -166,14 +269,14 @@ export default {
       error.value = ''
       const optimisticID = `local-${Date.now()}`
       pendingUserMessages.value.push({
-        id: optimisticID, session_id: 'default', role: 'user', content,
+        id: optimisticID, session_id: sessionID.value, role: 'user', content,
         created_at: new Date().toISOString(), pending: true
       })
       await scrollChatBottom()
       try {
         const result = await request('/chat', {
           method: 'POST',
-          body: JSON.stringify({ session_id: 'default', provider_id: defaultProvider.value?.id || '', message: content })
+          body: JSON.stringify({ session_id: sessionID.value, provider_id: defaultProvider.value?.id || '', message: content })
         })
         pendingUserMessages.value = pendingUserMessages.value.filter(item => item.id !== optimisticID)
         await load(true)
@@ -394,11 +497,12 @@ export default {
     })
 
     return {
-      loading, busy, error, notice, tab, overview, prompt, showProvider, providerForm, approvalPlan, chatPlanID, armedPlanID, chatStream, pendingUserMessages,
+      loading, busy, error, notice, tab, overview, prompt, showProvider, providerForm, approvalPlan, chatPlanID, armedPlanID, chatStream, pendingUserMessages, sessionID,
       confirmation, mediumApproved, settingsDraft, enabledProviders, defaultProvider, pendingPlans,
-      recentPlans, messages, activeProviderCount, automationReady, activeChatPlan, activeChatWorkflow, highRiskPlan, canConfirm,
+      recentPlans, messages, activeSessions, archivedSessions, currentSession, currentMemory, activeProviderCount, automationReady, activeChatPlan, activeChatWorkflow, highRiskPlan, canConfirm,
       load, choosePreset, openProvider, saveProvider, testProvider, removeProvider, saveSettings,
       sendPrompt, analyzeNow, requestExecution, executePlan, rejectPlan, pauseWorkflow, resumeWorkflow, toggleAction,
+      switchConversation, createConversation, archiveConversation, restoreConversation,
       handlePromptKeydown, scrollChatBottom, pollExecution, planForMessage, selectChatPlan, closeChatPlan, canConfirmPlan, requestPlanExecution,
       providerLabel, riskLabel, statusLabel, operationStatusLabel, phaseLabel, date, shortDate, actionAllowed
     }
@@ -499,17 +603,21 @@ export default {
         <section :class="['ai-copilot',{withPlan:activeChatPlan}]">
           <aside class="ai-copilot-context">
             <div class="ai-copilot-brand"><span>✦</span><div><b>GMHA Copilot</b><small>{{ defaultProvider?.model || '尚未配置模型' }}</small></div><i :class="{online:defaultProvider}"></i></div>
-            <h4>可以这样问</h4>
-            <button @click="sendPrompt('分析当前所有活动告警，按影响范围和紧急程度排序。')"><span>01</span>分析当前活动告警</button>
-            <button @click="sendPrompt('哪些机器存在容量或稳定性风险？请给出判断证据。')"><span>02</span>识别容量与稳定性风险</button>
-            <button @click="sendPrompt('检查 Agent 离线问题，生成安全的修复计划。')"><span>03</span>生成 Agent 修复计划</button>
-            <div class="ai-context-note"><i>⌾</i><p><b>已自动附加平台上下文</b><small>活动告警、机器状态、MySQL 实例、集群归属与进行中任务。凭据和敏感配置不会发送给模型。</small></p></div>
+            <section class="ai-session-panel">
+              <header><div><b>对话</b><small>{{ activeSessions.length }} 个进行中</small></div><button type="button" @click="createConversation" :disabled="busy==='session'">＋ 新对话</button></header>
+              <nav>
+                <button v-for="item in activeSessions" :key="item.id" type="button" :class="{active:item.id===sessionID}" @click="sessionID=item.id;switchConversation()"><span><b>{{ item.title }}</b><small>{{ item.message_count }} 条消息</small></span><i>›</i></button>
+              </nav>
+              <details v-if="archivedSessions.length"><summary>已归档 · {{ archivedSessions.length }}</summary><button v-for="item in archivedSessions" :key="item.id" type="button" @click="restoreConversation(item)"><span><b>{{ item.title }}</b><small>点击恢复</small></span><i>↗</i></button></details>
+            </section>
+            <div class="ai-context-note"><i>⌾</i><p><b>会话记忆{{ currentMemory?.enabled===false ? '已关闭' : '已启用' }}</b><small>服务端保留滚动摘要、近期原文和当前受控计划；浏览器每次只发送新消息。凭据不会进入记忆。</small></p></div>
           </aside>
           <main>
-            <header><div><h3>AI 运维助手</h3><p>自然语言分析平台状态，变更计划仍受安全闸门约束。</p></div><span>{{ messages.length }} 条消息</span></header>
+            <header><div><h3>{{ currentSession?.title || 'AI 运维助手' }}</h3><p>自然语言分析平台状态，变更计划仍受安全闸门约束。</p></div><div class="ai-chat-head-tools"><select class="mobile-session-action" v-model="sessionID" @change="switchConversation"><option v-for="item in activeSessions" :key="item.id" :value="item.id">{{ item.title }}</option></select><button class="mobile-session-action" type="button" @click="createConversation">＋ 新建</button><button type="button" @click="archiveConversation" :disabled="!currentSession || busy==='session'">归档当前对话</button><span>{{ messages.length }} 条消息</span></div></header>
             <div ref="chatStream" class="ai-chat-stream">
               <section v-if="!messages.length" class="ai-chat-welcome">
                 <div>✦</div><h3>从一个运维问题开始</h3><p>我会读取 GMHA 当前的监控与告警上下文，说明证据，并在需要时生成可审批的修复计划。</p>
+                <nav><button @click="sendPrompt('分析当前所有活动告警，按影响范围和紧急程度排序。')">分析活动告警</button><button @click="sendPrompt('哪些机器存在容量或稳定性风险？请给出判断证据。')">识别容量风险</button><button @click="sendPrompt('检查 Agent 离线问题，生成安全的修复计划。')">检查 Agent</button></nav>
               </section>
               <article v-for="message in messages" :key="message.id" :class="['ai-message',message.role,{pending:message.pending}]">
                 <div>{{ message.role==='assistant' ? '✦' : '你' }}</div>

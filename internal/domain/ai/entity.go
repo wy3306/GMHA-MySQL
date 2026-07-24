@@ -55,6 +55,44 @@ type Message struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+type ConversationSession struct {
+	ID            string     `json:"id"`
+	Title         string     `json:"title"`
+	Status        string     `json:"status"`
+	MessageCount  int        `json:"message_count"`
+	LastMessageAt *time.Time `json:"last_message_at,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+	ArchivedAt    *time.Time `json:"archived_at,omitempty"`
+}
+
+// SessionMemory is the durable, compact context for one AI conversation.
+// Summary and OpenQuestions are model-authored navigation aids only.
+// ActiveIntent is populated from server-validated plans so execution-critical
+// parameters never depend solely on a generated summary.
+type SessionMemory struct {
+	SessionID     string        `json:"session_id"`
+	Enabled       bool          `json:"enabled"`
+	Instructions  string        `json:"instructions,omitempty"`
+	Summary       string        `json:"summary,omitempty"`
+	OpenQuestions []string      `json:"open_questions,omitempty"`
+	ActiveIntent  *MemoryIntent `json:"active_intent,omitempty"`
+	LastMessageID string        `json:"last_message_id,omitempty"`
+	MessageCount  int           `json:"message_count"`
+	Revision      int           `json:"revision"`
+	UpdatedAt     time.Time     `json:"updated_at"`
+}
+
+type MemoryIntent struct {
+	Action     string            `json:"action"`
+	TargetID   string            `json:"target_id,omitempty"`
+	TargetName string            `json:"target_name,omitempty"`
+	Parameters map[string]string `json:"parameters,omitempty"`
+	PlanID     string            `json:"plan_id,omitempty"`
+	Status     string            `json:"status,omitempty"`
+	UpdatedAt  time.Time         `json:"updated_at"`
+}
+
 // PlanStep makes an AI proposal reviewable as an operations workflow instead
 // of presenting one opaque action. The server may replace model-authored steps
 // with authoritative preflight, execution, verification and recovery steps.
@@ -180,12 +218,14 @@ type AnalysisRun struct {
 }
 
 type State struct {
-	Providers []Provider    `json:"providers"`
-	Settings  Settings      `json:"settings"`
-	Messages  []Message     `json:"messages"`
-	Plans     []Plan        `json:"plans"`
-	Workflows []WorkflowRun `json:"workflows"`
-	Runs      []AnalysisRun `json:"runs"`
+	Providers []Provider            `json:"providers"`
+	Settings  Settings              `json:"settings"`
+	Sessions  []ConversationSession `json:"sessions,omitempty"`
+	Messages  []Message             `json:"messages"`
+	Memories  []SessionMemory       `json:"memories,omitempty"`
+	Plans     []Plan                `json:"plans"`
+	Workflows []WorkflowRun         `json:"workflows"`
+	Runs      []AnalysisRun         `json:"runs"`
 }
 
 type Repository interface {

@@ -10,10 +10,10 @@ Release 程序包提供独立的 `gmha-web` 启动器。执行 `./start-web.sh` 
 本地构建 Linux x86_64 程序包：
 
 ```bash
-./scripts/build-release.sh V0.0.2
+./scripts/build-release.sh V0.0.3
 ```
 
-构建结果位于 `dist/gmha-V0.0.2-linux-amd64.tar.gz`，并同时生成 SHA-256 校验文件。
+构建结果位于 `dist/gmha-V0.0.3-linux-amd64.tar.gz`，并同时生成 SHA-256 校验文件。
 
 ## 数据库配置
 

@@ -2,7 +2,7 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-VERSION=${1:-V0.0.2}
+VERSION=${1:-V0.0.3}
 EMBED_VERSION=$(printf '%s' "$VERSION" | sed 's/^v/V/')
 NAME="gmha-${VERSION}-linux-amd64"
 PACKAGE="$ROOT/dist/$NAME"

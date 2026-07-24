@@ -2,7 +2,7 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-VERSION=${1:-V0.0.2}
+VERSION=${1:-V0.0.3}
 ARCH=${2:-amd64}
 PERF_PACKAGES=${3:-}
 OUTPUT=${4:-"$ROOT/dist/gmha-flamegraph-${VERSION}-linux-${ARCH}-offline.tar.gz"}

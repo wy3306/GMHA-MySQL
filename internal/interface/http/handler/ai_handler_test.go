@@ -27,6 +27,12 @@ func TestAICapabilitiesCanBeDiscoveredWithoutWorkbenchState(t *testing.T) {
 			AIActionID          string   `json:"ai_action_id"`
 			SensitiveParameters []string `json:"sensitive_parameters"`
 		} `json:"cluster_endpoints"`
+		ConversationMemory struct {
+			SessionScoped         bool     `json:"session_scoped"`
+			RollingSummary        bool     `json:"rolling_summary"`
+			ValidatedActiveIntent bool     `json:"validated_active_intent"`
+			Endpoints             []string `json:"endpoints"`
+		} `json:"conversation_memory"`
 		SecurityBoundary string `json:"security_boundary"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
@@ -64,6 +70,12 @@ func TestAICapabilitiesCanBeDiscoveredWithoutWorkbenchState(t *testing.T) {
 	}
 	if payload.SecurityBoundary == "" {
 		t.Fatal("capability response omitted the secure-input boundary")
+	}
+	if !payload.ConversationMemory.SessionScoped ||
+		!payload.ConversationMemory.RollingSummary ||
+		!payload.ConversationMemory.ValidatedActiveIntent ||
+		len(payload.ConversationMemory.Endpoints) == 0 {
+		t.Fatalf("conversation memory contract is incomplete: %#v", payload.ConversationMemory)
 	}
 }
 

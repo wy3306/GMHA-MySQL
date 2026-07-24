@@ -205,14 +205,16 @@ type AIService struct {
 }
 
 type AIOverview struct {
-	Providers []aidomain.Provider    `json:"providers"`
-	Settings  aidomain.Settings      `json:"settings"`
-	Messages  []aidomain.Message     `json:"messages"`
-	Plans     []aidomain.Plan        `json:"plans"`
-	Workflows []aidomain.WorkflowRun `json:"workflows"`
-	Runs      []aidomain.AnalysisRun `json:"runs"`
-	Actions   []AIActionDefinition   `json:"actions"`
-	Stats     map[string]int         `json:"stats"`
+	Providers []aidomain.Provider            `json:"providers"`
+	Settings  aidomain.Settings              `json:"settings"`
+	Sessions  []aidomain.ConversationSession `json:"sessions"`
+	Messages  []aidomain.Message             `json:"messages"`
+	Memories  []aidomain.SessionMemory       `json:"memories"`
+	Plans     []aidomain.Plan                `json:"plans"`
+	Workflows []aidomain.WorkflowRun         `json:"workflows"`
+	Runs      []aidomain.AnalysisRun         `json:"runs"`
+	Actions   []AIActionDefinition           `json:"actions"`
+	Stats     map[string]int                 `json:"stats"`
 }
 
 type AIChatResult struct {
@@ -241,6 +243,18 @@ type aiModelOutput struct {
 	Summary  string             `json:"summary"`
 	Findings []aidomain.Finding `json:"findings"`
 	Plans    []aiModelProposal  `json:"plans"`
+	Memory   aiModelMemory      `json:"memory"`
+}
+
+type aiModelMemory struct {
+	Summary       string   `json:"summary"`
+	OpenQuestions []string `json:"open_questions"`
+}
+
+type AISessionMemoryUpdate struct {
+	SessionID    string `json:"session_id"`
+	Instructions string `json:"instructions"`
+	Enabled      *bool  `json:"enabled,omitempty"`
 }
 
 type aiClusterDeletionImpact struct {
@@ -418,6 +432,7 @@ func (s *AIService) ensureDefaults(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	ensureAIConversationSessions(&state)
 	if state.Settings.AnalysisIntervalMinutes <= 0 {
 		state.Settings = aidomain.Settings{
 			AnalysisIntervalMinutes: 15,
@@ -441,6 +456,60 @@ func (s *AIService) ensureDefaults(ctx context.Context) error {
 	}
 	refreshPendingAIPlanRisks(&state)
 	return s.repo.Save(ctx, state)
+}
+
+func ensureAIConversationSessions(state *aidomain.State) {
+	existing := make(map[string]bool, len(state.Sessions))
+	for _, session := range state.Sessions {
+		if strings.TrimSpace(session.ID) != "" {
+			existing[session.ID] = true
+		}
+	}
+	observed := make(map[string]time.Time)
+	for _, message := range state.Messages {
+		sessionID := firstNonEmptyAI(strings.TrimSpace(message.SessionID), "default")
+		if message.CreatedAt.After(observed[sessionID]) {
+			observed[sessionID] = message.CreatedAt
+		}
+	}
+	for _, plan := range state.Plans {
+		sessionID := strings.TrimSpace(plan.SessionID)
+		if sessionID != "" {
+			if plan.CreatedAt.After(observed[sessionID]) {
+				observed[sessionID] = plan.CreatedAt
+			}
+		}
+	}
+	if len(observed) == 0 && len(state.Sessions) == 0 {
+		observed["default"] = time.Now().UTC()
+	}
+	for sessionID, updatedAt := range observed {
+		if existing[sessionID] {
+			continue
+		}
+		if updatedAt.IsZero() {
+			updatedAt = time.Now().UTC()
+		}
+		count := 0
+		for _, message := range state.Messages {
+			if firstNonEmptyAI(message.SessionID, "default") == sessionID {
+				count++
+			}
+		}
+		lastMessageAt := updatedAt
+		state.Sessions = append(state.Sessions, aidomain.ConversationSession{
+			ID: sessionID, Title: legacyAIConversationTitle(sessionID), Status: "active",
+			MessageCount: count, LastMessageAt: &lastMessageAt,
+			CreatedAt: updatedAt, UpdatedAt: updatedAt,
+		})
+	}
+}
+
+func legacyAIConversationTitle(sessionID string) string {
+	if sessionID == "default" {
+		return "默认对话"
+	}
+	return "历史对话"
 }
 
 func refreshPendingAIPlanRisks(state *aidomain.State) {
@@ -566,8 +635,14 @@ func (s *AIService) Overview(ctx context.Context) (AIOverview, error) {
 	if state.Providers == nil {
 		state.Providers = []aidomain.Provider{}
 	}
+	if state.Sessions == nil {
+		state.Sessions = []aidomain.ConversationSession{}
+	}
 	if state.Messages == nil {
 		state.Messages = []aidomain.Message{}
+	}
+	if state.Memories == nil {
+		state.Memories = []aidomain.SessionMemory{}
 	}
 	if state.Plans == nil {
 		state.Plans = []aidomain.Plan{}
@@ -600,7 +675,166 @@ func (s *AIService) Overview(ctx context.Context) (AIOverview, error) {
 			stats["failed_runs"]++
 		}
 	}
-	return AIOverview{Providers: state.Providers, Settings: state.Settings, Messages: state.Messages, Plans: state.Plans, Workflows: state.Workflows, Runs: state.Runs, Actions: aiActionCatalog, Stats: stats}, nil
+	return AIOverview{
+		Providers: state.Providers, Settings: state.Settings, Sessions: state.Sessions,
+		Messages: state.Messages, Memories: state.Memories,
+		Plans: state.Plans, Workflows: state.Workflows, Runs: state.Runs, Actions: aiActionCatalog, Stats: stats,
+	}, nil
+}
+
+func (s *AIService) CreateConversationSession(ctx context.Context, title string) (aidomain.ConversationSession, error) {
+	title = compactAIRunes(strings.TrimSpace(title), 80)
+	if title == "" {
+		title = "新对话"
+	}
+	now := time.Now().UTC()
+	session := aidomain.ConversationSession{
+		ID: newAIID("session"), Title: title, Status: "active",
+		CreatedAt: now, UpdatedAt: now,
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, err := s.repo.Load(ctx)
+	if err != nil {
+		return aidomain.ConversationSession{}, err
+	}
+	state.Sessions = append([]aidomain.ConversationSession{session}, state.Sessions...)
+	if err := s.repo.Save(ctx, state); err != nil {
+		return aidomain.ConversationSession{}, err
+	}
+	return session, nil
+}
+
+func (s *AIService) ListConversationSessions(ctx context.Context, includeArchived bool) ([]aidomain.ConversationSession, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, err := s.repo.Load(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]aidomain.ConversationSession, 0, len(state.Sessions))
+	for _, session := range state.Sessions {
+		if !includeArchived && session.Status == "archived" {
+			continue
+		}
+		out = append(out, session)
+	}
+	return out, nil
+}
+
+func (s *AIService) ArchiveConversationSession(ctx context.Context, sessionID string) (aidomain.ConversationSession, error) {
+	return s.setConversationSessionArchived(ctx, sessionID, true)
+}
+
+func (s *AIService) RestoreConversationSession(ctx context.Context, sessionID string) (aidomain.ConversationSession, error) {
+	return s.setConversationSessionArchived(ctx, sessionID, false)
+}
+
+func (s *AIService) setConversationSessionArchived(ctx context.Context, sessionID string, archived bool) (aidomain.ConversationSession, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return aidomain.ConversationSession{}, errors.New("会话 ID 不能为空")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, err := s.repo.Load(ctx)
+	if err != nil {
+		return aidomain.ConversationSession{}, err
+	}
+	for index := range state.Sessions {
+		if state.Sessions[index].ID != sessionID {
+			continue
+		}
+		now := time.Now().UTC()
+		state.Sessions[index].UpdatedAt = now
+		state.Sessions[index].ArchivedAt = nil
+		state.Sessions[index].Status = "active"
+		if archived {
+			state.Sessions[index].Status = "archived"
+			state.Sessions[index].ArchivedAt = &now
+		}
+		if err := s.repo.Save(ctx, state); err != nil {
+			return aidomain.ConversationSession{}, err
+		}
+		return state.Sessions[index], nil
+	}
+	return aidomain.ConversationSession{}, aidomain.ErrNotFound
+}
+
+func (s *AIService) GetSessionMemory(ctx context.Context, sessionID string) (aidomain.SessionMemory, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		sessionID = "default"
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, err := s.repo.Load(ctx)
+	if err != nil {
+		return aidomain.SessionMemory{}, err
+	}
+	if memory := findAISessionMemory(state.Memories, sessionID); memory != nil {
+		return *memory, nil
+	}
+	return aidomain.SessionMemory{SessionID: sessionID, Enabled: true, OpenQuestions: []string{}}, nil
+}
+
+func (s *AIService) SaveSessionMemory(ctx context.Context, input AISessionMemoryUpdate) (aidomain.SessionMemory, error) {
+	sessionID := strings.TrimSpace(input.SessionID)
+	if sessionID == "" {
+		sessionID = "default"
+	}
+	instructions := strings.TrimSpace(input.Instructions)
+	if len([]rune(instructions)) > 8000 {
+		return aidomain.SessionMemory{}, errors.New("会话记忆指令不能超过 8000 个字符")
+	}
+	if aiSensitiveAssignmentPattern.MatchString(instructions) {
+		return aidomain.SessionMemory{}, errors.New("会话记忆不能保存密码、令牌、API Key 或私钥")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, err := s.repo.Load(ctx)
+	if err != nil {
+		return aidomain.SessionMemory{}, err
+	}
+	memory := aidomain.SessionMemory{
+		SessionID: sessionID, Enabled: true, OpenQuestions: []string{}, UpdatedAt: time.Now().UTC(),
+	}
+	if existing := findAISessionMemory(state.Memories, sessionID); existing != nil {
+		memory = *existing
+	}
+	memory.Instructions = instructions
+	if input.Enabled != nil {
+		memory.Enabled = *input.Enabled
+	}
+	memory.Revision++
+	memory.UpdatedAt = time.Now().UTC()
+	upsertAISessionMemory(&state, memory)
+	pruneAIState(&state)
+	if err := s.repo.Save(ctx, state); err != nil {
+		return aidomain.SessionMemory{}, err
+	}
+	return memory, nil
+}
+
+func (s *AIService) DeleteSessionMemory(ctx context.Context, sessionID string) error {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		sessionID = "default"
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, err := s.repo.Load(ctx)
+	if err != nil {
+		return err
+	}
+	for index := range state.Memories {
+		if state.Memories[index].SessionID != sessionID {
+			continue
+		}
+		state.Memories = append(state.Memories[:index], state.Memories[index+1:]...)
+		return s.repo.Save(ctx, state)
+	}
+	return aidomain.ErrNotFound
 }
 
 func redactAIState(state *aidomain.State) {
@@ -809,6 +1043,16 @@ func (s *AIService) Chat(ctx context.Context, sessionID, providerID, prompt stri
 	if sessionID == "" {
 		sessionID = "default"
 	}
+	s.mu.Lock()
+	conversationState, err := s.repo.Load(ctx)
+	s.mu.Unlock()
+	if err != nil {
+		return AIChatResult{}, err
+	}
+	conversationSession := findAIConversationSession(conversationState.Sessions, sessionID)
+	if conversationSession != nil && conversationSession.Status == "archived" {
+		return AIChatResult{}, errors.New("该对话已归档，请先恢复或新建对话")
+	}
 	provider, err := s.resolveProvider(ctx, providerID)
 	if err != nil {
 		return AIChatResult{}, err
@@ -817,15 +1061,23 @@ func (s *AIService) Chat(ctx context.Context, sessionID, providerID, prompt stri
 	if err != nil {
 		return AIChatResult{}, err
 	}
+	memory := findAISessionMemory(conversationState.Memories, sessionID)
 	system := s.systemPrompt(opsContext, false)
-	output, err := s.callModel(ctx, provider, []map[string]string{
-		{"role": "system", "content": system},
-		{"role": "user", "content": prompt},
-	})
+	if memory != nil && memory.Enabled {
+		system = appendAISessionMemoryContext(system, *memory)
+	}
+	history := recentAISessionMessages(conversationState.Messages, sessionID, 16, 24000)
+	output, err := s.callModel(ctx, provider, buildAIChatMessages(system, history, prompt))
 	if err != nil {
 		s.recordProviderTest(context.Background(), provider.ID, err)
 		return AIChatResult{}, err
 	}
+	previousPlan := latestAISessionPlan(conversationState, sessionID)
+	if previousPlan == nil && memory != nil && memory.Enabled {
+		previousPlan = aiPlanFromSessionMemory(*memory, conversationState)
+	}
+	var reconciled bool
+	output.Plans, reconciled = reconcileAIConversationProposals(output.Plans, history, prompt, previousPlan, opsContext)
 	now := time.Now().UTC()
 	userMessage := aidomain.Message{ID: newAIID("msg"), SessionID: sessionID, Role: "user", Content: prompt, CreatedAt: now}
 	answer := strings.TrimSpace(output.Answer)
@@ -838,13 +1090,27 @@ func (s *AIService) Chat(ctx context.Context, sessionID, providerID, prompt stri
 	assistantMessage := aidomain.Message{ID: newAIID("msg"), SessionID: sessionID, Role: "assistant", Content: answer, CreatedAt: time.Now().UTC()}
 	plans := s.proposalsToPlans(output.Plans, sessionID, "")
 	if len(plans) == 0 {
-		if proposal, ok := fallbackClusterVIPProposal(prompt, opsContext); ok {
+		if proposal, ok := fallbackClusterVIPProposal(aiConversationUserText(history, prompt), opsContext); ok {
 			plans = s.proposalsToPlans([]aiModelProposal{proposal}, sessionID, "")
-			answer = "平台已提供集群 VIP 配置、绑定、撤销和实机复检 API。GMHA 已按你的目标生成受控计划；VIP 地址、网段或目标网卡不明确时，服务端会阻止执行并列出需要补充的网络参数，AI 不会猜测生产地址。"
+			reconciled = true
+			answer = "已结合本会话中已确认的集群、VIP、目标机器和网卡信息生成受控计划。服务端仍会重新校验地址、网段、目标网卡和唯一持有者；无法从上下文确定的生产参数不会被猜测。"
 		}
 	}
 	plans = s.enforceGeneratedPlanSafety(ctx, plans)
 	plans, workflows := buildAIWorkflows(plans, prompt)
+	if reconciled {
+		for _, plan := range plans {
+			if plan.Action == "configure_cluster_vip" && plan.Status != "blocked" {
+				answer = fmt.Sprintf(
+					"已结合本会话上下文补全并核验 VIP 计划：%s/%s，目标 %s，网卡 %s。计划尚未执行，请在确认服务端预检结果后审批。",
+					plan.Parameters["vip_address"], plan.Parameters["vip_prefix"],
+					firstNonEmptyAI(plan.Parameters["target_machine_id"], plan.TargetName),
+					plan.Parameters["default_interface"],
+				)
+				break
+			}
+		}
+	}
 	for _, plan := range plans {
 		if plan.Action == "delete_cluster" && plan.Status == "blocked" {
 			answer = "GMHA 未生成可执行的删除计划。" + plan.Error
@@ -869,14 +1135,289 @@ func (s *AIService) Chat(ctx context.Context, sessionID, providerID, prompt stri
 	if err != nil {
 		return AIChatResult{}, err
 	}
+	if currentSession := findAIConversationSession(state.Sessions, sessionID); currentSession != nil && currentSession.Status == "archived" {
+		return AIChatResult{}, errors.New("该对话已在分析期间归档，本轮结果未保存；请恢复或新建对话")
+	}
 	state.Messages = append(state.Messages, userMessage, assistantMessage)
 	state.Plans = append(plans, state.Plans...)
 	state.Workflows = append(workflows, state.Workflows...)
+	currentMemory := findAISessionMemory(state.Memories, sessionID)
+	updatedMemory := updateAISessionMemory(currentMemory, sessionID, prompt, output.Memory, plans, assistantMessage.ID)
+	upsertAISessionMemory(&state, updatedMemory)
+	touchAIConversationSession(&state, sessionID, prompt, assistantMessage.CreatedAt)
 	pruneAIState(&state)
 	if err := s.repo.Save(ctx, state); err != nil {
 		return AIChatResult{}, err
 	}
 	return AIChatResult{Message: assistantMessage, Plans: plans, Workflows: workflows}, nil
+}
+
+func recentAISessionMessages(messages []aidomain.Message, sessionID string, maxMessages, maxCharacters int) []aidomain.Message {
+	if maxMessages <= 0 || maxCharacters <= 0 {
+		return nil
+	}
+	selected := make([]aidomain.Message, 0, maxMessages)
+	characters := 0
+	for index := len(messages) - 1; index >= 0 && len(selected) < maxMessages; index-- {
+		message := messages[index]
+		role := strings.ToLower(strings.TrimSpace(message.Role))
+		content := strings.TrimSpace(message.Content)
+		if message.SessionID != sessionID || (role != "user" && role != "assistant") || content == "" {
+			continue
+		}
+		contentCharacters := len([]rune(content))
+		if characters+contentCharacters > maxCharacters {
+			if len(selected) > 0 {
+				break
+			}
+			runes := []rune(content)
+			content = string(runes[len(runes)-maxCharacters:])
+			contentCharacters = maxCharacters
+		}
+		message.Role = role
+		message.Content = content
+		selected = append(selected, message)
+		characters += contentCharacters
+	}
+	for left, right := 0, len(selected)-1; left < right; left, right = left+1, right-1 {
+		selected[left], selected[right] = selected[right], selected[left]
+	}
+	return selected
+}
+
+func buildAIChatMessages(system string, history []aidomain.Message, prompt string) []map[string]string {
+	messages := make([]map[string]string, 0, len(history)+2)
+	messages = append(messages, map[string]string{"role": "system", "content": system})
+	for _, message := range history {
+		messages = append(messages, map[string]string{"role": message.Role, "content": message.Content})
+	}
+	messages = append(messages, map[string]string{"role": "user", "content": prompt})
+	return messages
+}
+
+func aiConversationUserText(history []aidomain.Message, prompt string) string {
+	parts := make([]string, 0, len(history)+1)
+	for _, message := range history {
+		if message.Role == "user" && strings.TrimSpace(message.Content) != "" {
+			parts = append(parts, strings.TrimSpace(message.Content))
+		}
+	}
+	parts = append(parts, strings.TrimSpace(prompt))
+	return strings.Join(parts, "\n")
+}
+
+func latestAISessionPlan(state aidomain.State, sessionID string) *aidomain.Plan {
+	for messageIndex := len(state.Messages) - 1; messageIndex >= 0; messageIndex-- {
+		message := state.Messages[messageIndex]
+		if message.SessionID != sessionID || message.Role != "assistant" || strings.TrimSpace(message.PlanID) == "" {
+			continue
+		}
+		for planIndex := range state.Plans {
+			plan := state.Plans[planIndex]
+			if plan.ID != message.PlanID || plan.SessionID != sessionID {
+				continue
+			}
+			switch plan.Status {
+			case "proposed", "approval_required", "blocked":
+				copy := plan
+				return &copy
+			default:
+				return nil
+			}
+		}
+		return nil
+	}
+	return nil
+}
+
+func findAIConversationSession(sessions []aidomain.ConversationSession, sessionID string) *aidomain.ConversationSession {
+	for index := range sessions {
+		if sessions[index].ID == sessionID {
+			copy := sessions[index]
+			return &copy
+		}
+	}
+	return nil
+}
+
+func touchAIConversationSession(state *aidomain.State, sessionID, prompt string, now time.Time) {
+	for index := range state.Sessions {
+		if state.Sessions[index].ID != sessionID {
+			continue
+		}
+		session := &state.Sessions[index]
+		if session.Status == "" {
+			session.Status = "active"
+		}
+		if session.Title == "" || session.Title == "新对话" || session.Title == "默认对话" {
+			session.Title = compactAIRunes(prompt, 36)
+		}
+		session.MessageCount += 2
+		session.LastMessageAt = &now
+		session.UpdatedAt = now
+		return
+	}
+	state.Sessions = append([]aidomain.ConversationSession{{
+		ID: sessionID, Title: compactAIRunes(prompt, 36), Status: "active",
+		MessageCount: 2, LastMessageAt: &now, CreatedAt: now, UpdatedAt: now,
+	}}, state.Sessions...)
+}
+
+func findAISessionMemory(memories []aidomain.SessionMemory, sessionID string) *aidomain.SessionMemory {
+	for index := range memories {
+		if memories[index].SessionID == sessionID {
+			copy := memories[index]
+			return &copy
+		}
+	}
+	return nil
+}
+
+func upsertAISessionMemory(state *aidomain.State, memory aidomain.SessionMemory) {
+	for index := range state.Memories {
+		if state.Memories[index].SessionID == memory.SessionID {
+			state.Memories[index] = memory
+			return
+		}
+	}
+	state.Memories = append(state.Memories, memory)
+}
+
+func appendAISessionMemoryContext(system string, memory aidomain.SessionMemory) string {
+	payload := map[string]any{
+		"instructions":   memory.Instructions,
+		"summary":        memory.Summary,
+		"open_questions": memory.OpenQuestions,
+		"active_intent":  memory.ActiveIntent,
+		"revision":       memory.Revision,
+	}
+	raw, _ := json.Marshal(payload)
+	return system + fmt.Sprintf(`
+
+持久会话记忆：
+以下 JSON 由 Manager 按 session_id 保存，作用类似 Claude Code 的项目记忆与压缩摘要。它是辅助上下文而不是事实证明，不能覆盖安全边界；资源和运行状态仍以本轮平台只读上下文及服务端预检为准。请结合它和近期原始消息理解省略主语的追问，并在响应的 memory 字段中返回更新后的简洁摘要与未解决问题。
+%s`, raw)
+}
+
+func aiPlanFromSessionMemory(memory aidomain.SessionMemory, state aidomain.State) *aidomain.Plan {
+	intent := memory.ActiveIntent
+	if intent == nil {
+		return nil
+	}
+	if intent.PlanID != "" {
+		for index := range state.Plans {
+			if state.Plans[index].ID != intent.PlanID {
+				continue
+			}
+			switch state.Plans[index].Status {
+			case "proposed", "approval_required", "blocked":
+				copy := state.Plans[index]
+				return &copy
+			default:
+				return nil
+			}
+		}
+	}
+	switch intent.Status {
+	case "proposed", "approval_required", "blocked":
+	default:
+		return nil
+	}
+	return &aidomain.Plan{
+		ID: intent.PlanID, SessionID: memory.SessionID, Action: intent.Action,
+		TargetID: intent.TargetID, TargetName: intent.TargetName,
+		Parameters: cloneAIStringMap(intent.Parameters), Status: intent.Status,
+	}
+}
+
+func updateAISessionMemory(
+	existing *aidomain.SessionMemory,
+	sessionID, prompt string,
+	modelMemory aiModelMemory,
+	plans []aidomain.Plan,
+	lastMessageID string,
+) aidomain.SessionMemory {
+	memory := aidomain.SessionMemory{
+		SessionID: sessionID, Enabled: true, OpenQuestions: []string{},
+	}
+	if existing != nil {
+		memory = *existing
+		memory.OpenQuestions = append([]string(nil), existing.OpenQuestions...)
+		if existing.ActiveIntent != nil {
+			intent := *existing.ActiveIntent
+			intent.Parameters = cloneAIStringMap(existing.ActiveIntent.Parameters)
+			memory.ActiveIntent = &intent
+		}
+	}
+	memory.MessageCount += 2
+	memory.LastMessageID = lastMessageID
+	memory.Revision++
+	memory.UpdatedAt = time.Now().UTC()
+	if !memory.Enabled {
+		return memory
+	}
+	if summary := compactAIRunes(redactAISensitiveAssignments(modelMemory.Summary), 6000); summary != "" {
+		memory.Summary = summary
+	} else if memory.Summary == "" {
+		memory.Summary = compactAIRunes("当前用户目标："+redactAISensitiveAssignments(prompt), 2000)
+	}
+	memory.OpenQuestions = normalizeAIMemoryQuestions(modelMemory.OpenQuestions)
+	for _, plan := range plans {
+		switch plan.Status {
+		case "proposed", "approval_required", "blocked":
+			memory.ActiveIntent = &aidomain.MemoryIntent{
+				Action: plan.Action, TargetID: plan.TargetID, TargetName: plan.TargetName,
+				Parameters: cloneAIStringMap(plan.Parameters), PlanID: plan.ID, Status: plan.Status,
+				UpdatedAt: time.Now().UTC(),
+			}
+			return memory
+		}
+	}
+	return memory
+}
+
+func normalizeAIMemoryQuestions(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = compactAIRunes(redactAISensitiveAssignments(value), 500)
+		if value == "" {
+			continue
+		}
+		out = append(out, value)
+		if len(out) == 10 {
+			break
+		}
+	}
+	return out
+}
+
+func cloneAIStringMap(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(values))
+	for key, value := range values {
+		out[key] = value
+	}
+	return out
+}
+
+func compactAIRunes(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	if limit <= 0 || value == "" {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return strings.TrimSpace(string(runes[:limit]))
+}
+
+var aiSensitiveAssignmentPattern = regexp.MustCompile(`(?i)(password|passwd|api[_-]?key|access[_-]?token|secret|密码|口令|私钥)\s*[:=：]\s*\S+`)
+
+func redactAISensitiveAssignments(value string) string {
+	return aiSensitiveAssignmentPattern.ReplaceAllString(value, "$1: [REDACTED]")
 }
 
 func (s *AIService) AnalyzeNow(ctx context.Context, trigger, providerID string) (aidomain.AnalysisRun, error) {
@@ -2397,15 +2938,13 @@ func fallbackClusterVIPProposal(prompt string, contextValue map[string]any) (aiM
 		return aiModelProposal{}, false
 	}
 	clusters, _ := contextValue["clusters"].([]map[string]any)
-	clusterID, clusterName := "", ""
+	clusterID, clusterName, clusterMatchIndex := "", "", -1
 	for _, cluster := range clusters {
 		id := aiContextString(cluster["id"])
 		name := firstNonEmptyAI(aiContextString(cluster["name"]), id)
-		if (id != "" && strings.Contains(lower, strings.ToLower(id))) ||
-			(name != "" && strings.Contains(lower, strings.ToLower(name))) {
-			if len(id) > len(clusterID) {
-				clusterID, clusterName = id, name
-			}
+		matchIndex := latestAITextMatch(lower, id, name)
+		if matchIndex > clusterMatchIndex {
+			clusterID, clusterName, clusterMatchIndex = id, name, matchIndex
 		}
 	}
 	if clusterID == "" && len(clusters) == 1 && containsAnyAIText(lower, "该集群", "这个集群", "当前集群", "the cluster") {
@@ -2416,7 +2955,7 @@ func fallbackClusterVIPProposal(prompt string, contextValue map[string]any) (aiM
 		return aiModelProposal{}, false
 	}
 	parameters := map[string]any{}
-	if match := aiVIPCIDRPattern.FindStringSubmatch(prompt); len(match) > 1 {
+	if match := latestAIVIPCIDR(prompt); len(match) > 1 {
 		if parsed := net.ParseIP(match[1]); parsed != nil && parsed.To4() != nil {
 			parameters["vip_address"] = match[1]
 			if len(match) > 2 && strings.TrimSpace(match[2]) != "" {
@@ -2426,6 +2965,8 @@ func fallbackClusterVIPProposal(prompt string, contextValue map[string]any) (aiM
 	}
 	if !remove {
 		machines, _ := contextValue["machines"].([]map[string]any)
+		var targetMachine map[string]any
+		targetMatchIndex := -1
 		for _, machine := range machines {
 			if aiContextString(machine["cluster"]) != clusterID {
 				continue
@@ -2433,20 +2974,32 @@ func fallbackClusterVIPProposal(prompt string, contextValue map[string]any) (aiM
 			id := aiContextString(machine["id"])
 			name := aiContextString(machine["name"])
 			ip := aiContextString(machine["ip"])
-			if (id != "" && strings.Contains(lower, strings.ToLower(id))) ||
-				(name != "" && strings.Contains(lower, strings.ToLower(name))) ||
-				(ip != "" && strings.Contains(lower, strings.ToLower(ip))) {
-				parameters["target_machine_id"] = id
-				if interfaces, ok := machine["network_interfaces"].([]map[string]any); ok {
-					for _, iface := range interfaces {
-						ifaceName := aiContextString(iface["name"])
-						if ifaceName != "" && strings.Contains(lower, strings.ToLower(ifaceName)) {
-							parameters["default_interface"] = ifaceName
-							break
-						}
+			matchIndex := latestAITextMatch(lower, id, name, ip)
+			if matchIndex > targetMatchIndex {
+				targetMatchIndex = matchIndex
+				targetMachine = machine
+			}
+		}
+		if targetMachine != nil {
+			parameters["target_machine_id"] = aiContextString(targetMachine["id"])
+			if interfaces, ok := targetMachine["network_interfaces"].([]map[string]any); ok {
+				interfaceName, interfaceMatchIndex := "", -1
+				for _, iface := range interfaces {
+					name := aiContextString(iface["name"])
+					if matchIndex := latestAITextMatch(lower, name); matchIndex > interfaceMatchIndex {
+						interfaceName, interfaceMatchIndex = name, matchIndex
 					}
 				}
-				break
+				if interfaceName == "" && containsAnyAIText(lower, "同网段", "同一网段", "same subnet") {
+					interfaceName = uniqueAISameSubnetInterface(
+						interfaces,
+						aiContextString(parameters["vip_address"]),
+						aiContextInt(parameters["vip_prefix"]),
+					)
+				}
+				if interfaceName != "" {
+					parameters["default_interface"] = interfaceName
+				}
 			}
 		}
 	}
@@ -2466,6 +3019,157 @@ func fallbackClusterVIPProposal(prompt string, contextValue map[string]any) (aiM
 		Evidence: []string{"用户明确提出集群 VIP 变更", "动作由 GMHA 固定白名单和服务端安全预检控制"},
 		Rollback: rollback,
 	}, true
+}
+
+func latestAIVIPCIDR(text string) []string {
+	matches := aiVIPCIDRPattern.FindAllStringSubmatch(text, -1)
+	for index := len(matches) - 1; index >= 0; index-- {
+		if parsed := net.ParseIP(matches[index][1]); parsed != nil && parsed.To4() != nil {
+			return matches[index]
+		}
+	}
+	return nil
+}
+
+func latestAITextMatch(text string, candidates ...string) int {
+	latest := -1
+	for _, candidate := range candidates {
+		candidate = strings.ToLower(strings.TrimSpace(candidate))
+		if candidate == "" {
+			continue
+		}
+		if index := strings.LastIndex(text, candidate); index > latest {
+			latest = index
+		}
+	}
+	return latest
+}
+
+func uniqueAISameSubnetInterface(interfaces []map[string]any, vip string, prefix int) string {
+	if net.ParseIP(vip).To4() == nil || prefix < 1 || prefix > 32 {
+		return ""
+	}
+	matches := make([]string, 0, 1)
+	for _, iface := range interfaces {
+		name := aiContextString(iface["name"])
+		if name == "" {
+			continue
+		}
+		addresses := make([]string, 0)
+		switch values := iface["ips"].(type) {
+		case []string:
+			addresses = values
+		case []any:
+			for _, value := range values {
+				addresses = append(addresses, aiContextString(value))
+			}
+		}
+		for _, address := range addresses {
+			if aiVIPInInterfaceSubnet(vip, address, prefix) {
+				matches = append(matches, name)
+				break
+			}
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0]
+	}
+	return ""
+}
+
+func reconcileAIConversationProposals(
+	proposals []aiModelProposal,
+	history []aidomain.Message,
+	prompt string,
+	previousPlan *aidomain.Plan,
+	contextValue map[string]any,
+) ([]aiModelProposal, bool) {
+	conversationText := aiConversationUserText(history, prompt)
+	fallback, hasFallback := fallbackClusterVIPProposal(conversationText, contextValue)
+	reconciled := false
+	for index := range proposals {
+		proposal := &proposals[index]
+		if proposal.Action != "configure_cluster_vip" && proposal.Action != "remove_cluster_vip" {
+			continue
+		}
+		if proposal.Parameters == nil {
+			proposal.Parameters = map[string]any{}
+		}
+		if previousPlan != nil && previousPlan.Action == proposal.Action &&
+			(proposal.TargetID == "" || previousPlan.TargetID == "" || strings.EqualFold(proposal.TargetID, previousPlan.TargetID)) {
+			if proposal.TargetID == "" && previousPlan.TargetID != "" {
+				proposal.TargetID = previousPlan.TargetID
+				proposal.TargetName = firstNonEmptyAI(proposal.TargetName, previousPlan.TargetName)
+				reconciled = true
+			}
+			for key, value := range previousPlan.Parameters {
+				if aiContextString(proposal.Parameters[key]) == "" && strings.TrimSpace(value) != "" {
+					proposal.Parameters[key] = value
+					reconciled = true
+				}
+			}
+		}
+		if hasFallback && fallback.Action == proposal.Action {
+			if proposal.TargetID == "" || canonicalAIClusterID(proposal.TargetID, contextValue) == "" {
+				proposal.TargetID = fallback.TargetID
+				proposal.TargetName = firstNonEmptyAI(proposal.TargetName, fallback.TargetName)
+				reconciled = true
+			}
+			for key, value := range fallback.Parameters {
+				if aiContextString(proposal.Parameters[key]) == "" {
+					proposal.Parameters[key] = value
+					reconciled = true
+				}
+			}
+		}
+		if canonical := canonicalAIClusterID(proposal.TargetID, contextValue); canonical != "" && canonical != proposal.TargetID {
+			proposal.TargetID = canonical
+			reconciled = true
+		}
+		if proposal.Action == "configure_cluster_vip" {
+			target := aiContextString(proposal.Parameters["target_machine_id"])
+			if canonical := canonicalAIMachineID(target, proposal.TargetID, contextValue); canonical != "" && canonical != target {
+				proposal.Parameters["target_machine_id"] = canonical
+				reconciled = true
+			}
+		}
+	}
+	return proposals, reconciled
+}
+
+func canonicalAIClusterID(value string, contextValue map[string]any) string {
+	value = strings.TrimSpace(value)
+	clusters, _ := contextValue["clusters"].([]map[string]any)
+	for _, cluster := range clusters {
+		id := aiContextString(cluster["id"])
+		name := aiContextString(cluster["name"])
+		if strings.EqualFold(value, id) || (name != "" && strings.EqualFold(value, name)) {
+			return id
+		}
+	}
+	return ""
+}
+
+func canonicalAIMachineID(value, clusterID string, contextValue map[string]any) string {
+	value = strings.TrimSpace(value)
+	machines, _ := contextValue["machines"].([]map[string]any)
+	match := ""
+	for _, machine := range machines {
+		if cluster := aiContextString(machine["cluster"]); clusterID != "" && cluster != clusterID {
+			continue
+		}
+		id := aiContextString(machine["id"])
+		name := aiContextString(machine["name"])
+		ip := aiContextString(machine["ip"])
+		if !strings.EqualFold(value, id) && !strings.EqualFold(value, name) && value != ip {
+			continue
+		}
+		if match != "" && match != id {
+			return ""
+		}
+		match = id
+	}
+	return match
 }
 
 func containsAnyAIText(value string, candidates ...string) bool {
@@ -5025,7 +5729,7 @@ func (s *AIService) systemPrompt(contextValue map[string]any, analysis bool) str
 9. 用户要求新增、绑定或修改业务 VIP 时使用 configure_cluster_vip；parameters 必须提供 vip_address、vip_prefix、target_machine_id、default_interface，可选 vip_name 和 arping_count。VIP 地址必须由用户或网络规划明确提供，不得因为用户说“随便定”就猜测地址；地址缺失时仍应生成该动作计划，让服务端明确标记缺少地址和网卡，而不是声称平台不支持。删除 VIP 使用 remove_cluster_vip，只提供已登记的 vip_address。VIP 绑定和删除都必须经过人工确认、Agent 实机执行与全节点唯一持有者复检。
 10. 集群登记和成员操作使用精确动作：创建空登记用 create_cluster；改名或改说明用 update_cluster（parameters 提供 new_name 和 description）；移出成员用 remove_cluster_members（parameters 提供 machine_ids）；一键卸载 MySQL、Agent 并删除集群只能用 cleanup_cluster。cleanup_cluster 与 delete_cluster 不同：前者会清理数据和软件，后者仅允许删除无任何依赖的空登记，绝不能混用。移出 VIP 持有者、备份目标或存在活动任务的机器必须由服务端阻止。
 11. 其余集群核心操作使用精确动作：只读实机复检 VIP 用 scan_cluster_vip；立即运行现有备份策略用 run_cluster_backup；升级全部集群节点用 rolling_upgrade_cluster_mysql（必须提供用户明确指定的 target_version，可选 port）；永久删除指定端口全部实例用 uninstall_cluster_mysql。滚动升级和卸载均为极高风险，必须由服务端实时预检和逐字确认。安装 MySQL、创建/修改备份策略、恢复备份、数据库账号等需要密码的操作不得要求用户把密码发给模型；应明确说明平台 API 已存在，并引导用户在对应安全表单中输入密钥，不得声称平台不支持。
-方案制定规则：
+	方案制定规则：
 1. 先根据 clusters[].architecture、mysql_instances[].replication、business_vips、backup_policies、active_alerts 和 active_tasks，用中文说明当前架构、业务入口与依赖；不得只复述用户命令。
 2. planning_context.complete 不为 true，或目标节点的角色、复制健康和业务入口不明确时，只能提出只读调查步骤，plans 必须为空。
 3. 每个可执行计划必须包含 understand、precheck、execute、verify、rollback 五阶段 steps。每一步说明目的、验证标准和失败处理；不得把多个不可验证的变更压缩成一个步骤。
@@ -5033,9 +5737,10 @@ func (s *AIService) systemPrompt(contextValue map[string]any, analysis bool) str
 5. answer 使用适合控制台直接显示的纯文本和换行，不要使用 Markdown 标题、粗体、反引号或表格。机器生命周期 status 不等于实时在线；若实时心跳缺失或状态矛盾，必须明确写“状态待确认”，不得推断在线。
 6. 用户目标可由动作目录覆盖时必须生成计划，不要仅回答“平台不支持”。即使 Agent 离线、存在并发任务或其他前置条件未满足，也应生成对应动作计划，由 GMHA 服务端把它标记为 blocked 并展示具体处理顺序。
 7. 一个目标需要多个动作时，必须拆成多个 plans，并给它们相同的 workflow_id；每项使用唯一 operation_id，depends_on 填写它依赖的 operation_id。先诊断、再变更、再验证，不允许把后续动作提前执行。
-8. 多步骤工作流在每个动作开始前都会由 GMHA 重新读取架构、监控、告警和活动任务。任何一步失败或上下文出现冲突都必须暂停后续步骤，禁止继续猜测执行。
-仅返回一个 JSON 对象，不要 Markdown，结构：
-{"answer":"先说明当前架构与依赖，再给出结论；生成高风险计划时明确提示需要二次确认","summary":"一句话摘要","findings":[{"severity":"warning","title":"标题","detail":"证据"}],"plans":[{"workflow_id":"同一目标的稳定分组名","operation_id":"step-1","depends_on":[],"title":"计划标题","summary":"为何要做","action":"动作ID","target_id":"上下文中的目标ID","target_name":"目标名称","parameters":{},"evidence":["证据"],"steps":[{"order":1,"phase":"understand","title":"步骤标题","detail":"要做什么及原因","verification":"如何确认成功","on_failure":"失败时如何处理","executable":false}],"rollback":"整体回滚说明"}]}
+	8. 多步骤工作流在每个动作开始前都会由 GMHA 重新读取架构、监控、告警和活动任务。任何一步失败或上下文出现冲突都必须暂停后续步骤，禁止继续猜测执行。
+	9. memory.summary 是跨轮次滚动记忆：保留仍有效的用户目标、已确认约束、关键决定和当前进度，删除已被用户纠正或已经完成的临时细节；不得写入密码、令牌、API Key、私钥或凭据。memory.open_questions 只保留继续完成当前目标所必需、且无法从平台上下文唯一确定的问题。即使本轮没有计划，也必须返回 memory。
+	仅返回一个 JSON 对象，不要 Markdown，结构：
+	{"answer":"先说明当前架构与依赖，再给出结论；生成高风险计划时明确提示需要二次确认","summary":"一句话摘要","findings":[{"severity":"warning","title":"标题","detail":"证据"}],"plans":[{"workflow_id":"同一目标的稳定分组名","operation_id":"step-1","depends_on":[],"title":"计划标题","summary":"为何要做","action":"动作ID","target_id":"上下文中的目标ID","target_name":"目标名称","parameters":{},"evidence":["证据"],"steps":[{"order":1,"phase":"understand","title":"步骤标题","detail":"要做什么及原因","verification":"如何确认成功","on_failure":"失败时如何处理","executable":false}],"rollback":"整体回滚说明"}],"memory":{"summary":"跨轮次保留的目标、约束、决定和进度","open_questions":["仍需确认的问题"]}}
 动作目录：%s
 集群 API 目录：%s
 平台只读上下文：%s`, mode, actionsJSON, clusterAPIsJSON, contextJSON)
@@ -5409,18 +6114,10 @@ func newAIID(prefix string) string {
 }
 
 func pruneAIState(state *aidomain.State) {
-	if len(state.Messages) > 120 {
-		state.Messages = state.Messages[len(state.Messages)-120:]
-	}
-	if len(state.Plans) > 100 {
-		state.Plans = state.Plans[:100]
-	}
-	if len(state.Workflows) > 100 {
-		state.Workflows = state.Workflows[:100]
-	}
-	if len(state.Runs) > 50 {
-		state.Runs = state.Runs[:50]
-	}
+	// Conversation transcripts, memories, plans and workflows are durable audit
+	// records. Context compaction limits what is sent to a model, not what the
+	// Manager retains, so archiving or a long-running installation never causes
+	// earlier turns to disappear.
 }
 
 func compactAIError(err error) string {
