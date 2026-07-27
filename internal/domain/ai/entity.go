@@ -71,16 +71,25 @@ type ConversationSession struct {
 // ActiveIntent is populated from server-validated plans so execution-critical
 // parameters never depend solely on a generated summary.
 type SessionMemory struct {
-	SessionID     string        `json:"session_id"`
-	Enabled       bool          `json:"enabled"`
-	Instructions  string        `json:"instructions,omitempty"`
-	Summary       string        `json:"summary,omitempty"`
-	OpenQuestions []string      `json:"open_questions,omitempty"`
-	ActiveIntent  *MemoryIntent `json:"active_intent,omitempty"`
-	LastMessageID string        `json:"last_message_id,omitempty"`
-	MessageCount  int           `json:"message_count"`
-	Revision      int           `json:"revision"`
-	UpdatedAt     time.Time     `json:"updated_at"`
+	SessionID              string        `json:"session_id"`
+	Enabled                bool          `json:"enabled"`
+	Instructions           string        `json:"instructions,omitempty"`
+	Summary                string        `json:"summary,omitempty"`
+	Goals                  []string      `json:"goals,omitempty"`
+	Constraints            []string      `json:"constraints,omitempty"`
+	Decisions              []string      `json:"decisions,omitempty"`
+	Progress               []string      `json:"progress,omitempty"`
+	OpenQuestions          []string      `json:"open_questions,omitempty"`
+	ActiveIntent           *MemoryIntent `json:"active_intent,omitempty"`
+	LastMessageID          string        `json:"last_message_id,omitempty"`
+	MessageCount           int           `json:"message_count"`
+	SummarizedMessageCount int           `json:"summarized_message_count"`
+	CompactedMessageCount  int           `json:"compacted_message_count"`
+	RecentMessageCount     int           `json:"recent_message_count"`
+	RecentCharacterCount   int           `json:"recent_character_count"`
+	EstimatedInputTokens   int           `json:"estimated_input_tokens"`
+	Revision               int           `json:"revision"`
+	UpdatedAt              time.Time     `json:"updated_at"`
 }
 
 type MemoryIntent struct {

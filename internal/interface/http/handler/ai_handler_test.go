@@ -28,10 +28,18 @@ func TestAICapabilitiesCanBeDiscoveredWithoutWorkbenchState(t *testing.T) {
 			SensitiveParameters []string `json:"sensitive_parameters"`
 		} `json:"cluster_endpoints"`
 		ConversationMemory struct {
-			SessionScoped         bool     `json:"session_scoped"`
-			RollingSummary        bool     `json:"rolling_summary"`
-			ValidatedActiveIntent bool     `json:"validated_active_intent"`
-			Endpoints             []string `json:"endpoints"`
+			SessionScoped          bool     `json:"session_scoped"`
+			RollingSummary         bool     `json:"rolling_summary"`
+			SummaryStrategy        string   `json:"summary_strategy"`
+			RecentMessageLimit     int      `json:"recent_message_limit"`
+			RecentCharacterLimit   int      `json:"recent_character_limit"`
+			RecentTokenBudget      int      `json:"recent_token_budget"`
+			MemoryTokenBudget      int      `json:"memory_token_budget"`
+			SinglePromptCharLimit  int      `json:"single_prompt_char_limit"`
+			SinglePromptTokenLimit int      `json:"single_prompt_token_limit"`
+			FullHistoryRetransmit  bool     `json:"full_history_retransmit"`
+			ValidatedActiveIntent  bool     `json:"validated_active_intent"`
+			Endpoints              []string `json:"endpoints"`
 		} `json:"conversation_memory"`
 		SecurityBoundary string `json:"security_boundary"`
 	}
@@ -73,6 +81,14 @@ func TestAICapabilitiesCanBeDiscoveredWithoutWorkbenchState(t *testing.T) {
 	}
 	if !payload.ConversationMemory.SessionScoped ||
 		!payload.ConversationMemory.RollingSummary ||
+		payload.ConversationMemory.SummaryStrategy != "structured_snapshot" ||
+		payload.ConversationMemory.RecentMessageLimit != 8 ||
+		payload.ConversationMemory.RecentCharacterLimit != 8000 ||
+		payload.ConversationMemory.RecentTokenBudget != 2400 ||
+		payload.ConversationMemory.MemoryTokenBudget != 2400 ||
+		payload.ConversationMemory.SinglePromptCharLimit != 12000 ||
+		payload.ConversationMemory.SinglePromptTokenLimit != 4000 ||
+		payload.ConversationMemory.FullHistoryRetransmit ||
 		!payload.ConversationMemory.ValidatedActiveIntent ||
 		len(payload.ConversationMemory.Endpoints) == 0 {
 		t.Fatalf("conversation memory contract is incomplete: %#v", payload.ConversationMemory)

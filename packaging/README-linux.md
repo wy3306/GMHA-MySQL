@@ -45,11 +45,11 @@ GMHA_MANAGER_PUBKEY=/opt/gmha/manager_ed25519.pub ./start-web.sh
 
 ## 版本升级
 
-Manager 和 Agent 的当前版本均为 `V0.0.3`。执行 `scripts/build-release.sh V0.0.3`
+Manager 和 Agent 的当前版本均为 `V0.0.4`。执行 `scripts/build-release.sh V0.0.4`
 会在 `dist/` 额外生成可直接上传到 Web 控制台的两个升级制品：
 
-- `gmha-manager-V0.0.3-linux-amd64.bin`：上传到 `GMHA Manager` 分类。
-- `gmha-agent-V0.0.3-linux-amd64.bin`：上传到 `GMHA Agent` 分类。
+- `gmha-manager-V0.0.4-linux-amd64.bin`：上传到 `GMHA Manager` 分类。
+- `gmha-agent-V0.0.4-linux-amd64.bin`：上传到 `GMHA Agent` 分类。
 
 上传后进入“平台运维 → 版本升级”。Manager 升级会校验候选版本、备份当前程序、
 原子替换并重启；Agent 升级会检查在线状态与架构，逐台备份替换，并以新鲜心跳上报的
@@ -119,8 +119,8 @@ Go、Node.js 或 FlameGraph Perl 脚本。PID/进程模式在没有 `perf` 时�
 
 ```sh
 ./scripts/build-flamegraph-offline-bundle.sh \
-  V0.0.3 amd64 ./perf-packages \
-  ./dist/gmha-flamegraph-V0.0.3-linux-amd64-offline.tar.gz
+  V0.0.4 amd64 ./perf-packages \
+  ./dist/gmha-flamegraph-V0.0.4-linux-amd64-offline.tar.gz
 ```
 
 将包内 `bin/agentd` 通过“平台运维 → 版本升级”分发；目标机解压后执行 `sudo ./install.sh`

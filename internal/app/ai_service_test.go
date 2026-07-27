@@ -552,6 +552,7 @@ func TestAISessionMemoryKeepsSummaryAndServerValidatedActiveIntent(t *testing.T)
 			Parameters: map[string]string{"vip_address": "192.168.31.222", "vip_prefix": "24"},
 		}},
 		"message-02",
+		aiConversationContextStats{RecentMessageCount: 2, RecentCharacterCount: 120, EstimatedInputTokens: 80},
 	)
 	if !memory.Enabled || memory.Summary == "" || memory.Revision != 1 || memory.MessageCount != 2 {
 		t.Fatalf("memory metadata was not updated: %#v", memory)

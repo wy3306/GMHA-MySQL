@@ -610,7 +610,7 @@ export default {
               </nav>
               <details v-if="archivedSessions.length"><summary>已归档 · {{ archivedSessions.length }}</summary><button v-for="item in archivedSessions" :key="item.id" type="button" @click="restoreConversation(item)"><span><b>{{ item.title }}</b><small>点击恢复</small></span><i>↗</i></button></details>
             </section>
-            <div class="ai-context-note"><i>⌾</i><p><b>会话记忆{{ currentMemory?.enabled===false ? '已关闭' : '已启用' }}</b><small>服务端保留滚动摘要、近期原文和当前受控计划；浏览器每次只发送新消息。凭据不会进入记忆。</small></p></div>
+            <div class="ai-context-note"><i>⌾</i><p><b>会话记忆{{ currentMemory?.enabled===false ? '已关闭' : '已启用' }}</b><small>服务端保留结构化滚动摘要和最多 8 条近期原文，不会重传完整历史。<template v-if="currentMemory?.message_count">已归纳 {{ currentMemory.summarized_message_count || currentMemory.message_count }} 条，当前窗口 {{ currentMemory.recent_message_count || 0 }} 条，约 {{ currentMemory.estimated_input_tokens || 0 }} tokens。</template>凭据不会进入记忆。</small></p></div>
           </aside>
           <main>
             <header><div><h3>{{ currentSession?.title || 'AI 运维助手' }}</h3><p>自然语言分析平台状态，变更计划仍受安全闸门约束。</p></div><div class="ai-chat-head-tools"><select class="mobile-session-action" v-model="sessionID" @change="switchConversation"><option v-for="item in activeSessions" :key="item.id" :value="item.id">{{ item.title }}</option></select><button class="mobile-session-action" type="button" @click="createConversation">＋ 新建</button><button type="button" @click="archiveConversation" :disabled="!currentSession || busy==='session'">归档当前对话</button><span>{{ messages.length }} 条消息</span></div></header>
