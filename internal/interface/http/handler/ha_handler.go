@@ -28,6 +28,17 @@ func (h *HAHandler) HandleClusterActions(w http.ResponseWriter, r *http.Request)
 	}
 	clusterID := parts[0]
 	switch {
+	case len(parts) == 2 && parts[1] == "mgr" && r.Method == http.MethodGet:
+		item, err := h.ha.MGRManagementStatus(r.Context(), clusterID)
+		writeHAJSON(w, item, err)
+	case len(parts) == 3 && parts[1] == "mgr" && parts[2] == "actions" && r.Method == http.MethodPost:
+		var req app.MGRManagementActionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeHAError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		item, err := h.ha.RunMGRManagementAction(r.Context(), clusterID, req)
+		writeHAJSON(w, item, err)
 	case len(parts) == 3 && parts[1] == "vip" && parts[2] == "config" && r.Method == http.MethodGet:
 		items, err := h.ha.ListVIPConfigs(r.Context(), clusterID)
 		writeHAJSON(w, items, err)

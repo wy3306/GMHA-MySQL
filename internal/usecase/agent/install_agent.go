@@ -2,7 +2,9 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"debug/elf"
 	"errors"
 	"fmt"
 	"strings"
@@ -10,6 +12,7 @@ import (
 
 	agentdomain "gmha/internal/domain/agent"
 	machinedomain "gmha/internal/domain/machine"
+	"gmha/internal/platform/linuxcompat"
 )
 
 // SSHClient 定义了 SSH 远程操作接口，用于在目标机器上执行命令、获取输出和上传文件。
@@ -140,6 +143,9 @@ func (u *InstallAgentUsecase) Execute(ctx context.Context, req InstallAgentReque
 		sshUser = machine.SSHUser
 	}
 	auth := machinedomain.SSHAuth{User: sshUser, Password: req.SSHPassword, PrivateKey: req.SSHPrivateKey, Passphrase: req.SSHPassphrase}
+	if err := u.validateLinuxTarget(ctx, endpoint, auth, binary); err != nil {
+		return u.fail(ctx, machine.ID, installDir, agentID, err)
+	}
 	managerGRPCAddr := strings.TrimSpace(req.ManagerGRPCAddr)
 	if managerGRPCAddr == "" {
 		managerGRPCAddr, err = u.detectManagerGRPCAddr(ctx, endpoint, auth)
@@ -203,13 +209,9 @@ func (u *InstallAgentUsecase) Execute(ctx context.Context, req InstallAgentReque
 	if err := u.sshClient.Upload(ctx, endpoint, auth, "/etc/systemd/system/gmha-agent.service", systemdBytes, "0644"); err != nil {
 		return u.fail(ctx, machine.ID, installDir, agentID, fmt.Errorf("failed to upload systemd unit: %w", err))
 	}
-	for _, cmd := range []string{
-		"systemctl daemon-reload",
-		"systemctl enable gmha-agent",
-		"systemctl restart gmha-agent || systemctl start gmha-agent",
-	} {
+	for _, cmd := range agentSystemdActivationCommands() {
 		if err := u.sshClient.Run(ctx, endpoint, auth, cmd); err != nil {
-			return u.fail(ctx, machine.ID, installDir, agentID, err)
+			return u.fail(ctx, machine.ID, installDir, agentID, fmt.Errorf("failed to activate gmha-agent systemd service: %w", err))
 		}
 	}
 
@@ -229,6 +231,67 @@ func (u *InstallAgentUsecase) Execute(ctx context.Context, req InstallAgentReque
 		InstallDir: installDir,
 		FinalState: string(agentdomain.StateOnline),
 	}, nil
+}
+
+func (u *InstallAgentUsecase) validateLinuxTarget(ctx context.Context, endpoint machinedomain.Endpoint, auth machinedomain.SSHAuth, binary []byte) error {
+	output, err := u.sshClient.RunOutput(ctx, endpoint, auth, `set -eu; test -r /etc/os-release; . /etc/os-release; printf 'os=%s %s\n' "${NAME:-Linux}" "${VERSION_ID:-${VERSION:-}}"; printf 'arch=%s\n' "$(uname -m)"; printf 'glibc=%s\n' "$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}' || true)"; if command -v systemctl >/dev/null 2>&1 && test -d /run/systemd/system; then echo 'systemd=yes'; else echo 'systemd=no'; fi`)
+	if err != nil {
+		return fmt.Errorf("failed to inspect target Linux compatibility: %w", err)
+	}
+	values := parseLinuxPrecheck(output)
+	if values["systemd"] != "yes" {
+		return errors.New("Linux compatibility check failed: systemd is required and must be PID 1")
+	}
+	report := linuxcompat.Evaluate(values["os"], values["arch"], values["glibc"])
+	if !report.CanInstall {
+		return report.Error()
+	}
+	binaryArch := agentBinaryArchitecture(binary)
+	if binaryArch != "" && binaryArch != report.Architecture {
+		return fmt.Errorf("agent binary architecture %s does not match target %s; upload the matching GMHA Agent package", binaryArch, report.Architecture)
+	}
+	return nil
+}
+
+func parseLinuxPrecheck(output []byte) map[string]string {
+	values := make(map[string]string)
+	for _, line := range strings.Split(string(output), "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if ok {
+			values[strings.TrimSpace(key)] = strings.TrimSpace(value)
+		}
+	}
+	return values
+}
+
+func agentBinaryArchitecture(binary []byte) string {
+	file, err := elf.NewFile(bytes.NewReader(binary))
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+	switch file.Machine {
+	case elf.EM_X86_64:
+		return "x86_64"
+	case elf.EM_AARCH64:
+		return "aarch64"
+	default:
+		return ""
+	}
+}
+
+// agentSystemdActivationCommands returns the full activation sequence shared
+// by install and upgrade. The final checks make a successful installation mean
+// both "running now" and "will start after reboot".
+func agentSystemdActivationCommands() []string {
+	return []string{
+		"systemctl daemon-reload",
+		"systemctl reset-failed gmha-agent.service 2>/dev/null || true",
+		"systemctl enable gmha-agent.service",
+		"systemctl restart gmha-agent.service",
+		"systemctl is-enabled --quiet gmha-agent.service",
+		"systemctl is-active --quiet gmha-agent.service",
+	}
 }
 
 // fail 处理安装失败的情况，更新机器和 Agent 的状态为错误状态。

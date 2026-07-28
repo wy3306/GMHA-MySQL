@@ -169,7 +169,11 @@ func mysqlLifecycleCommands(target mysqlapp.Instance, targetIP string, members [
 		mysqlLifecycleWritableGate(targetIP, target.Port, len(members), primaryAcknowledged),
 		mysqlLifecycleTransactionGate(targetIP, target.Port),
 		mysqlLifecycleSnapshotScript(members, "$state_dir/topology.before"),
-		mysqlLifecycleReplicationCheckScript(members, deepCheck, 60),
+		"mgr_target_state=$(mgr_member_state " + shellQuote(targetIP) + " " + strconv.Itoa(target.Port) + ")",
+		"if [ -n \"$mgr_target_state\" ]; then printf '%s\\n' mgr > \"$state_dir/topology.kind\"; " +
+			mysqlLifecycleMGRCheckScript(targetIP, target.Port, len(members), 60) +
+			"; else printf '%s\\n' async > \"$state_dir/topology.kind\"; " +
+			mysqlLifecycleReplicationCheckScript(members, deepCheck, 60) + "; fi",
 		"baseline_ok=1",
 		"echo 'GMHA_LIFECYCLE_BASELINE_OK topology_members=" + strconv.Itoa(len(members)) + "'",
 	}, "\n")
@@ -177,17 +181,19 @@ func mysqlLifecycleCommands(target mysqlapp.Instance, targetIP string, members [
 	if deepCheck && len(members) > 1 {
 		commands = append(commands, taskdomain.ExecCommandStep{
 			Name:    "重启前主从数据一致性校验",
-			Command: common + "\nset -eu\n" + mysqlLifecyclePTCheckScript(members, "before"),
+			Command: common + "\nset -eu\nif [ \"$(cat " + shellQuote(filepath.Join(stateDir, "topology.kind")) + ")\" = mgr ]; then echo 'MGR uses certified group transactions; async PT checksum step skipped'; else " + mysqlLifecyclePTCheckScript(members, "before") + "; fi",
 		})
 	}
 	switch action {
 	case "shutdown":
+		remainingMGRCheck := mysqlLifecycleMGRRemainingCheckScript(targetIP, target.Port, members, 120)
 		commands = append(commands, taskdomain.ExecCommandStep{
 			Name: "关闭 MySQL 实例并确认进程退出",
-			Command: strings.Join([]string{
+			Command: common + "\n" + strings.Join([]string{
 				"set -eu",
 				"systemctl stop " + shellQuote(unit),
 				"if systemctl is-active --quiet " + shellQuote(unit) + "; then echo 'MySQL service is still active after shutdown' >&2; exit 73; fi",
+				"if [ \"$(cat " + shellQuote(filepath.Join(stateDir, "topology.kind")) + ")\" = mgr ]; then " + remainingMGRCheck + "; fi",
 				"echo 'GMHA_MYSQL_SHUTDOWN_OK unit=" + unit + "'",
 				"rm -rf -- " + shellQuote(stateDir),
 				"rm -rf -- " + shellQuote(lockDir),
@@ -211,8 +217,10 @@ func mysqlLifecycleCommands(target mysqlapp.Instance, targetIP string, members [
 				Command: common + "\nset -eu\n" + strings.Join([]string{
 					"state_dir=" + shellQuote(stateDir),
 					mysqlLifecycleSnapshotScript(members, "$state_dir/topology.after"),
-					"diff -u \"$state_dir/topology.before\" \"$state_dir/topology.after\" || { echo 'Replication topology changed after restart' >&2; exit 75; }",
-					mysqlLifecycleReplicationCheckScript(members, deepCheck, 120),
+					"if [ \"$(cat \"$state_dir/topology.kind\")\" = mgr ]; then " +
+						mysqlLifecycleMGRCheckScript(targetIP, target.Port, len(members), 120) +
+						"; else diff -u \"$state_dir/topology.before\" \"$state_dir/topology.after\" || { echo 'Replication topology changed after restart' >&2; exit 75; }; " +
+						mysqlLifecycleReplicationCheckScript(members, deepCheck, 120) + "; fi",
 					"echo 'GMHA_LIFECYCLE_TOPOLOGY_OK'",
 				}, "\n"),
 			},
@@ -220,7 +228,7 @@ func mysqlLifecycleCommands(target mysqlapp.Instance, targetIP string, members [
 		if deepCheck && len(members) > 1 {
 			commands = append(commands, taskdomain.ExecCommandStep{
 				Name:    "重启后主从数据一致性复核",
-				Command: common + "\nset -eu\n" + mysqlLifecyclePTCheckScript(members, "after"),
+				Command: common + "\nset -eu\nif [ \"$(cat " + shellQuote(filepath.Join(stateDir, "topology.kind")) + ")\" = mgr ]; then echo 'MGR group health and apply queues verified; async PT checksum step skipped'; else " + mysqlLifecyclePTCheckScript(members, "after") + "; fi",
 			})
 		}
 		commands = append(commands, taskdomain.ExecCommandStep{
@@ -252,6 +260,8 @@ func mysqlLifecycleShellPrelude(mysqlBinary string) string {
 		"status_field_either() { value=$(status_field \"$1\" \"$2\"); if [ -z \"$value\" ]; then value=$(status_field \"$1\" \"$3\"); fi; printf '%s' \"$value\"; }",
 		"snapshot_node() { host=\"$1\"; port=\"$2\"; core=$(mysql_exec \"$host\" \"$port\" --execute=\"SELECT CONCAT_WS('|',@@server_uuid,@@server_id,@@read_only,@@super_read_only)\"); repl=$(replica_status \"$host\" \"$port\"); source=$(status_field_either \"$repl\" Source_Host Master_Host); source_port=$(status_field_either \"$repl\" Source_Port Master_Port); [ -n \"$source\" ] || source='-'; [ -n \"$source_port\" ] || source_port='-'; printf '%s:%s|%s|%s|%s\\n' \"$host\" \"$port\" \"$core\" \"$source\" \"$source_port\"; }",
 		"check_replication() { host=\"$1\"; port=\"$2\"; attempts=\"$3\"; allow_no_gtid=\"$4\"; n=1; while [ \"$n\" -le \"$attempts\" ]; do repl=$(replica_status \"$host\" \"$port\"); [ -n \"$repl\" ] || return 0; io=$(status_field_either \"$repl\" Replica_IO_Running Slave_IO_Running); sql=$(status_field_either \"$repl\" Replica_SQL_Running Slave_SQL_Running); lag=$(status_field_either \"$repl\" Seconds_Behind_Source Seconds_Behind_Master); source=$(status_field_either \"$repl\" Source_Host Master_Host); source_port=$(status_field_either \"$repl\" Source_Port Master_Port); [ -n \"$source_port\" ] || source_port=\"$port\"; if [ \"$io\" = Yes ] && [ \"$sql\" = Yes ] && [ \"${lag:-null}\" = 0 ]; then source_gtid=$(mysql_exec \"$source\" \"$source_port\" --execute='SELECT @@GLOBAL.gtid_executed' 2>/dev/null || true); replica_gtid=$(mysql_exec \"$host\" \"$port\" --execute='SELECT @@GLOBAL.gtid_executed' 2>/dev/null || true); if [ -z \"$source_gtid\" ] || [ -z \"$replica_gtid\" ]; then [ \"$allow_no_gtid\" = 1 ] && return 0; else verdict=$(mysql_exec \"$host\" \"$port\" --execute=\"SELECT IF(GTID_SUBSET('$source_gtid',@@GLOBAL.gtid_executed) AND GTID_SUBSET(@@GLOBAL.gtid_executed,'$source_gtid'),'OK','DIFF')\"); [ \"$verdict\" = OK ] && return 0; fi; fi; sleep 1; n=$((n+1)); done; echo \"replication/GTID check failed for $host:$port (io=$io sql=$sql lag=${lag:-NULL})\" >&2; return 1; }",
+		"mgr_member_state() { mysql_exec \"$1\" \"$2\" --execute=\"SELECT COALESCE(MAX(CASE WHEN MEMBER_ID=@@server_uuid THEN MEMBER_STATE END),'') FROM performance_schema.replication_group_members\" 2>/dev/null || true; }",
+		"mgr_group_health() { mysql_exec \"$1\" \"$2\" --execute=\"SELECT CONCAT_WS('|',(SELECT COUNT(*) FROM performance_schema.replication_group_members),(SELECT COUNT(*) FROM performance_schema.replication_group_members WHERE MEMBER_STATE='ONLINE'),(SELECT COUNT(*) FROM performance_schema.replication_group_members WHERE MEMBER_ROLE='PRIMARY'),COALESCE((SELECT SUM(COUNT_TRANSACTIONS_REMOTE_IN_APPLIER_QUEUE) FROM performance_schema.replication_group_member_stats),0))\" 2>/dev/null || true; }",
 	}, "\n")
 }
 
@@ -292,6 +302,30 @@ func mysqlLifecycleReplicationCheckScript(members []app.MySQLInstanceTarget, all
 	}
 	lines = append(lines, "echo 'GMHA_REPLICATION_HEALTH_OK'")
 	return strings.Join(lines, "\n")
+}
+
+func mysqlLifecycleMGRCheckScript(host string, port, expectedMembers, attempts int) string {
+	return strings.Join([]string{
+		"mgr_ok=0",
+		"for attempt in $(seq 1 " + strconv.Itoa(attempts) + "); do",
+		"  mgr_health=$(mgr_group_health " + shellQuote(host) + " " + strconv.Itoa(port) + ")",
+		"  IFS='|' read -r mgr_total mgr_online mgr_primaries mgr_queue <<< \"$mgr_health\"",
+		"  if [ \"$mgr_total\" = " + strconv.Itoa(expectedMembers) + " ] && [ \"$mgr_online\" = " + strconv.Itoa(expectedMembers) + " ] && [ \"$mgr_primaries\" = 1 ] && [ \"${mgr_queue:-1}\" = 0 ]; then mgr_ok=1; break; fi",
+		"  sleep 1",
+		"done",
+		"[ \"$mgr_ok\" = 1 ] || { echo \"MGR health check failed: total=${mgr_total:-?} online=${mgr_online:-?} primaries=${mgr_primaries:-?} queue=${mgr_queue:-?}\" >&2; exit 78; }",
+		"echo 'GMHA_MGR_HEALTH_OK members=" + strconv.Itoa(expectedMembers) + "'",
+	}, "\n")
+}
+
+func mysqlLifecycleMGRRemainingCheckScript(targetIP string, targetPort int, members []app.MySQLInstanceTarget, attempts int) string {
+	for _, member := range members {
+		if member.Machine.IP == targetIP && member.Instance.Port == targetPort {
+			continue
+		}
+		return mysqlLifecycleMGRCheckScript(member.Machine.IP, member.Instance.Port, len(members)-1, attempts)
+	}
+	return "echo 'MGR shutdown requires another managed member for quorum verification' >&2; exit 78"
 }
 
 func mysqlLifecyclePTCheckScript(members []app.MySQLInstanceTarget, phase string) string {

@@ -134,3 +134,41 @@ func TestAlertRepositoryPersistsRuleEventChannelAndMetricConfig(t *testing.T) {
 		t.Fatalf("missing event must return ErrNotFound, got %v", err)
 	}
 }
+
+func TestAlertRepositoryClassifiesRestartFromTaskAudit(t *testing.T) {
+	db, err := sql.Open("sqlite", t.TempDir()+"/restart-classification.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store := NewDB(db, DialectSQLite)
+	if err := NewTaskRepository(store).Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	repo := NewAlertRepository(store)
+	observedAt := time.Date(2026, 7, 28, 8, 5, 0, 0, time.UTC)
+	bootAt := observedAt.Add(-30 * time.Second)
+	startedAt := bootAt.Add(-time.Minute)
+	if _, err := store.Exec(`
+		insert into tasks(id,type,machine_id,agent_id,status,progress_percent,current_step,spec_json,created_at,started_at,finished_at)
+		values(?,?,?,?,?,?,?,?,?,?,?)`,
+		"restart-task", "exec", "machine-1", "agent-1", "success", 100, "重启 MySQL",
+		`{"operation":"mysql_restart","port":3307,"command":"[redacted after execution]"}`,
+		startedAt.Format(time.RFC3339Nano), startedAt.Format(time.RFC3339Nano), observedAt.Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	classification, err := repo.ClassifyMySQLRestart(context.Background(), "machine-1", 3307, bootAt, observedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !classification.Manual || classification.TaskID != "restart-task" || classification.Operation != "mysql_restart" {
+		t.Fatalf("matching restart task was not classified as manual: %+v", classification)
+	}
+	classification, err = repo.ClassifyMySQLRestart(context.Background(), "machine-1", 3306, bootAt, observedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if classification.Manual {
+		t.Fatalf("a task for another MySQL port must not classify the restart as manual: %+v", classification)
+	}
+}

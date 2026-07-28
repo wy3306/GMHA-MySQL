@@ -76,6 +76,23 @@ func TestXtraBackupScriptsEnforceServerSeriesCompatibility(t *testing.T) {
 	}
 }
 
+func TestXtraBackupRestoreProtectsAndVerifiesMGRMembers(t *testing.T) {
+	for _, expected := range []string{
+		"performance_schema.replication_group_members",
+		"single-member point-in-time restore is unsafe for an active MGR group",
+		"pt-table-sync async repair is not valid for an active MGR member",
+		`"$mgr_self_state" == "ONLINE"`,
+		`"$mgr_member_count" == "$MGR_EXPECTED_MEMBERS"`,
+		`"$mgr_primary_count" == "1"`,
+		`"$mgr_queue" == "0"`,
+		"restored MGR member rejoined and caught up",
+	} {
+		if !strings.Contains(xtrabackupRestoreScript, expected) {
+			t.Fatalf("restore script missing MGR safety guard %q", expected)
+		}
+	}
+}
+
 func TestXtraBackupBackupScriptChecksInstalledSeriesBeforeBackup(t *testing.T) {
 	root := t.TempDir()
 	binDir := filepath.Join(root, "bin")
@@ -102,6 +119,7 @@ if [[ "${1:-}" == --defaults-file=* && "$*" == *"--backup"* ]]; then
 fi
 `)
 	writeExecutable("flock", "#!/usr/bin/env bash\nexit 0\n")
+	writeExecutable("df", "#!/usr/bin/env bash\nprintf 'Filesystem 1024-blocks Used Available Capacity Mounted on\\nfake 100 50 50 50%% /\\n'\n")
 	scriptPath := filepath.Join(root, "backup.sh")
 	if err := os.WriteFile(scriptPath, []byte(xtrabackupBackupScript), 0o755); err != nil {
 		t.Fatal(err)

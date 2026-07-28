@@ -21,3 +21,20 @@ func TestTopologyEdgeIncludesConfiguredSQLDelay(t *testing.T) {
 		t.Fatalf("unexpected topology edge: %+v", edge)
 	}
 }
+
+func TestApplyTopologyGroupReplication(t *testing.T) {
+	node := clusterTopologyNode{Name: "db-1"}
+	applyTopologyGroupReplication(&node, map[string]any{
+		"active":       true,
+		"group_name":   "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+		"member_count": 3,
+		"online_count": 3,
+		"quorum":       true,
+		"self": map[string]any{
+			"member_id": "server-uuid-1", "member_state": "ONLINE", "member_role": "PRIMARY",
+		},
+	})
+	if node.GroupRole != "PRIMARY" || node.GroupState != "ONLINE" || node.GroupMembers != 3 || node.GroupOnline != 3 || !node.GroupQuorum {
+		t.Fatalf("unexpected MGR topology node: %+v", node)
+	}
+}

@@ -497,6 +497,36 @@
   font-weight: 800;
 }
 
+.architecture-execution-modal .architecture-blockers {
+  display: grid;
+  gap: 6px;
+}
+
+.architecture-repair-packages {
+  width: max-content;
+  margin-top: 7px;
+}
+
+.architecture-warnings {
+  margin: 12px 18px 0;
+  padding: 11px 14px;
+  border-left: 3px solid #d79a2b;
+  border-radius: 5px;
+  background: #fff9eb;
+}
+
+.architecture-warnings b {
+  color: #946314;
+  font-size: 12px;
+}
+
+.architecture-warnings p {
+  margin: 5px 0 0;
+  color: #805f2c;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
 .architecture-dialog-steps {
   display: grid;
   margin: 0;

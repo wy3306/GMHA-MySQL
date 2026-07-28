@@ -786,6 +786,46 @@ func TestMySQLParameterBatchClassifiesDynamicAndRestartChanges(t *testing.T) {
 	}
 }
 
+func TestMySQLServerIDParameterRequiresSafeRangeAndCannotBeDeleted(t *testing.T) {
+	for _, value := range []string{"", "0", "-1", "4294967296", "1.5", "not-a-number"} {
+		if _, err := parseMySQLServerID(value); err == nil {
+			t.Fatalf("unsafe server_id %q was accepted", value)
+		}
+	}
+	for _, value := range []string{"1", "4294967295"} {
+		if _, err := parseMySQLServerID(value); err != nil {
+			t.Fatalf("valid server_id %q was rejected: %v", value, err)
+		}
+	}
+	if _, _, _, _, err := mysqlParameterCommand("mysql-client", mysqlParameterTaskRequest{
+		Action: "delete", Name: "server_id", ConfigPath: "/data/3306/my.cnf", Port: 3306,
+	}); err == nil || !strings.Contains(err.Error(), "不能删除") {
+		t.Fatalf("server_id deletion should be rejected clearly, got %v", err)
+	}
+}
+
+func TestMySQLServerIDBatchGuardsMGRAndVerifiesRestartedValue(t *testing.T) {
+	command, err := mysqlParameterBatchCommand("mysql-client", mysqlParameterTargetRequest{
+		Port: 3306, ConfigPath: "/data/3306/my.cnf", SystemdUnit: "mysqld-3306",
+	}, []mysqlParameterChangeRequest{{Action: "update", Name: "server_id", Value: "102"}}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"replication_group_members",
+		"active MGR member must use the architecture adjustment workflow",
+		"server_id=102",
+		"systemctl restart 'mysqld-3306'",
+		"SELECT @@server_id",
+		"GMHA_SERVER_ID_VERIFIED",
+		"expected 102",
+	} {
+		if !strings.Contains(command, want) {
+			t.Fatalf("server_id command missing %q: %s", want, command)
+		}
+	}
+}
+
 func TestClusterAutomationShellSupportsMultipleClusters(t *testing.T) {
 	req := validAutomationRequest()
 	req.Clusters = []string{"cluster-a", "cluster-b", "cluster-c"}

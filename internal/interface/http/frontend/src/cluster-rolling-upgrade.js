@@ -49,6 +49,7 @@ export default {
       return Math.round(stages.filter(stage => stage.status === 'success').length * 100 / stages.length)
     })
     const runActive = computed(() => ['pending', 'running'].includes(run.value?.status))
+    const isMGR = computed(() => (run.value?.architecture || plan.value?.architecture) === 'mgr_router')
     const temporaryPrimary = computed(() => (run.value?.nodes || plan.value?.nodes || []).find(node => node.machine_id === (run.value?.temporary_primary_machine_id || plan.value?.temporary_primary_machine_id)))
     const originalPrimary = computed(() => (run.value?.nodes || plan.value?.nodes || []).find(node => node.machine_id === (run.value?.original_primary_machine_id || plan.value?.original_primary_machine_id)))
 
@@ -82,7 +83,10 @@ export default {
 
     async function startUpgrade() {
       if (!plan.value?.executable || !riskAcknowledged.value) return
-      if (!confirm(`确认将集群 ${props.clusterName} 的全部 MySQL 节点滚动升级到 ${targetVersion.value}？\n\n系统会先升级从库，迁移 VIP 并切主，再升级原主库，最后切回原主库。任一步骤不满足安全条件都会停止。`)) return
+      const route = isMGR.value
+        ? '系统会逐台升级 SECONDARY，将原 PRIMARY 安全移出复制组后完成组内切主，再升级并重新加入原 PRIMARY；Router 持续跟随组元数据。'
+        : '系统会先升级从库，迁移 VIP 并切主，再升级原主库，最后切回原主库。'
+      if (!confirm(`确认将集群 ${props.clusterName} 的全部 MySQL 节点滚动升级到 ${targetVersion.value}？\n\n${route}任一步骤不满足安全条件都会停止。`)) return
       starting.value = true
       error.value = ''
       const token = ++pollToken
@@ -112,15 +116,15 @@ export default {
     onUnmounted(() => { pollToken++ })
     return {
       targetVersion, targetVersions, currentVersions, port, planning, starting, error, plan, run,
-      riskAcknowledged, progress, runActive, temporaryPrimary, originalPrimary,
+      riskAcknowledged, progress, runActive, isMGR, temporaryPrimary, originalPrimary,
       stageLabel, createPlan, startUpgrade, openTask
     }
   },
   template: `
     <section class="cluster-rolling-upgrade">
       <header class="rolling-upgrade-hero">
-        <div><p>ZERO-DOWNTIME ROLLING UPGRADE</p><h3>集群不停机滚动升级</h3><span>先逐台升级从库，再迁移 VIP 并切换主从；升级原主库后切回，始终保留可用写入口。</span></div>
-        <div class="rolling-upgrade-route"><span><b>1</b>升级从库</span><i>→</i><span><b>2</b>切换主从</span><i>→</i><span><b>3</b>升级原主</span><i>→</i><span><b>4</b>切回原主</span></div>
+        <div><p>ZERO-DOWNTIME ROLLING UPGRADE</p><h3>集群不停机滚动升级</h3><span>{{ isMGR ? '逐台升级 SECONDARY，安全移出并升级原 PRIMARY；MGR 保持多数派，Router 跟随组内选主。' : '先逐台升级从库，再迁移 VIP 并切换主从；升级原主库后切回，始终保留可用写入口。' }}</span></div>
+        <div class="rolling-upgrade-route"><span><b>1</b>升级{{ isMGR ? ' SECONDARY' : '从库' }}</span><i>→</i><span><b>2</b>{{ isMGR ? '组内切主' : '切换主从' }}</span><i>→</i><span><b>3</b>升级原主</span><i>→</i><span><b>4</b>切回原主</span></div>
       </header>
 
       <div class="rolling-upgrade-config">
@@ -135,8 +139,8 @@ export default {
         <section class="rolling-upgrade-summary">
           <article><small>当前版本</small><b>{{ currentVersions.join(' / ') || '未知' }}</b></article>
           <article><small>目标版本</small><b>{{ run?.target_version || plan?.target_version }}</b></article>
-          <article><small>原主库</small><b>{{ originalPrimary?.machine || '未识别' }}</b></article>
-          <article><small>临时主库</small><b>{{ temporaryPrimary?.machine || '未识别' }}</b></article>
+          <article><small>原{{ isMGR ? ' PRIMARY' : '主库' }}</small><b>{{ originalPrimary?.machine || '未识别' }}</b></article>
+          <article><small>临时{{ isMGR ? ' PRIMARY' : '主库' }}</small><b>{{ temporaryPrimary?.machine || '未识别' }}</b></article>
           <article><small>整体进度</small><b>{{ progress }}%</b></article>
         </section>
 
@@ -145,17 +149,17 @@ export default {
 
         <div class="rolling-upgrade-layout">
           <section class="rolling-upgrade-stages">
-            <header><div><h4>在线升级状态机</h4><p>Manager 严格串行推进，复制未追平时禁止强制切主。</p></div><button v-if="run?.run_id" class="text-button" @click="openTask">任务详情 →</button></header>
+            <header><div><h4>在线升级状态机</h4><p>{{ isMGR ? 'Manager 严格串行推进，成员未恢复 ONLINE 或失去多数派时立即停止。' : 'Manager 严格串行推进，复制未追平时禁止强制切主。' }}</p></div><button v-if="run?.run_id" class="text-button" @click="openTask">任务详情 →</button></header>
             <ol><li v-for="(stage,index) in (run?.stages || plan?.stages || [])" :key="stage.code" :class="stage.status"><i>{{ stage.status==='success' ? '✓' : stage.status==='failed' ? '!' : index+1 }}</i><span><b>{{ stage.name }}</b><small>{{ stage.message || stageLabel(stage.status) }}</small></span><em>{{ stageLabel(stage.status) }}</em></li></ol>
           </section>
           <section class="rolling-upgrade-nodes">
             <header><h4>节点升级顺序与状态</h4><span>{{ (run?.nodes || plan?.nodes || []).length }} 个节点</span></header>
-            <div><table><thead><tr><th>节点</th><th>当前角色</th><th>版本路径</th><th>制品</th><th>状态</th></tr></thead><tbody><tr v-for="node in (run?.nodes || plan?.nodes || [])" :key="node.machine_id"><td><b>{{ node.machine }}</b><small>{{ node.ip }}:{{ node.port }}</small></td><td><span :class="['rolling-node-role',node.role]">{{ node.machine_id===(run?.original_primary_machine_id || plan?.original_primary_machine_id) ? '原主库' : node.machine_id===(run?.temporary_primary_machine_id || plan?.temporary_primary_machine_id) ? '临时主候选' : '从库' }}</span></td><td>{{ node.current_version }} → {{ node.target_version }}</td><td><code>{{ node.package_name }}</code></td><td><span :class="['status',node.status]">{{ node.status || '等待' }}</span><small v-if="node.error" class="rolling-node-error">{{ node.error }}</small></td></tr></tbody></table></div>
+            <div><table><thead><tr><th>节点</th><th>当前角色</th><th>版本路径</th><th>制品</th><th>状态</th></tr></thead><tbody><tr v-for="node in (run?.nodes || plan?.nodes || [])" :key="node.machine_id"><td><b>{{ node.machine }}</b><small>{{ node.ip }}:{{ node.port }}</small></td><td><span :class="['rolling-node-role',node.role]">{{ node.machine_id===(run?.original_primary_machine_id || plan?.original_primary_machine_id) ? (isMGR ? '原 PRIMARY' : '原主库') : node.machine_id===(run?.temporary_primary_machine_id || plan?.temporary_primary_machine_id) ? (isMGR ? '临时 PRIMARY 候选' : '临时主候选') : (isMGR ? 'SECONDARY' : '从库') }}</span></td><td>{{ node.current_version }} → {{ node.target_version }}</td><td><code>{{ node.package_name }}</code></td><td><span :class="['status',node.status]">{{ node.status || '等待' }}</span><small v-if="node.error" class="rolling-node-error">{{ node.error }}</small></td></tr></tbody></table></div>
           </section>
         </div>
 
         <footer v-if="!run" class="rolling-upgrade-submit">
-          <label><input v-model="riskAcknowledged" type="checkbox"><span><b>我确认已完成全节点可恢复备份，并验证客户端具备断线重连能力</b><small>主从切换会迁移 VIP 并短暂重建连接，但不会同时停止全部数据库节点。</small></span></label>
+          <label><input v-model="riskAcknowledged" type="checkbox"><span><b>我确认已完成全节点可恢复备份，并验证客户端具备断线重连能力</b><small>{{ isMGR ? 'MGR PRIMARY 切换会使 Router 上的连接短暂重建，但升级始终保留多数派。' : '主从切换会迁移 VIP 并短暂重建连接，但不会同时停止全部数据库节点。' }}</small></span></label>
           <button class="primary" :disabled="!plan?.executable || !riskAcknowledged || starting" @click="startUpgrade">{{ starting ? '正在启动…' : '开始集群不停机升级' }}</button>
         </footer>
         <footer v-else class="rolling-upgrade-running"><div><b>{{ run.status==='success' ? '集群滚动升级完成' : run.status==='failed' ? '流程已安全停止' : '滚动升级正在执行' }}</b><small>运行 ID：{{ run.run_id }} · 当前阶段：{{ run.current_stage || '准备中' }}</small></div><progress :value="progress" max="100"></progress></footer>

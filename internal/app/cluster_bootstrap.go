@@ -48,6 +48,9 @@ type ClusterBootstrapRequest struct {
 	Architecture             string                    `json:"architecture"`
 	PrimaryMachineID         string                    `json:"primary_machine_id"`
 	SecondaryMasterMachineID string                    `json:"secondary_master_machine_id,omitempty"`
+	MGRGroupName             string                    `json:"mgr_group_name,omitempty"`
+	MGRPort                  int                       `json:"mgr_port,omitempty"`
+	RouterPort               int                       `json:"router_port,omitempty"`
 	EnableVIP                bool                      `json:"enable_vip"`
 	VIP                      hadomain.ClusterVIPConfig `json:"vip"`
 	Installs                 []ClusterBootstrapInstall `json:"installs"`
@@ -56,11 +59,19 @@ type ClusterBootstrapRequest struct {
 }
 
 func validateClusterBootstrapRequest(req ClusterBootstrapRequest) error {
-	if req.Architecture != hadomain.ArchitectureMasterSlave && req.Architecture != hadomain.ArchitectureDualMaster {
-		return errors.New("architecture must be master_slave or dual_master")
+	if req.Architecture != hadomain.ArchitectureMasterSlave && req.Architecture != hadomain.ArchitectureDualMaster && req.Architecture != hadomain.ArchitectureMGRRouter {
+		return errors.New("architecture must be master_slave, dual_master or mgr_router")
 	}
 	if len(req.Installs) < 2 {
 		return errors.New("at least two install targets are required")
+	}
+	if req.Architecture == hadomain.ArchitectureMGRRouter {
+		if len(req.Installs) < 3 || len(req.Installs) > 9 || len(req.Installs)%2 == 0 {
+			return errors.New("mgr_router bootstrap requires 3, 5, 7 or 9 install targets")
+		}
+		if req.EnableVIP {
+			return errors.New("mgr_router exposes MySQL Router endpoints and cannot enable a database VIP")
+		}
 	}
 	ids := make(map[string]bool, len(req.Installs))
 	for _, item := range req.Installs {
@@ -168,6 +179,9 @@ func (s *HAService) executeClusterBootstrap(ctx context.Context, parentID, clust
 		if item.MachineID == req.PrimaryMachineID || (req.Architecture == hadomain.ArchitectureDualMaster && item.MachineID == req.SecondaryMasterMachineID) {
 			role, source = "M", ""
 		}
+		if req.Architecture == hadomain.ArchitectureMGRRouter {
+			source = ""
+		}
 		nodes = append(nodes, hadomain.ArchitectureNodeRequest{MachineID: item.MachineID, Port: item.Port, Role: role, SourceMachineID: source, ElectionPriority: 50})
 		rootPasswords[item.MachineID] = item.RootPassword
 	}
@@ -175,8 +189,10 @@ func (s *HAService) executeClusterBootstrap(ctx context.Context, parentID, clust
 	run, err := s.StartArchitectureAdjustment(ctx, clusterID, hadomain.ArchitectureAdjustmentRequest{
 		Architecture: req.Architecture, PreferredNewMasterMachineID: req.PrimaryMachineID,
 		MoveVIP: req.EnableVIP, InitializeVIP: req.EnableVIP,
+		MGRGroupName: req.MGRGroupName, MGRPort: req.MGRPort, RouterPort: req.RouterPort,
 		ManagementUsers: []string{"root", "monitor", "mha", "backup", "repl"}, RootPassword: req.Installs[0].RootPassword, RootPasswords: rootPasswords,
 		ReplicationUser: req.replicationUser, ReplicationPassword: req.replicationPassword, Nodes: nodes,
+		FreshInstall: req.Architecture == hadomain.ArchitectureMGRRouter,
 	})
 	if err != nil {
 		fail("apply_architecture", err)

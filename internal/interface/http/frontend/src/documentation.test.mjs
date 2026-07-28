@@ -50,6 +50,8 @@ test('cluster management UI operations stay covered by the API manual', async ()
     ['POST', '/clusters/{cluster_name}/architecture/start'],
     ['GET', '/clusters/{cluster_name}/architecture/{run_id}'],
     ['POST', '/clusters/{cluster_name}/architecture/{run_id}/force'],
+    ['GET', '/clusters/{cluster_name}/mgr'],
+    ['POST', '/clusters/{cluster_name}/mgr/actions'],
     ['POST', '/tasks/cluster-mysql-uninstall'],
     ['POST', '/tasks/mysql-cluster-upgrade/plan'],
     ['POST', '/tasks/mysql-cluster-upgrade/start'],
@@ -82,6 +84,7 @@ test('cluster management UI operations stay covered by the API manual', async ()
     '/vip/scan',
     '/architecture/plan',
     '/architecture/start',
+    '/mgr',
     '/backup/targets',
     '/backup/policies',
     '/backup/runs/'

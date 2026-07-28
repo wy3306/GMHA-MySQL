@@ -38,12 +38,14 @@ type HARepository interface {
 
 // HAService 是高可用服务，负责故障转移规划和执行、VIP 管理、候选评分。
 type HAService struct {
-	repo      HARepository
-	machines  machinedomain.Repository
-	instances MySQLInstanceRepository
-	presets   MySQLAccountPresetRepository
-	vip       *VIPService
-	tasks     *TaskService
+	repo            HARepository
+	machines        machinedomain.Repository
+	instances       MySQLInstanceRepository
+	presets         MySQLAccountPresetRepository
+	vip             *VIPService
+	tasks           *TaskService
+	packages        *PackageService
+	managerHTTPAddr string
 }
 
 func NewHAService(repo HARepository, machines machinedomain.Repository, instances MySQLInstanceRepository, presets ...MySQLAccountPresetRepository) *HAService {
@@ -72,6 +74,13 @@ func (s *HAService) architectureManagementAccount(ctx context.Context) (string, 
 
 func (s *HAService) VIP() *VIPService {
 	return s.vip
+}
+
+// ConfigureMGRRouter supplies the trusted Router artifact repository and the
+// Manager address used by Agents to download those artifacts.
+func (s *HAService) ConfigureMGRRouter(packages *PackageService, managerHTTPAddr string) {
+	s.packages = packages
+	s.managerHTTPAddr = strings.TrimRight(strings.TrimSpace(managerHTTPAddr), "/")
 }
 
 type vipConfigWriter interface {
@@ -307,7 +316,7 @@ func (s *VIPService) Scan(ctx context.Context, clusterID string) ([]hadomain.VIP
 	if err != nil {
 		return nil, err
 	}
-	parent, err := s.tasks.CreateBatchTrackingTask(ctx, "vip_scan", "扫描集群 VIP 绑定状态", clusterID)
+	parent, err := s.tasks.CreateInternalBatchTrackingTask(ctx, "vip_scan", "扫描集群 VIP 绑定状态", clusterID)
 	if err != nil {
 		return nil, err
 	}

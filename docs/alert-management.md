@@ -15,6 +15,8 @@
 
 规则通过 `consecutive_count` 控制连续命中次数，通过 `repeat_interval_seconds` 控制重复间隔，通过 `max_notifications` 控制一次持续故障最多推送次数（`0` 为不限）。
 
+Manager 会持续比较同一 MySQL 实例相邻样本推算出的启动时间，并把启动时间变化记录为 `mysql_restart_detected` 事件。若重启时间与 GMHA 任务审计中的安全重启、参数重启、升级、恢复或架构调整任务吻合，事件记为“手动重启”，等级为 `notice`（通知）；没有匹配到平台任务时记为“意外重启”，等级为 `critical`（严重）。事件标签会保留实例端口、重启时间、前后运行时长，以及可用的任务 ID 和操作编码，便于追溯。
+
 ## HTTP API
 
 | 接口 | 方法 | 用途 |

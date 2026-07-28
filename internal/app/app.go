@@ -277,6 +277,7 @@ func New(cfg Config) (*App, error) {
 	sqlDiagnosticService.Start()
 	haService := NewHAService(haRepo, machinedomain.Repository(machineRepo), mysqlInstanceRepo, mysqlAccountPresetRepo)
 	haService.ConfigureArchitectureExecutor(taskService)
+	haService.ConfigureMGRRouter(packageService, cfg.ManagerHTTPAddr)
 	clusterUpgradeService := NewClusterUpgradeService(taskService, haService)
 	if err := clusterUpgradeService.RecoverInterrupted(context.Background()); err != nil {
 		_ = db.Close()

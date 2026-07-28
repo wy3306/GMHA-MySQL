@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -62,6 +63,19 @@ func TestArchitectureRootPasswordUsesPerMachineCredential(t *testing.T) {
 	}
 }
 
+func TestFreshInstallMarkerIsNeverSerialized(t *testing.T) {
+	payload, err := json.Marshal(hadomain.ArchitectureAdjustmentRequest{
+		Architecture: hadomain.ArchitectureMGRRouter,
+		FreshInstall: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(payload), "FreshInstall") || strings.Contains(string(payload), "fresh_install") {
+		t.Fatalf("execution-only fresh-install marker leaked into persisted/API JSON: %s", payload)
+	}
+}
+
 func TestValidateClusterBootstrapDualMasterRequiresSecondMaster(t *testing.T) {
 	req := validClusterBootstrapRequest()
 	req.Architecture = hadomain.ArchitectureDualMaster
@@ -71,6 +85,29 @@ func TestValidateClusterBootstrapDualMasterRequiresSecondMaster(t *testing.T) {
 	req.SecondaryMasterMachineID = "machine-2"
 	if err := validateClusterBootstrapRequest(req); err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateClusterBootstrapMGRRouter(t *testing.T) {
+	req := validClusterBootstrapRequest()
+	req.Architecture = hadomain.ArchitectureMGRRouter
+	req.MGRPort, req.RouterPort = 33061, 6446
+	req.Installs = append(req.Installs, ClusterBootstrapInstall{
+		Machine: "10.0.0.3", MachineID: "machine-3", Port: 3306, ServerID: 3, RootPassword: "root-secret",
+		Accounts: []taskdomain.MySQLAccountSpec{{Role: "mha", Username: "mha", Password: "secret", Enabled: true}},
+	})
+	if err := validateClusterBootstrapRequest(req); err != nil {
+		t.Fatalf("three-member MGR bootstrap should be valid: %v", err)
+	}
+	req.EnableVIP = true
+	req.VIP.VIPAddress = "10.0.0.100"
+	if err := validateClusterBootstrapRequest(req); err == nil || !strings.Contains(err.Error(), "VIP") {
+		t.Fatalf("MGR bootstrap must reject VIP: %v", err)
+	}
+	req.EnableVIP = false
+	req.Installs = req.Installs[:2]
+	if err := validateClusterBootstrapRequest(req); err == nil || !strings.Contains(err.Error(), "3, 5, 7 or 9") {
+		t.Fatalf("MGR bootstrap must reject two members: %v", err)
 	}
 }
 

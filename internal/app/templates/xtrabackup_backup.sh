@@ -83,7 +83,18 @@ printf '%s\n' "$xtrabackup_version_output" | grep -Eq "xtrabackup version ${esca
 echo "[gmha-backup][INFO] compatibility precheck: MySQL ${mysql_version}, XtraBackup ${xtrabackup_version:-unknown}"
 
 replication_lag() {
-  local status lag
+  local status lag mgr state queue
+  mgr="$(mysql "${mysql_args[@]}" --batch --skip-column-names -e "
+    SELECT CONCAT('MGR:',m.MEMBER_STATE,':',COALESCE(s.COUNT_TRANSACTIONS_IN_QUEUE+s.COUNT_TRANSACTIONS_REMOTE_IN_APPLIER_QUEUE,0))
+    FROM performance_schema.replication_group_members m
+    LEFT JOIN performance_schema.replication_group_member_stats s ON s.MEMBER_ID=m.MEMBER_ID
+    WHERE m.MEMBER_ID=@@server_uuid LIMIT 1" 2>/dev/null || true)"
+  if [[ "$mgr" == MGR:* ]]; then
+    IFS=':' read -r _ state queue <<<"$mgr"
+    [[ "$state" == "ONLINE" ]] || { echo "mgr_${state:-unknown}"; return 0; }
+    echo "${queue:-unknown}"
+    return 0
+  fi
   status="$(mysql "${mysql_args[@]}" -e 'SHOW REPLICA STATUS\G' 2>/dev/null || mysql "${mysql_args[@]}" -e 'SHOW SLAVE STATUS\G' 2>/dev/null || true)"
   [[ -z "$status" ]] && { echo "primary"; return 0; }
   lag="$(printf '%s\n' "$status" | awk -F': ' '/Seconds_Behind_(Source|Master):/{print $2; exit}' | tr -d '[:space:]')"
@@ -95,7 +106,7 @@ wait_replication_zero() {
   while (( elapsed <= REPLICATION_LAG_WAIT )); do
     lag="$(replication_lag)"
     if [[ "$lag" == "primary" ]]; then echo "[gmha-backup][INFO] selected instance is primary/standalone; replica lag check skipped"; return 0; fi
-    if [[ "$lag" == "0" ]]; then echo "[gmha-backup][INFO] replication lag reached 0 seconds"; return 0; fi
+    if [[ "$lag" == "0" ]]; then echo "[gmha-backup][INFO] replication lag/apply queue reached 0"; return 0; fi
     echo "[gmha-backup][WARN] replication lag=${lag}; waiting ${elapsed}/${REPLICATION_LAG_WAIT}s"
     sleep 2; elapsed=$((elapsed + 2))
   done

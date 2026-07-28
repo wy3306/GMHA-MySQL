@@ -69,6 +69,7 @@ type ClusterCleanupMachineResult struct {
 	MachineID          string   `json:"machine_id"`
 	Name               string   `json:"name"`
 	IP                 string   `json:"ip"`
+	RouterCleanupTask  []string `json:"router_cleanup_tasks,omitempty"`
 	MySQLUninstallTask []string `json:"mysql_uninstall_tasks,omitempty"`
 	MySQLPorts         []int    `json:"mysql_ports,omitempty"`
 	AgentUninstalled   bool     `json:"agent_uninstalled"`
@@ -1159,10 +1160,23 @@ func (s *MachineService) UnassignMachineCluster(ctx context.Context, machineID s
 	if strings.TrimSpace(machineID) == "" {
 		return errors.New("machine id is required")
 	}
-	if _, ok, err := s.machineRepo.GetByID(ctx, machineID); err != nil {
+	machine, ok, err := s.machineRepo.GetByID(ctx, machineID)
+	if err != nil {
 		return err
-	} else if !ok {
+	}
+	if !ok {
 		return errors.New("machine not found")
+	}
+	if strings.TrimSpace(machine.Cluster) != "" && s.taskSvc != nil {
+		instancesByMachineID, listErr := s.mysqlInstancesByMachineID(ctx)
+		if listErr != nil {
+			return listErr
+		}
+		for _, instance := range instancesByMachineID[machineID] {
+			if guardErr := s.taskSvc.validateMGRUninstallGuard(ctx, machineID, instance.Port); guardErr != nil {
+				return fmt.Errorf("活动 MGR 成员不能直接移出集群；请先在受控维护中解散/重建该组，或执行整集群清理: %w", guardErr)
+			}
+		}
 	}
 	return s.machineRepo.AssignCluster(ctx, machineID, "")
 }
@@ -1241,8 +1255,36 @@ func (s *MachineService) ensureClusterReferencesCanChange(ctx context.Context, n
 	if len(active) > 0 {
 		blockers = append(blockers, fmt.Sprintf("%d 个进行中任务", len(active)))
 	}
+	if err := s.ensureClusterHasNoActiveMGR(ctx, name); err != nil {
+		blockers = append(blockers, err.Error())
+	}
 	if len(blockers) > 0 {
 		return fmt.Errorf("集群 %s 仍有关联资源（%s），不能直接%s；请先处理引用或使用一键清理", name, strings.Join(blockers, "、"), operation)
+	}
+	return nil
+}
+
+func (s *MachineService) ensureClusterHasNoActiveMGR(ctx context.Context, clusterName string) error {
+	if s.taskSvc == nil || s.clusterHA == nil {
+		return nil
+	}
+	instancesByMachineID, err := s.mysqlInstancesByMachineID(ctx)
+	if err != nil {
+		return err
+	}
+	machines, err := s.machineRepo.List(ctx)
+	if err != nil {
+		return err
+	}
+	for _, machine := range machines {
+		if machine.Cluster != clusterName {
+			continue
+		}
+		for _, instance := range instancesByMachineID[machine.ID] {
+			if err := s.taskSvc.validateMGRUninstallGuard(ctx, machine.ID, instance.Port); err != nil {
+				return fmt.Errorf("活动 MGR 拓扑或其安全状态无法确认（%s:%d）", machine.Name, instance.Port)
+			}
+		}
 	}
 	return nil
 }
@@ -1340,11 +1382,19 @@ func (s *MachineService) CleanupCluster(ctx context.Context, name string) (Clust
 			continue
 		}
 		item := ClusterCleanupMachineResult{MachineID: machine.ID, Name: machine.Name, IP: machine.IP}
+		if s.clusterHA != nil {
+			taskIDs, cleanupErr := s.clusterHA.CleanupMGRRouterNode(ctx, name, machine)
+			item.RouterCleanupTask = append(item.RouterCleanupTask, taskIDs...)
+			if cleanupErr != nil {
+				item.Error = appendCleanupError(item.Error, fmt.Sprintf("MySQL Router 清理失败: %v", cleanupErr))
+			}
+		}
 		for _, instance := range instancesByMachineID[machine.ID] {
 			item.MySQLPorts = append(item.MySQLPorts, instance.Port)
 			detail, err := s.taskSvc.CreateMySQLUninstallTask(ctx, taskusecase.CreateMySQLUninstallTaskRequest{
-				Machine: machine.IP,
-				Port:    instance.Port,
+				Machine:  machine.IP,
+				Port:     instance.Port,
+				AllowMGR: true,
 			})
 			if err != nil {
 				item.Error = appendCleanupError(item.Error, fmt.Sprintf("MySQL %d 卸载任务创建失败: %v", instance.Port, err))

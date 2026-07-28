@@ -54,6 +54,8 @@ var clusterAPICatalog = []ClusterAPIEndpoint{
 	{ID: "clusters.architecture.start", Group: "ha", Method: http.MethodPost, Path: "/api/v1/clusters/{cluster_name}/architecture/start", Description: "启动架构调整", InvocationMode: "ai_action", AIActionID: "configure_cluster_architecture"},
 	{ID: "clusters.architecture.get", Group: "ha", Method: http.MethodGet, Path: "/api/v1/clusters/{cluster_name}/architecture/{run_id}", Description: "查询架构调整状态", InvocationMode: "read"},
 	{ID: "clusters.architecture.force", Group: "ha", Method: http.MethodPost, Path: "/api/v1/clusters/{cluster_name}/architecture/{run_id}/force", Description: "人工确认强制继续架构切换", InvocationMode: "approval_api"},
+	{ID: "clusters.mgr.status", Group: "ha", Method: http.MethodGet, Path: "/api/v1/clusters/{cluster_name}/mgr", Description: "查询 MGR 成员、法定人数、InnoDB Cluster 与 Router 状态", InvocationMode: "read"},
+	{ID: "clusters.mgr.actions", Group: "ha", Method: http.MethodPost, Path: "/api/v1/clusters/{cluster_name}/mgr/actions", Description: "执行 PRIMARY 切换、成员重入、元数据重扫、恢复账户轮换或全组停机恢复", InvocationMode: "approval_api"},
 	{ID: "clusters.failover.plan", Group: "ha", Method: http.MethodPost, Path: "/api/v1/clusters/{cluster_name}/failover/plan", Description: "生成故障切换计划", InvocationMode: "approval_api"},
 	{ID: "clusters.failover.start", Group: "ha", Method: http.MethodPost, Path: "/api/v1/clusters/{cluster_name}/failover/start", Description: "启动受保护的故障切换", InvocationMode: "approval_api"},
 	{ID: "clusters.failover.get", Group: "ha", Method: http.MethodGet, Path: "/api/v1/clusters/{cluster_name}/failover/{failover_id}", Description: "查询故障切换状态", InvocationMode: "read"},

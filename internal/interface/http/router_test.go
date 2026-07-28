@@ -12,6 +12,8 @@ func TestIsHAClusterActionPath(t *testing.T) {
 		{"/api/v1/clusters/demo/vip/config", true},
 		{"/api/v1/clusters/demo/failover/plan", true},
 		{"/api/v1/clusters/demo/architecture/start", true},
+		{"/api/v1/clusters/demo/mgr", true},
+		{"/api/v1/clusters/demo/mgr/actions", true},
 		{"/api/v1/clusters/demo", false},
 		{"/api/v1/clusters/demo/machines", false},
 		{"/api/v1/clusters/bootstrap-demo", false},

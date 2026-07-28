@@ -27,6 +27,17 @@ const (
 	TypeFlameGraph          Type = "flamegraph"
 )
 
+// Visibility separates user-initiated business work from platform-internal
+// probes and collection jobs. Internal tasks remain durable for dispatch,
+// reporting and troubleshooting, but never become standalone task-center
+// records.
+type Visibility string
+
+const (
+	VisibilityUser     Visibility = "user"
+	VisibilityInternal Visibility = "internal"
+)
+
 type Status string
 
 const (
@@ -35,6 +46,7 @@ const (
 	StatusRunning Status = "running"
 	StatusSuccess Status = "success"
 	StatusFailed  Status = "failed"
+	StatusSkipped Status = "skipped"
 )
 
 type StepStatus string
@@ -44,7 +56,14 @@ const (
 	StepRunning StepStatus = "running"
 	StepSuccess StepStatus = "success"
 	StepFailed  StepStatus = "failed"
+	StepSkipped StepStatus = "skipped"
 )
+
+// IsTerminalStatus reports whether a task can no longer receive execution
+// progress. Skipped is terminal even though it is neither success nor failure.
+func IsTerminalStatus(status Status) bool {
+	return status == StatusSuccess || status == StatusFailed || status == StatusSkipped
+}
 
 type EventType string
 
@@ -58,6 +77,7 @@ const (
 type Task struct {
 	ID              string
 	ParentTaskID    string
+	Visibility      Visibility
 	Type            Type
 	MachineID       string
 	AgentID         string
@@ -162,6 +182,10 @@ type FlameGraphResult struct {
 // deliberately separate from the generic exec task capability: older Agents
 // can execute shell commands but would pass the placeholder to mysql literally.
 const CapabilityMySQLDefaultsFile = "feature:mysql-defaults-file-v1"
+
+// CapabilityTaskStepResumeV1 marks Agents that understand the status carried
+// by DispatchStep and skip steps that succeeded on an earlier attempt.
+const CapabilityTaskStepResumeV1 = "feature:task-step-resume-v1"
 
 type CollectMachineInfoSpec struct{}
 
@@ -371,9 +395,10 @@ type DispatchTask struct {
 }
 
 type DispatchStep struct {
-	ID       string `json:"id"`
-	StepNo   int    `json:"step_no"`
-	StepName string `json:"step_name"`
+	ID       string     `json:"id"`
+	StepNo   int        `json:"step_no"`
+	StepName string     `json:"step_name"`
+	Status   StepStatus `json:"status"`
 }
 
 // ReportEnvelope 是任务进度上报的消息信封，Agent 通过 HTTP 回报任务执行状态。

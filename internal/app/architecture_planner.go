@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -19,6 +20,7 @@ func (s *HAService) PlanArchitectureAdjustment(ctx context.Context, clusterID st
 	if clusterID == "" {
 		return hadomain.ArchitectureAdjustmentPlan{}, errors.New("cluster_id is required")
 	}
+	req = normalizeMGRRouterRequest(clusterID, req)
 	if err := validateArchitectureRequest(req); err != nil {
 		return hadomain.ArchitectureAdjustmentPlan{}, err
 	}
@@ -126,13 +128,102 @@ func (s *HAService) PlanArchitectureAdjustment(ctx context.Context, clusterID st
 			plan.BlockingReasons = append(plan.BlockingReasons, fmt.Sprintf("VIP route mode %s cannot be executed automatically", plan.VIPRouteMode))
 		}
 	}
+	if req.Architecture == hadomain.ArchitectureMGRRouter {
+		artifactsByCategory := make(map[string]routerArtifacts)
+		mgrInstances := make(map[string]mysqlapp.Instance, len(req.Nodes))
+		if req.CurrentArchitecture != hadomain.ArchitectureMGRRouter && s.packages == nil {
+			plan.Executable = false
+			plan.BlockingReasons = append(plan.BlockingReasons, "MySQL Shell/Router package repository is not configured")
+		} else if req.CurrentArchitecture != hadomain.ArchitectureMGRRouter {
+			for _, category := range []string{"mysql-shell", "mysql-router"} {
+				artifacts, packageErr := s.resolveMGRToolArtifacts(category)
+				if packageErr != nil {
+					plan.Executable = false
+					plan.BlockingReasons = append(plan.BlockingReasons, "cannot use "+category+" package repository: "+packageErr.Error())
+					continue
+				}
+				artifactsByCategory[category] = artifacts
+			}
+		}
+		serverIDs := make(map[int]string, len(req.Nodes))
+		for _, node := range req.Nodes {
+			instance, ok := architectureInstanceForNode(node, instancesByMachine[node.MachineID])
+			if !ok {
+				plan.Executable = false
+				plan.BlockingReasons = append(plan.BlockingReasons, fmt.Sprintf("node %s has no matching registered MySQL instance", node.MachineID))
+				continue
+			}
+			mgrInstances[node.MachineID] = instance
+			if instance.Status != "" && !strings.EqualFold(instance.Status, mysqlapp.StatusRunning) {
+				plan.Executable = false
+				plan.BlockingReasons = append(plan.BlockingReasons, fmt.Sprintf("node %s MySQL instance is not running", node.MachineID))
+			}
+			if instance.ServerID <= 0 && req.CurrentArchitecture == hadomain.ArchitectureMGRRouter {
+				plan.Executable = false
+				plan.BlockingReasons = append(plan.BlockingReasons, fmt.Sprintf("node %s has an invalid server_id", node.MachineID))
+			} else if other, duplicate := serverIDs[instance.ServerID]; duplicate && req.CurrentArchitecture == hadomain.ArchitectureMGRRouter {
+				plan.Executable = false
+				plan.BlockingReasons = append(plan.BlockingReasons, fmt.Sprintf("nodes %s and %s use duplicate server_id %d", other, node.MachineID, instance.ServerID))
+			} else if instance.ServerID > 0 {
+				serverIDs[instance.ServerID] = node.MachineID
+			}
+			version := instance.Version
+			if strings.TrimSpace(version) == "" {
+				version, _ = mysqlapp.PackageVersion(instance.PackageName)
+			}
+			capabilities, capabilityErr := mysqlapp.CapabilitiesForVersion(version)
+			if capabilityErr != nil || capabilities.Legacy57 || !mgrVersionSupported(version) {
+				plan.Executable = false
+				plan.BlockingReasons = append(plan.BlockingReasons, fmt.Sprintf("node %s must run MySQL 8.0.17 or newer for mgr_router", node.MachineID))
+			}
+			if req.CurrentArchitecture != hadomain.ArchitectureMGRRouter {
+				arch := normalizePackageArch(instance.Architecture)
+				if arch == "" {
+					if detected, detectErr := mysqlapp.PackageArchitecture(instance.PackageName); detectErr == nil {
+						arch = normalizePackageArch(detected)
+					}
+				}
+				for category, artifacts := range artifactsByCategory {
+					available := (arch == "x86_64" && artifacts.X8664.Name != "") || (arch == "aarch64" && artifacts.AArch64.Name != "")
+					if !available {
+						plan.Executable = false
+						plan.BlockingReasons = append(plan.BlockingReasons, fmt.Sprintf("node %s architecture %s has no SHA256-verified %s artifact", node.MachineID, arch, category))
+					}
+				}
+			}
+		}
+		if req.CurrentArchitecture != hadomain.ArchitectureMGRRouter {
+			for machineID, plannedID := range plannedMGRServerIDs(req, mgrInstances) {
+				currentID := mgrInstances[machineID].ServerID
+				if currentID == plannedID {
+					continue
+				}
+				plan.Warnings = append(plan.Warnings, fmt.Sprintf(
+					"节点 %s 的 server_id 将在冻结业务后由 %d 安全调整为唯一值 %d，并同步平台登记信息",
+					machineID, currentID, plannedID,
+				))
+			}
+			sort.Strings(plan.Warnings)
+		}
+		if req.CurrentArchitecture != hadomain.ArchitectureMGRRouter && strings.TrimSpace(req.RootPassword) == "" {
+			missing := make([]string, 0)
+			for _, node := range req.Nodes {
+				if strings.TrimSpace(req.RootPasswords[node.MachineID]) == "" {
+					missing = append(missing, node.MachineID)
+				}
+			}
+			if len(missing) > 0 {
+				plan.Warnings = append(plan.Warnings, "未提供一次性 root 凭据；执行前将严格验证 Agent 管理账号已具备 Group Replication、持久化变量、账号与连接管理权限，旧账号权限不足时需回到安全表单补充 root 密码")
+			}
+		}
+	}
 	plan.Steps = architecturePlanSteps(req)
 	return plan, nil
 }
 
 func validateArchitectureRequest(req hadomain.ArchitectureAdjustmentRequest) error {
 	switch req.Architecture {
-	case hadomain.ArchitectureStandalone, hadomain.ArchitectureMasterSlave, hadomain.ArchitectureDualMaster, hadomain.ArchitectureMultiMaster:
+	case hadomain.ArchitectureStandalone, hadomain.ArchitectureMasterSlave, hadomain.ArchitectureDualMaster, hadomain.ArchitectureMultiMaster, hadomain.ArchitectureMGRRouter:
 	default:
 		return fmt.Errorf("unsupported architecture %s", req.Architecture)
 	}
@@ -207,6 +298,56 @@ func validateArchitectureRequest(req hadomain.ArchitectureAdjustmentRequest) err
 		}
 		if req.MoveVIP {
 			return errors.New("standalone architecture cannot own or migrate a shared VIP")
+		}
+		return nil
+	}
+	if req.Architecture == hadomain.ArchitectureMGRRouter {
+		if len(req.Nodes) < 3 || len(req.Nodes) > 9 {
+			return errors.New("mgr_router requires 3 to 9 group members")
+		}
+		if len(req.Nodes)%2 == 0 {
+			return errors.New("mgr_router requires an odd number of members to preserve quorum")
+		}
+		if masters != 1 {
+			return errors.New("mgr_router requires exactly one preferred primary")
+		}
+		preferredIsPrimary := false
+		for _, node := range req.Nodes {
+			if node.MachineID == req.PreferredNewMasterMachineID && strings.EqualFold(strings.TrimSpace(node.Role), "M") {
+				preferredIsPrimary = true
+				break
+			}
+		}
+		if !preferredIsPrimary {
+			return errors.New("mgr_router preferred_new_master_machine_id must reference the role M member")
+		}
+		if req.MoveVIP {
+			return errors.New("mgr_router uses MySQL Router endpoints and cannot migrate a database VIP")
+		}
+		for _, node := range req.Nodes {
+			if strings.TrimSpace(node.SourceMachineID) != "" {
+				return fmt.Errorf("mgr_router member %s cannot declare an asynchronous replication source", node.MachineID)
+			}
+			if node.DelaySeconds != 0 {
+				return fmt.Errorf("mgr_router member %s cannot be a delayed replica", node.MachineID)
+			}
+		}
+		if req.MGRPort != 0 && (req.MGRPort < 1 || req.MGRPort > 65535) {
+			return errors.New("mgr_port must be between 1 and 65535")
+		}
+		if strings.TrimSpace(req.MGRGroupName) != "" && !validMGRUUID(req.MGRGroupName) {
+			return errors.New("mgr_group_name must be a valid UUID")
+		}
+		if req.RouterPort != 0 && (req.RouterPort < 1 || req.RouterPort > 65532) {
+			return errors.New("router_port must leave room for Router's four bootstrap endpoints")
+		}
+		if req.MGRPort != 0 && req.RouterPort != 0 && req.MGRPort >= req.RouterPort && req.MGRPort <= req.RouterPort+3 {
+			return errors.New("mgr_port cannot overlap Router bootstrap ports")
+		}
+		for _, node := range req.Nodes {
+			if node.Port == req.MGRPort || (node.Port >= req.RouterPort && node.Port <= req.RouterPort+3) {
+				return fmt.Errorf("member %s MySQL port cannot overlap MGR or Router ports", node.MachineID)
+			}
 		}
 		return nil
 	}
@@ -328,6 +469,9 @@ func architecturePlanSteps(req hadomain.ArchitectureAdjustmentRequest) []hadomai
 	if items := architectureConversionPlanSteps(req); len(items) > 0 {
 		return items
 	}
+	if req.Architecture == hadomain.ArchitectureMGRRouter {
+		return mgrRouterPlanSteps(req)
+	}
 	if req.Architecture == hadomain.ArchitectureStandalone {
 		items := []hadomain.ArchitecturePlanStep{
 			{Code: "acquire_lock", Name: "获取集群切换锁", Description: "阻止并发架构变更和脑裂"},
@@ -430,6 +574,48 @@ func architecturePlanSteps(req hadomain.ArchitectureAdjustmentRequest) []hadomai
 	return steps
 }
 
+func mgrRouterPlanSteps(req hadomain.ArchitectureAdjustmentRequest) []hadomain.ArchitecturePlanStep {
+	if req.CurrentArchitecture == hadomain.ArchitectureMGRRouter {
+		items := []hadomain.ArchitecturePlanStep{
+			{Code: "acquire_lock", Name: "获取集群架构锁", Description: "阻止并发拓扑、升级和业务入口变更"},
+			{Code: "preflight", Name: "MGR 实时预检", Description: "验证全部成员、法定人数、单主状态和管理通道"},
+			{Code: "bootstrap_group", Name: "切换 MGR PRIMARY", Description: "使用 Group Replication 原生单主切换函数指定新 PRIMARY", Destructive: true},
+			{Code: "verify_group", Name: "验证 MGR 法定人数", Description: "确认全部成员 ONLINE、恰好一个 PRIMARY 且应用队列已清空"},
+			{Code: "deploy_mysql_shell", Name: "校验 MySQL Shell", Description: "部署与 MySQL 主版本系列匹配的 Shell AdminAPI 工具"},
+			{Code: "adopt_innodb_cluster", Name: "校验 Router 元数据", Description: "幂等确认现有复制组已纳入 InnoDB Cluster 元数据管理", Destructive: true},
+			{Code: "deploy_mysql_router", Name: "校准 MySQL Router", Description: "幂等部署 Router，并刷新读写与只读元数据路由端点", Destructive: true},
+			{Code: "verify_router", Name: "验证 Router 入口", Description: "逐节点验证读写端口命中新 PRIMARY、只读端口可连接在线成员"},
+			{Code: "resume_business_connections", Name: "开放业务连接", Description: "MGR 与 Router 全部验证通过后确认数据库业务连接可用"},
+			{Code: "release_lock", Name: "释放架构锁", Description: "保存审计结果并释放集群互斥锁"},
+		}
+		for index := range items {
+			items[index].Order = index + 1
+		}
+		return items
+	}
+	items := []hadomain.ArchitecturePlanStep{
+		{Code: "acquire_lock", Name: "获取集群架构锁", Description: "阻止并发拓扑、升级和业务入口变更"},
+		{Code: "preflight", Name: "MGR 实时预检", Description: "验证 MySQL 版本、GTID、server_uuid、InnoDB、主键、端口和管理权限"},
+		{Code: "freeze_business_access", Name: "冻结现有写入口", Description: "配置 Group Replication 前阻止新业务连接和分叉写入", Destructive: true},
+		{Code: "drain_business_sessions", Name: "排空业务会话", Description: "保留管理、监控和备份连接，清理存量业务连接", Destructive: true},
+		{Code: "align_group_data", Name: "对齐数据与 GTID", Description: "新装空节点安全清理从节点 GTID；已有数据必须先追平并通过 PT 一致性校验", Destructive: true},
+		{Code: "configure_group_replication", Name: "修复实例身份并写入 MGR 配置", Description: "保留已有唯一 server_id；对默认值或重复值分配确定性的唯一编号，再配置组 UUID、种子、通信地址和故障安全参数并重启复检", Destructive: true},
+		{Code: "bootstrap_group", Name: "启动复制组", Description: "仅在首选主节点引导一次组，其余成员通过分布式恢复加入", Destructive: true},
+		{Code: "verify_group", Name: "验证 MGR 法定人数", Description: "确认全部成员 ONLINE、恰好一个 PRIMARY 且应用队列已清空"},
+		{Code: "deploy_mysql_shell", Name: "部署 MySQL Shell", Description: "从 Manager 可信制品库在首选主节点安装 Shell AdminAPI 工具"},
+		{Code: "adopt_innodb_cluster", Name: "创建 Router 元数据", Description: "通过 MySQL Shell 将现有复制组纳入 InnoDB Cluster 元数据管理", Destructive: true},
+		{Code: "deploy_mysql_router", Name: "部署 MySQL Router", Description: "在每个成员节点安装 Router，并生成读写与只读元数据路由端点", Destructive: true},
+		{Code: "verify_router", Name: "验证 Router 入口", Description: "逐节点验证读写端口命中 PRIMARY、只读端口可连接在线成员"},
+		{Code: "resume_business_connections", Name: "开放业务连接", Description: "MGR 与 Router 全部验证通过后恢复数据库业务连接"},
+		{Code: "release_lock", Name: "释放架构锁", Description: "保存审计结果并释放集群互斥锁"},
+	}
+	items = addArchitectureManagementRepairStep(items, req)
+	for index := range items {
+		items[index].Order = index + 1
+	}
+	return items
+}
+
 func architectureTransitionKind(req hadomain.ArchitectureAdjustmentRequest) string {
 	current, target := strings.TrimSpace(req.CurrentArchitecture), strings.TrimSpace(req.Architecture)
 	switch {
@@ -488,12 +674,12 @@ func reqVIPStepName(req hadomain.ArchitectureAdjustmentRequest) string {
 }
 
 func addArchitectureManagementRepairStep(items []hadomain.ArchitecturePlanStep, req hadomain.ArchitectureAdjustmentRequest) []hadomain.ArchitecturePlanStep {
-	if strings.TrimSpace(req.RootPassword) == "" || len(req.RootPasswords) > 0 {
+	if strings.TrimSpace(req.RootPassword) == "" && len(req.RootPasswords) == 0 {
 		return items
 	}
 	repair := hadomain.ArchitecturePlanStep{
 		Code: "repair_management_privileges", Name: "修复 MHA 管理权限",
-		Description: "仅使用一次 root 凭据补齐旧实例的 MHA 管理权限，后续步骤切回 Agent 保存的 MHA 账号",
+		Description: "仅使用一次、可按节点提供的 root 凭据补齐 MHA/MGR 管理权限，后续步骤切回 Agent 保存的 MHA 账号",
 	}
 	insertAt := 1
 	if len(items) < insertAt {

@@ -58,7 +58,11 @@ func (r *Receiver) Run(ctx context.Context) error {
 }
 
 func (r *Receiver) runOnce(ctx context.Context, managerHTTPAddr string) error {
-	capabilities := append(r.dispatcher.Types(), taskdomain.CapabilityMySQLDefaultsFile)
+	capabilities := append(
+		r.dispatcher.Types(),
+		taskdomain.CapabilityMySQLDefaultsFile,
+		taskdomain.CapabilityTaskStepResumeV1,
+	)
 	wsURL, err := buildTaskWSURL(managerHTTPAddr, r.agentID, r.machineID, capabilities)
 	if err != nil {
 		return err

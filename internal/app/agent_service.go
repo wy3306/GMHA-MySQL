@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"debug/elf"
 	"errors"
 	"os"
 	"os/exec"
@@ -675,14 +676,20 @@ func (s *AgentService) loadAgentBinary(targetOS, targetArch string) ([]byte, err
 	}
 
 	if strings.TrimSpace(s.binaryPath) != "" {
-		if data, err := os.ReadFile(s.binaryPath); err == nil {
-			if looksLikeGMHAAgentBinary(data) && binaryMatchesTarget(data, targetOS) {
-				return data, nil
-			}
-			return nil, errors.New("configured agent binary is not a valid GMHA agent for target platform")
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return nil, err
+		candidates := []string{s.binaryPath}
+		if targetOS == "linux" {
+			candidates = append([]string{filepath.Join(filepath.Dir(s.binaryPath), "agentd-linux-"+targetArch)}, candidates...)
 		}
+		for _, candidate := range candidates {
+			if data, readErr := os.ReadFile(candidate); readErr == nil {
+				if looksLikeGMHAAgentBinary(data) && binaryMatchesTarget(data, targetOS, targetArch) {
+					return data, nil
+				}
+			} else if !errors.Is(readErr, os.ErrNotExist) {
+				return nil, readErr
+			}
+		}
+		return nil, fmt.Errorf("configured agent binary is not valid for target %s/%s", targetOS, targetArch)
 	}
 
 	if err != nil {
@@ -761,10 +768,22 @@ func looksLikeGMHAAgentBinary(data []byte) bool {
 	return false
 }
 
-func binaryMatchesTarget(data []byte, targetOS string) bool {
+func binaryMatchesTarget(data []byte, targetOS, targetArch string) bool {
 	switch targetOS {
 	case "linux":
-		return len(data) >= 4 && bytes.Equal(data[:4], []byte{0x7f, 'E', 'L', 'F'})
+		file, err := elf.NewFile(bytes.NewReader(data))
+		if err != nil {
+			return false
+		}
+		defer file.Close()
+		switch targetArch {
+		case "amd64":
+			return file.Machine == elf.EM_X86_64
+		case "arm64":
+			return file.Machine == elf.EM_AARCH64
+		default:
+			return false
+		}
 	case "darwin":
 		return len(data) >= 4 && (bytes.Equal(data[:4], []byte{0xcf, 0xfa, 0xed, 0xfe}) || bytes.Equal(data[:4], []byte{0xca, 0xfe, 0xba, 0xbe}))
 	default:

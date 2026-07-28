@@ -210,13 +210,9 @@ func (u *UpgradeAgentUsecase) Execute(ctx context.Context, req UpgradeAgentReque
 		return rollback(fmt.Errorf("failed to upload systemd unit: %w", err))
 	}
 	startedAt := time.Now().UTC()
-	for _, cmd := range []string{
-		"systemctl daemon-reload",
-		"systemctl enable gmha-agent",
-		"systemctl restart gmha-agent",
-	} {
+	for _, cmd := range agentSystemdActivationCommands() {
 		if err := u.sshClient.Run(ctx, endpoint, auth, cmd); err != nil {
-			return rollback(err)
+			return rollback(fmt.Errorf("failed to activate gmha-agent systemd service: %w", err))
 		}
 	}
 

@@ -167,11 +167,11 @@ var aiActionCatalog = []AIActionDefinition{
 		Parameters: []AIActionParameter{{Name: "target_id", Type: "string", Required: true, Description: "集群名称"}},
 	},
 	{
-		ID: "configure_cluster_architecture", Label: "配置集群复制架构", Description: "将已纳管机器及现有 MySQL 实例加入目标集群，并通过 GMHA 架构执行器配置一主多从或双主拓扑；不会重复安装已满足版本要求的实例",
+		ID: "configure_cluster_architecture", Label: "配置集群复制架构", Description: "将已纳管机器及现有 MySQL 实例加入目标集群，并通过 GMHA 架构执行器配置一主多从、双主或 MGR + MySQL Router；不会重复安装已满足版本要求的实例",
 		Risk: "high", TargetKind: "cluster", HTTPMethod: http.MethodPost, APIPath: "/api/v1/clusters/{cluster_name}/architecture/start",
 		Parameters: []AIActionParameter{
 			{Name: "target_id", Type: "string", Required: true, Description: "集群名称"},
-			{Name: "architecture", Type: "string", Required: true, Description: "master_slave 或 dual_master"},
+			{Name: "architecture", Type: "string", Required: true, Description: "master_slave、dual_master 或 mgr_router"},
 			{Name: "machine_ids", Type: "string[]", Required: true, Description: "参与架构的机器 ID"},
 			{Name: "port", Type: "integer", Required: false, Description: "MySQL 端口，默认 3306"},
 		},
@@ -328,12 +328,13 @@ type aiClusterArchitectureNode struct {
 }
 
 type aiClusterArchitectureImpact struct {
-	ClusterName   string
-	ClusterExists bool
-	Architecture  string
-	Nodes         []aiClusterArchitectureNode
-	Blockers      []string
-	ActiveTasks   []string
+	ClusterName         string
+	ClusterExists       bool
+	Architecture        string
+	CurrentArchitecture string
+	Nodes               []aiClusterArchitectureNode
+	Blockers            []string
+	ActiveTasks         []string
 }
 
 type aiClusterMembershipImpact struct {
@@ -5716,12 +5717,17 @@ func (s *AIService) collectClusterArchitectureImpact(ctx context.Context, plan a
 	if impact.ClusterName == "" {
 		impact.Blockers = append(impact.Blockers, "目标集群名称为空")
 	}
-	if impact.Architecture != hadomain.ArchitectureDualMaster && impact.Architecture != hadomain.ArchitectureMasterSlave {
-		impact.Blockers = append(impact.Blockers, "architecture 必须为 dual_master 或 master_slave")
+	if impact.Architecture != hadomain.ArchitectureDualMaster && impact.Architecture != hadomain.ArchitectureMasterSlave && impact.Architecture != hadomain.ArchitectureMGRRouter {
+		impact.Blockers = append(impact.Blockers, "architecture 必须为 dual_master、master_slave 或 mgr_router")
 	}
 	machineIDs := splitAIParameterList(plan.Parameters["machine_ids"])
 	expectedNodes := 2
-	if len(machineIDs) != expectedNodes {
+	if impact.Architecture == hadomain.ArchitectureMGRRouter {
+		expectedNodes = len(machineIDs)
+		if expectedNodes < 3 || expectedNodes > 9 || expectedNodes%2 == 0 {
+			impact.Blockers = append(impact.Blockers, fmt.Sprintf("MGR + MySQL Router 需要明确选择 3–9 台奇数节点，实际得到 %d 台", expectedNodes))
+		}
+	} else if len(machineIDs) != expectedNodes {
 		impact.Blockers = append(impact.Blockers, fmt.Sprintf("当前架构需要明确选择 %d 台机器，实际得到 %d 台", expectedNodes, len(machineIDs)))
 	}
 	port := 3306
@@ -5781,7 +5787,9 @@ func (s *AIService) collectClusterArchitectureImpact(ctx context.Context, plan a
 			}
 			foundInstance = true
 			node.Version = instance.Version
-			if !mysqlVersionAtLeast8(instance.Version) {
+			if impact.Architecture == hadomain.ArchitectureMGRRouter && !mgrVersionSupported(instance.Version) {
+				impact.Blockers = append(impact.Blockers, fmt.Sprintf("%s 的 MySQL %s 低于 MGR 所需的 8.0.17", node.Name, instance.Version))
+			} else if !mysqlVersionAtLeast8(instance.Version) {
 				impact.Blockers = append(impact.Blockers, fmt.Sprintf("%s 的 MySQL %s 低于 8.0", node.Name, instance.Version))
 			}
 			facts := s.mysqlArchitectureFacts(ctx, net.JoinHostPort(machine.IP, strconv.Itoa(port)))
@@ -5796,6 +5804,23 @@ func (s *AIService) collectClusterArchitectureImpact(ctx context.Context, plan a
 			impact.Blockers = append(impact.Blockers, fmt.Sprintf("%s：%s", node.Name, node.AgentWhy))
 		}
 		impact.Nodes = append(impact.Nodes, node)
+	}
+	writers, replicas, mgrMembers := 0, 0, 0
+	for _, node := range impact.Nodes {
+		switch {
+		case strings.HasPrefix(strings.ToLower(node.Role), "mgr_"):
+			mgrMembers++
+		case strings.EqualFold(node.Role, "writer"):
+			writers++
+		case strings.EqualFold(node.Role, "replica"):
+			replicas++
+		}
+	}
+	switch {
+	case mgrMembers == len(impact.Nodes) && mgrMembers > 0:
+		impact.CurrentArchitecture = hadomain.ArchitectureMGRRouter
+	case writers == 1 && replicas == len(impact.Nodes)-1:
+		impact.CurrentArchitecture = hadomain.ArchitectureMasterSlave
 	}
 	recentTasks, err := s.tasks.ListTasks(ctx, 100)
 	if err != nil {
@@ -5904,9 +5929,11 @@ func (s *AIService) executeClusterArchitecture(ctx context.Context, plan aidomai
 	for index, node := range impact.Nodes {
 		role := "M"
 		source := ""
-		if impact.Architecture == hadomain.ArchitectureMasterSlave && index > 0 {
+		if (impact.Architecture == hadomain.ArchitectureMasterSlave || impact.Architecture == hadomain.ArchitectureMGRRouter) && index > 0 {
 			role = "S"
-			source = impact.Nodes[0].ID
+			if impact.Architecture == hadomain.ArchitectureMasterSlave {
+				source = impact.Nodes[0].ID
+			}
 		} else if impact.Architecture == hadomain.ArchitectureDualMaster && len(impact.Nodes) == 2 {
 			source = impact.Nodes[1-index].ID
 		}
@@ -5916,7 +5943,7 @@ func (s *AIService) executeClusterArchitecture(ctx context.Context, plan aidomai
 		})
 	}
 	run, err := s.ha.StartArchitectureAdjustment(ctx, impact.ClusterName, hadomain.ArchitectureAdjustmentRequest{
-		Architecture: impact.Architecture, PreferredNewMasterMachineID: impact.Nodes[0].ID,
+		Architecture: impact.Architecture, CurrentArchitecture: impact.CurrentArchitecture, PreferredNewMasterMachineID: impact.Nodes[0].ID,
 		ManagementUsers: []string{"root", "monitor", "mha", "backup", "repl"}, Nodes: nodes,
 	})
 	if err != nil {
@@ -6373,7 +6400,7 @@ func (s *AIService) mysqlArchitectureFacts(ctx context.Context, endpoint string)
 		case "mysql_read_only":
 			readOnly := aiContextString(metric.Value)
 			facts["read_only"] = readOnly
-			if strings.EqualFold(readOnly, "false") || strings.EqualFold(readOnly, "off") || readOnly == "0" {
+			if facts["role"] == "unknown" && (strings.EqualFold(readOnly, "false") || strings.EqualFold(readOnly, "off") || readOnly == "0") {
 				facts["role"] = "writer"
 			}
 		case "mysql_super_read_only":
@@ -6393,6 +6420,23 @@ func (s *AIService) mysqlArchitectureFacts(ctx context.Context, endpoint string)
 				"sql_running": aiContextString(status["sql_running"]),
 				"lag_seconds": aiContextString(status["lag_seconds"]),
 				"last_error":  aiContextString(status["last_error"]),
+			}
+		case "mysql_group_replication_status":
+			status := aiContextMap(metric.Value)
+			if active, _ := status["active"].(bool); !active {
+				continue
+			}
+			self := aiContextMap(status["self"])
+			role := strings.ToUpper(firstNonEmptyAI(aiContextString(self["member_role"]), aiContextString(self["MEMBER_ROLE"])))
+			state := strings.ToUpper(firstNonEmptyAI(aiContextString(self["member_state"]), aiContextString(self["MEMBER_STATE"])))
+			if role != "" {
+				facts["role"] = "mgr_" + strings.ToLower(role)
+			}
+			facts["replication"] = map[string]any{
+				"type": "group_replication", "group_name": aiContextString(status["group_name"]),
+				"member_role": role, "member_state": state,
+				"member_count": aiContextString(status["member_count"]), "online_count": aiContextString(status["online_count"]),
+				"quorum": status["quorum"],
 			}
 		}
 	}
@@ -6479,7 +6523,7 @@ func (s *AIService) systemPrompt(contextValue map[string]any, analysis bool) str
 7. 模型结论只是建议。GMHA 服务端会重新计算目标、依赖和运行状态；服务端预检结果与模型文字冲突时，以服务端为准并阻止执行。DROP、TRUNCATE、删除文件等未列入动作目录的操作不得生成。
 8. 必须区分“平台归属”和“数据库架构”：
    - 用户只要求创建/复用集群登记或把已纳管机器加入集群，且不要求修改 MySQL、复制、读写角色或 VIP 时，使用 register_cluster_members。parameters 只需提供 machine_ids（英文逗号分隔的精确 machine id）；这是中风险平台元数据变更。
-   - 用户明确要求配置或改变一主多从、双主、复制源、读写角色时，使用 configure_cluster_architecture。target_id 使用集群名称；parameters 必须提供 architecture（dual_master 或 master_slave）、machine_ids 和 port。这是高风险数据库架构变更，需要逐字二次确认。
+   - 用户明确要求配置或改变一主多从、双主、MGR + MySQL Router、复制源、读写角色时，使用 configure_cluster_architecture。target_id 使用集群名称；parameters 必须提供 architecture（dual_master、master_slave 或 mgr_router）、machine_ids 和 port。MGR 必须选择 3–9 台奇数节点且不使用 VIP。这是高风险数据库架构变更，需要逐字二次确认。
    若上下文显示目标端口已存在 MySQL 8.0+，必须复用现有实例，不得重复安装。
 9. 用户要求新增、绑定或修改业务 VIP 时使用 configure_cluster_vip；parameters 必须提供 vip_address、vip_prefix、target_machine_id、default_interface，可选 vip_name 和 arping_count。VIP 地址必须由用户或网络规划明确提供，不得因为用户说“随便定”就猜测地址；地址缺失时仍应生成该动作计划，让服务端明确标记缺少地址和网卡，而不是声称平台不支持。删除 VIP 使用 remove_cluster_vip，只提供已登记的 vip_address。VIP 绑定和删除都必须经过人工确认、Agent 实机执行与全节点唯一持有者复检。
 10. 集群登记和成员操作使用精确动作：创建空登记用 create_cluster；改名或改说明用 update_cluster（parameters 提供 new_name 和 description）；移出成员用 remove_cluster_members（parameters 提供 machine_ids）；一键卸载 MySQL、Agent 并删除集群只能用 cleanup_cluster。cleanup_cluster 与 delete_cluster 不同：前者会清理数据和软件，后者仅允许删除无任何依赖的空登记，绝不能混用。移出 VIP 持有者、备份目标或存在活动任务的机器必须由服务端阻止。

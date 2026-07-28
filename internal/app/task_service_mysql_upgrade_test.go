@@ -39,6 +39,37 @@ func TestMySQLUpgradeRestoreReadOnlyPreservesBothFlags(t *testing.T) {
 	}
 }
 
+func TestMySQLUpgradeDirectWorkflowRejectsActiveMGRMember(t *testing.T) {
+	command := mysqlUpgradeMGRGuardCommand("mysql --defaults-extra-file=" + mysqlDefaultsFilePlaceholder)
+	for _, required := range []string{
+		mysqlDefaultsFilePlaceholder,
+		"replication_group_members",
+		"MEMBER_ID=@@server_uuid",
+		"cluster rolling-upgrade workflow",
+		"exit 79",
+	} {
+		if !strings.Contains(command, required) {
+			t.Fatalf("MGR upgrade guard missing %q: %s", required, command)
+		}
+	}
+}
+
+func TestMySQLUninstallDirectWorkflowRejectsActiveMGRMember(t *testing.T) {
+	command := mysqlMGRUninstallGuardCommand(3307)
+	for _, required := range []string{
+		mysqlDefaultsFilePlaceholder,
+		"--port=3307",
+		"replication_group_members",
+		"MEMBER_STATE IN",
+		"cannot be uninstalled individually",
+		"exit 79",
+	} {
+		if !strings.Contains(command, required) {
+			t.Fatalf("MGR uninstall guard missing %q: %s", required, command)
+		}
+	}
+}
+
 func TestMySQLUpgradeValidateConfigSupports57(t *testing.T) {
 	legacy := mysqlUpgradeValidateConfigCommand("/mysql/bin/mysqld", "/data/3306/my.cnf", "5.7.44")
 	if !strings.Contains(legacy, "--verbose --help") || !strings.Contains(legacy, "grep -q -- '--validate-config'") {

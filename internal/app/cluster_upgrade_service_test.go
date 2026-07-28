@@ -2,6 +2,7 @@ package app
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	hadomain "gmha/internal/domain/ha"
@@ -30,6 +31,32 @@ func TestClusterUpgradeStagesPreserveSafeRollingOrder(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected rolling upgrade order:\ngot  %v\nwant %v", got, want)
+	}
+}
+
+func TestMGRClusterUpgradeUsesGroupAwareStages(t *testing.T) {
+	stages := mgrClusterUpgradeStages()
+	if len(stages) != len(clusterUpgradeStages()) {
+		t.Fatalf("MGR rolling upgrade stage count=%d", len(stages))
+	}
+	names := map[string]string{}
+	for _, stage := range stages {
+		names[stage.Code] = stage.Name
+	}
+	for code, fragment := range map[string]string{
+		"cluster_preflight":    "MGR",
+		"upgrade_replicas":     "SECONDARY",
+		"final_cluster_verify": "单主",
+	} {
+		if !strings.Contains(names[code], fragment) {
+			t.Fatalf("MGR stage %s should contain %q: %q", code, fragment, names[code])
+		}
+	}
+	if !isMGRClusterUpgrade(ClusterUpgradeRun{Architecture: string(hadomain.ArchitectureMGRRouter)}) {
+		t.Fatal("mgr_router run was not recognized")
+	}
+	if isMGRClusterUpgrade(ClusterUpgradeRun{Architecture: string(hadomain.ArchitectureMasterSlave)}) {
+		t.Fatal("traditional replication run was recognized as MGR")
 	}
 }
 

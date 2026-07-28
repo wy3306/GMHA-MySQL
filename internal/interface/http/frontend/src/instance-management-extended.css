@@ -114,23 +114,31 @@
 .agent-category { display: inline-flex; padding: 3px 8px; border-radius: 999px; color: #3269a8; background: #edf5ff; font-size: 10px; }
 .agent-task-switch { display: flex; align-items: center; gap: 6px; color: #52657c; font-size: 11px; }
 .agent-task-switch input { accent-color: #1677ff; }
-.parameter-restart-dialog { width: min(600px, calc(100vw - 32px)); overflow: hidden; }
-.parameter-restart-dialog > header { display: grid; grid-template-columns: 42px 1fr auto; align-items: center; gap: 12px; padding: 20px 22px; border-bottom: 1px solid #e7edf5; }
-.parameter-restart-dialog > header > span { display: grid; width: 40px; height: 40px; place-items: center; border-radius: 50%; background: #fff0df; color: #c66b17; font-size: 20px; font-weight: 800; }
+.parameter-restart-mask { z-index: 80; overflow-y: auto; }
+.parameter-restart-dialog { display: grid; width: min(680px, calc(100vw - 32px)); max-height: calc(100vh - 40px); padding: 0; grid-template-rows: auto minmax(0, 1fr) auto; overflow: hidden; border: 1px solid #e3e9f1; border-radius: 12px; }
+.parameter-restart-dialog > header { display: grid; grid-template-columns: 44px minmax(0, 1fr) auto; align-items: center; gap: 14px; padding: 22px 24px; border-bottom: 1px solid #e7edf5; }
+.parameter-restart-dialog > header > span { display: grid; width: 44px; height: 44px; place-items: center; border-radius: 50%; background: #fff0df; color: #c66b17; font-size: 21px; font-weight: 800; }
 .parameter-restart-dialog header p, .parameter-restart-dialog header h2 { margin: 0; }
-.parameter-restart-dialog header p { color: #bd731c; font-size: 9px; font-weight: 800; letter-spacing: 1px; }
-.parameter-restart-dialog header h2 { margin-top: 4px; font-size: 19px; }
-.parameter-restart-dialog header button { border: 0; background: transparent; font-size: 20px; cursor: pointer; }
-.parameter-restart-summary, .parameter-restart-warning { display: grid; gap: 5px; margin: 16px 22px; padding: 13px 15px; border-radius: 7px; }
+.parameter-restart-dialog header p { color: #bd731c; font-size: 10px; font-weight: 800; letter-spacing: 1px; }
+.parameter-restart-dialog header h2 { margin-top: 4px; color: #172033; font-size: 20px; line-height: 1.35; }
+.parameter-restart-dialog header button { display: grid; width: 32px; height: 32px; place-items: center; padding: 0; border: 0; border-radius: 7px; background: transparent; color: #64748b; font-size: 22px; cursor: pointer; }
+.parameter-restart-dialog header button:hover { background: #f1f5f9; color: #172033; }
+.parameter-restart-body { display: grid; min-height: 0; gap: 16px; padding: 18px 24px 20px; overflow-y: auto; }
+.parameter-restart-summary, .parameter-restart-warning { display: grid; gap: 5px; margin: 0; padding: 14px 16px; border-radius: 8px; }
 .parameter-restart-summary { border: 1px solid #dce6f1; background: #f8fbfe; }
+.parameter-restart-summary b, .parameter-restart-warning b { color: #26364a; font-size: 13px; }
 .parameter-restart-summary span, .parameter-restart-warning p { margin: 0; color: #718298; font-size: 11px; line-height: 1.55; }
-.parameter-restart-options { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 0 22px; }
-.parameter-restart-options label { display: flex; align-items: flex-start; gap: 10px; padding: 14px; border: 1px solid #dce5ef; border-radius: 8px; cursor: pointer; }
+.parameter-restart-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin: 0; }
+.parameter-restart-options label { display: flex; min-width: 0; min-height: 96px; align-items: flex-start; gap: 11px; margin: 0; padding: 16px; border: 1px solid #dce5ef; border-radius: 9px; background: #fff; cursor: pointer; transition: border-color .15s ease, background .15s ease, box-shadow .15s ease; }
+.parameter-restart-options label:hover { border-color: #a9c5e7; }
 .parameter-restart-options label.active { border-color: #6ba1e2; background: #f3f8ff; box-shadow: 0 0 0 2px #e2efff; }
-.parameter-restart-options span { display: grid; gap: 4px; }
-.parameter-restart-options small { color: #78899f; font-size: 10px; line-height: 1.5; }
+.parameter-restart-options input[type=radio] { flex: 0 0 auto; width: 17px; height: 17px; margin: 2px 0 0; padding: 0; accent-color: #1677ff; cursor: pointer; }
+.parameter-restart-options span { display: grid; min-width: 0; gap: 5px; }
+.parameter-restart-options b { color: #334155; font-size: 13px; line-height: 1.45; }
+.parameter-restart-options small { color: #78899f; font-size: 11px; line-height: 1.55; overflow-wrap: anywhere; }
 .parameter-restart-warning { border-left: 3px solid #e39a32; background: #fff9ed; }
-.parameter-restart-dialog > footer { display: flex; justify-content: flex-end; gap: 9px; padding: 16px 22px; border-top: 1px solid #e7edf5; }
+.parameter-restart-dialog > footer { display: flex; justify-content: flex-end; gap: 10px; padding: 15px 24px; border-top: 1px solid #e7edf5; background: #fff; }
+.parameter-restart-dialog > footer button { min-height: 38px; }
 .mysql-upgrade-page { padding-bottom: 22px; }
 .upgrade-form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); margin: 0 20px; border: 1px solid #e7edf5; border-radius: 8px; }
 .mysql-upgrade-page .upgrade-preview { margin: 16px 20px; }
@@ -211,6 +219,14 @@
   .parameter-group-lists { border-right: 0; border-bottom: 1px solid #e7edf5; }
   .agent-collect-panel .panel-head, .agent-collect-actions { align-items: stretch; flex-direction: column; }
   .agent-collect-meta { grid-template-columns: auto minmax(0,1fr); }
+  .parameter-restart-mask { padding: 12px; }
+  .parameter-restart-dialog { width: 100%; max-height: calc(100vh - 24px); }
+  .parameter-restart-dialog > header { grid-template-columns: 38px minmax(0, 1fr) auto; gap: 10px; padding: 16px; }
+  .parameter-restart-dialog > header > span { width: 38px; height: 38px; font-size: 18px; }
+  .parameter-restart-dialog header h2 { font-size: 17px; }
+  .parameter-restart-body { gap: 12px; padding: 14px 16px 16px; }
+  .parameter-restart-options label { min-height: 0; padding: 13px; }
+  .parameter-restart-dialog > footer { gap: 8px; padding: 12px 16px 16px; }
 }
 
 /* MySQL upgrade gate: target -> independent report -> explicit risk approval. */

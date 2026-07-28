@@ -153,6 +153,7 @@ func BuildDefaultMySQLDynamicCollectConfig() DynamicCollectConfig {
 	add("mysql_probe", "connection", 1, "MySQL探活状态", nil)
 	add("mysql_connectivity", "connection", 1, "MySQL是否可连接", nil)
 	add("mysql_replication_thread_status", "replication", 1, "主从复制线程状态", nil)
+	add("mysql_group_replication_status", "replication", 1, "MGR 成员与法定人数状态", nil)
 	add("mysql_replica_io_thread", "replication", 1, "IO线程状态", map[string]string{"replica_field": "Replica_IO_Running", "slave_field": "Slave_IO_Running"})
 	add("mysql_replica_sql_thread", "replication", 1, "SQL线程状态", map[string]string{"replica_field": "Replica_SQL_Running", "slave_field": "Slave_SQL_Running"})
 	add("mysql_replication_lag", "replication", 1, "主从延迟", map[string]string{"replica_field": "Seconds_Behind_Source", "slave_field": "Seconds_Behind_Master"})
@@ -334,6 +335,7 @@ func mysqlImplementedNoParamCollectors() map[string]bool {
 		"mysql_probe",
 		"mysql_connectivity",
 		"mysql_replication_thread_status",
+		"mysql_group_replication_status",
 		"mysql_role",
 		"mysql_semisync_status",
 		"mysql_connection_usage_percent",

@@ -124,6 +124,7 @@ func NewRouter(core *app.App) http.Handler {
 	mux.HandleFunc("/api/v1/agents/register", agentHandler.HandleRegister)
 	mux.HandleFunc("/api/v1/agents/heartbeat", agentHandler.HandleHeartbeat)
 	mux.HandleFunc("/api/v1/tasks", taskHandler.HandleTasks)
+	mux.HandleFunc("/api/v1/tasks/control", taskHandler.HandleTaskControl)
 	mux.HandleFunc("/api/v1/tasks/exec", taskHandler.HandleCreateExecTask)
 	mux.HandleFunc("/api/v1/tasks/collect-machine-info", taskHandler.HandleCreateCollectMachineInfoTask)
 	mux.HandleFunc("/api/v1/tasks/cluster-automation", taskHandler.HandleClusterAutomation)
@@ -150,6 +151,7 @@ func NewRouter(core *app.App) http.Handler {
 	mux.HandleFunc("/api/v1/tasks/cluster-mysql-install", taskHandler.HandleCreateClusterMySQLInstallTasks)
 	mux.HandleFunc("/api/v1/tasks/cluster-mysql-uninstall", taskHandler.HandleCreateClusterMySQLUninstallTasks)
 	mux.HandleFunc("/api/v1/mysql/packages", taskHandler.HandleMySQLPackages)
+	mux.HandleFunc("/api/v1/mysql/linux-compatibility", taskHandler.HandleLinuxCompatibility)
 	mux.HandleFunc("/api/v1/backup/targets", backupHandler.HandleTargets)
 	mux.HandleFunc("/api/v1/backup/policies", backupHandler.HandlePolicies)
 	mux.HandleFunc("/api/v1/backup/policies/", backupHandler.HandlePolicyByID)
@@ -175,7 +177,7 @@ func NewRouter(core *app.App) http.Handler {
 
 func isHAClusterActionPath(path string) bool {
 	trimmed := strings.Trim(path, "/")
-	return strings.HasSuffix(trimmed, "/bootstrap") || strings.Contains(trimmed, "/vip/") || strings.Contains(trimmed, "/failover/") || strings.Contains(trimmed, "/architecture/")
+	return strings.HasSuffix(trimmed, "/bootstrap") || strings.HasSuffix(trimmed, "/mgr") || strings.Contains(trimmed, "/mgr/") || strings.Contains(trimmed, "/vip/") || strings.Contains(trimmed, "/failover/") || strings.Contains(trimmed, "/architecture/")
 }
 
 // Serve 在指定地址启动 HTTP 服务器。

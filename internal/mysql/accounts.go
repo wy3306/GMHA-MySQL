@@ -96,7 +96,7 @@ func DefaultAccountSpecs() []AccountSpec {
 
 // AvailablePrivileges 返回 Web 可选择的受控 MySQL 权限白名单，避免任意 SQL 权限拼接。
 func AvailablePrivileges() []string {
-	return []string{"SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "CREATE USER", "ALTER", "DROP", "SHOW VIEW", "TRIGGER", "EVENT", "PROCESS", "RELOAD", "LOCK TABLES", "REPLICATION CLIENT", "REPLICATION SLAVE", "SUPER", "CONNECTION_ADMIN", "SYSTEM_VARIABLES_ADMIN", "REPLICATION_SLAVE_ADMIN", "BACKUP_ADMIN", "CLONE_ADMIN"}
+	return []string{"SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "CREATE USER", "ALTER", "DROP", "SHOW VIEW", "TRIGGER", "EVENT", "PROCESS", "RELOAD", "LOCK TABLES", "REPLICATION CLIENT", "REPLICATION SLAVE", "SUPER", "CONNECTION_ADMIN", "SYSTEM_VARIABLES_ADMIN", "REPLICATION_SLAVE_ADMIN", "REPLICATION_APPLIER", "BACKUP_ADMIN", "CLONE_ADMIN", "GROUP_REPLICATION_ADMIN", "PERSIST_RO_VARIABLES_ADMIN"}
 }
 
 // DefaultPrivileges 返回各预设角色的默认授权集合。
@@ -105,7 +105,7 @@ func DefaultPrivileges(role string) []string {
 	case AccountRoleMonitor:
 		return []string{"SELECT", "PROCESS", "REPLICATION CLIENT"}
 	case AccountRoleMHA:
-		return []string{"CREATE", "CREATE USER", "ALTER", "DROP", "INSERT", "UPDATE", "DELETE", "SELECT", "SHOW VIEW", "TRIGGER", "EVENT", "PROCESS", "RELOAD", "LOCK TABLES", "REPLICATION CLIENT", "REPLICATION SLAVE", "CONNECTION_ADMIN", "SYSTEM_VARIABLES_ADMIN", "REPLICATION_SLAVE_ADMIN", "BACKUP_ADMIN", "CLONE_ADMIN"}
+		return []string{"CREATE", "CREATE USER", "ALTER", "DROP", "INSERT", "UPDATE", "DELETE", "SELECT", "SHOW VIEW", "TRIGGER", "EVENT", "PROCESS", "RELOAD", "LOCK TABLES", "REPLICATION CLIENT", "REPLICATION SLAVE", "CONNECTION_ADMIN", "SYSTEM_VARIABLES_ADMIN", "REPLICATION_SLAVE_ADMIN", "REPLICATION_APPLIER", "BACKUP_ADMIN", "CLONE_ADMIN", "GROUP_REPLICATION_ADMIN", "PERSIST_RO_VARIABLES_ADMIN"}
 	case AccountRoleBackup:
 		return []string{"SELECT", "PROCESS", "RELOAD", "LOCK TABLES", "REPLICATION CLIENT"}
 	default:
@@ -459,7 +459,7 @@ func validatePrivileges(items []string) error {
 }
 
 func filterStaticPrivileges(items []string) []string {
-	dynamic := map[string]bool{"CONNECTION_ADMIN": true, "SYSTEM_VARIABLES_ADMIN": true, "REPLICATION_SLAVE_ADMIN": true, "BACKUP_ADMIN": true, "CLONE_ADMIN": true}
+	dynamic := map[string]bool{"CONNECTION_ADMIN": true, "SYSTEM_VARIABLES_ADMIN": true, "REPLICATION_SLAVE_ADMIN": true, "REPLICATION_APPLIER": true, "BACKUP_ADMIN": true, "CLONE_ADMIN": true, "GROUP_REPLICATION_ADMIN": true, "PERSIST_RO_VARIABLES_ADMIN": true}
 	out := make([]string, 0, len(items))
 	for _, item := range normalizePrivileges(items) {
 		if !dynamic[item] {
@@ -470,8 +470,8 @@ func filterStaticPrivileges(items []string) []string {
 }
 
 func filterDynamicPrivileges(items []string) []string {
-	dynamic := map[string]bool{"CONNECTION_ADMIN": true, "SYSTEM_VARIABLES_ADMIN": true, "REPLICATION_SLAVE_ADMIN": true, "BACKUP_ADMIN": true, "CLONE_ADMIN": true}
-	out := make([]string, 0, 5)
+	dynamic := map[string]bool{"CONNECTION_ADMIN": true, "SYSTEM_VARIABLES_ADMIN": true, "REPLICATION_SLAVE_ADMIN": true, "REPLICATION_APPLIER": true, "BACKUP_ADMIN": true, "CLONE_ADMIN": true, "GROUP_REPLICATION_ADMIN": true, "PERSIST_RO_VARIABLES_ADMIN": true}
+	out := make([]string, 0, len(dynamic))
 	for _, item := range normalizePrivileges(items) {
 		if dynamic[item] {
 			out = append(out, item)

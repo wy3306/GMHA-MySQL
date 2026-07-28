@@ -80,6 +80,43 @@ func TestTaskRepositoryPagesAndFiltersTaskHistory(t *testing.T) {
 	}
 }
 
+func TestTaskRepositoryHidesInternalTasksFromTaskCenter(t *testing.T) {
+	db, err := sql.Open("sqlite", t.TempDir()+"/task-visibility.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repo := NewTaskRepository(NewDB(db, DialectSQLite))
+	if err := repo.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	internal := taskdomain.Task{
+		ID: "task-internal-probe", Visibility: taskdomain.VisibilityInternal,
+		Type: taskdomain.TypeExec, Status: taskdomain.StatusSuccess, CreatedAt: now,
+	}
+	user := taskdomain.Task{
+		ID: "task-user-operation", Type: taskdomain.TypeExec,
+		Status: taskdomain.StatusSuccess, CreatedAt: now.Add(time.Second),
+	}
+	for _, item := range []taskdomain.Task{internal, user} {
+		if err := repo.CreateTask(context.Background(), item, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	items, total, err := repo.ListTaskPage(context.Background(), taskdomain.ListQuery{Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 || len(items) != 1 || items[0].ID != user.ID {
+		t.Fatalf("internal task leaked into task center: total=%d items=%+v", total, items)
+	}
+	stored, ok, err := repo.GetTask(context.Background(), internal.ID)
+	if err != nil || !ok || stored.Visibility != taskdomain.VisibilityInternal {
+		t.Fatalf("internal task must remain available for execution detail: %+v, %v, %v", stored, ok, err)
+	}
+}
+
 func TestTaskRepositoryKeepsChildrenOutOfTopLevelHistory(t *testing.T) {
 	db, err := sql.Open("sqlite", t.TempDir()+"/task-children.db")
 	if err != nil {

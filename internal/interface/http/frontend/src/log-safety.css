@@ -97,6 +97,6 @@ th {
 
 .task-log-line pre {
   overflow-x: auto;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
+  white-space: pre;
+  overflow-wrap: normal;
 }

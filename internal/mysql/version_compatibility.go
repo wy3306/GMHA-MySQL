@@ -130,7 +130,11 @@ func SupportsDynamicPrivilegeForVersion(raw, privilege string) bool {
 		return false
 	}
 	privilege = strings.ToUpper(strings.TrimSpace(privilege))
-	for _, item := range []string{"CONNECTION_ADMIN", "SYSTEM_VARIABLES_ADMIN", "REPLICATION_SLAVE_ADMIN", "BACKUP_ADMIN", "CLONE_ADMIN"} {
+	if privilege == "REPLICATION_APPLIER" {
+		version, parseErr := validateSupportedMySQLVersion(raw)
+		return parseErr == nil && compareMySQLVersion(version, mysqlVersion{Major: 8, Minor: 0, Patch: 18}) >= 0
+	}
+	for _, item := range []string{"CONNECTION_ADMIN", "SYSTEM_VARIABLES_ADMIN", "REPLICATION_SLAVE_ADMIN", "BACKUP_ADMIN", "CLONE_ADMIN", "GROUP_REPLICATION_ADMIN", "PERSIST_RO_VARIABLES_ADMIN"} {
 		if privilege == item {
 			return true
 		}

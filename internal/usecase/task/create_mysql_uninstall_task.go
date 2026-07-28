@@ -24,6 +24,9 @@ type CreateMySQLUninstallTaskRequest struct {
 	ParentTaskID string
 	Machine      string
 	Port         int
+	// AllowMGR is set only by whole-cluster cleanup workflows that have already
+	// made the destructive scope explicit and remove the matching Router.
+	AllowMGR bool
 }
 
 // CreateMySQLUninstallTaskResult 是创建 MySQL 卸载任务的结果。

@@ -48,6 +48,35 @@ func TestVersionRelation(t *testing.T) {
 	}
 }
 
+func TestHighestComponentVersionIgnoresUnknownAndUsesNumericOrder(t *testing.T) {
+	got := highestComponentVersion("未知", "V0.0.9", "v0.0.10", "", "invalid")
+	if got != "V0.0.10" {
+		t.Fatalf("highestComponentVersion() = %q, want V0.0.10", got)
+	}
+}
+
+func TestUpgradePackagesAreMarkedAndSortedByHighestKnownVersion(t *testing.T) {
+	items := []UpgradePackageView{
+		{PackageItem: PackageItem{Name: "agent-old", Version: "V0.0.9", Arch: "x86_64"}},
+		{PackageItem: PackageItem{Name: "agent-arm", Version: "V0.0.10", Arch: "aarch64"}},
+		{PackageItem: PackageItem{Name: "agent-amd", Version: "V0.0.10", Arch: "x86_64"}},
+		{PackageItem: PackageItem{Name: "agent-unknown", Version: "unknown", Arch: "x86_64"}},
+	}
+	latest := highestComponentVersion("V0.0.8", items[0].Version, items[1].Version, items[2].Version, items[3].Version)
+	markLatestUpgradePackages(items, latest)
+	sortUpgradePackageViews(items)
+
+	if latest != "V0.0.10" {
+		t.Fatalf("latest = %q, want V0.0.10", latest)
+	}
+	if items[0].Version != "V0.0.10" || items[1].Version != "V0.0.10" || !items[0].Latest || !items[1].Latest {
+		t.Fatalf("highest packages were not retained first and marked latest: %#v", items)
+	}
+	if items[len(items)-1].Name != "agent-unknown" || items[len(items)-1].Latest {
+		t.Fatalf("unknown package should sort last: %#v", items[len(items)-1])
+	}
+}
+
 func TestDetectAgentVersionOutput(t *testing.T) {
 	tests := map[string]string{
 		"V0.0.1\n":              "V0.0.1",

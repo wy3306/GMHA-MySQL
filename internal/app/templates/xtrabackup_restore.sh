@@ -95,6 +95,7 @@ done
 stamp="$(date +%Y%m%d_%H%M%S)"; STAGING="$(dirname "$DATA_DIR")/gmha_restore_${stamp}"
 INCREMENTAL_STAGING_ROOT="${STAGING}_incrementals"
 ROLLBACK_REQUIRED="false"; AUTH_FILE=""; ORIGINAL_DIRS=(); SAVED_DIRS=(); HAD_ORIGINAL=()
+MGR_WAS_ACTIVE="false"; MGR_EXPECTED_MEMBERS="0"
 
 rollback_original() {
   local i path saved
@@ -124,6 +125,30 @@ on_exit() {
   exit "$rc"
 }
 trap on_exit EXIT
+
+MYSQL_PWD="$(printf '%s' "$DB_PASSWORD_B64" | base64 -d)"
+AUTH_FILE="$(mktemp "/tmp/gmha-restore-auth-${PORT}.XXXXXX.cnf")"; chmod 600 "$AUTH_FILE"
+escaped_user="${DB_USER//\\/\\\\}"; escaped_user="${escaped_user//\"/\\\"}"
+escaped_password="${MYSQL_PWD//\\/\\\\}"; escaped_password="${escaped_password//\"/\\\"}"
+printf '[client]\nuser="%s"\npassword="%s"\n' "$escaped_user" "$escaped_password" > "$AUTH_FILE"
+mysql_args=("--defaults-extra-file=$AUTH_FILE" --batch --skip-column-names "--port=$PORT")
+if [[ -n "$SOCKET" ]]; then mysql_args+=("--socket=$SOCKET"); else mysql_args+=(--host=127.0.0.1); fi
+
+# A physical member restore can safely rejoin the group through distributed
+# recovery. A single-member PITR or async pt-table-sync repair would create a
+# divergent history, so reject those modes before stopping MySQL.
+mgr_probe="$(mysql "${mysql_args[@]}" -e "SELECT COALESCE(MAX(CASE WHEN MEMBER_ID=@@server_uuid THEN MEMBER_STATE END),''), COUNT(*), SUM(MEMBER_ROLE='PRIMARY') FROM performance_schema.replication_group_members;" 2>/dev/null || true)"
+if [[ -n "$mgr_probe" ]]; then
+  read -r mgr_self_state mgr_member_count mgr_primary_count <<< "$mgr_probe"
+  if [[ "$mgr_self_state" == "ONLINE" || "$mgr_self_state" == "RECOVERING" ]]; then
+    MGR_WAS_ACTIVE="true"
+    MGR_EXPECTED_MEMBERS="$mgr_member_count"
+    [[ "$mgr_primary_count" == "1" ]] || { echo "[gmha-restore][ERROR] MGR precheck requires exactly one PRIMARY" >&2; exit 1; }
+    [[ "$RECOVERY_MODE" != "point_in_time" ]] || { echo "[gmha-restore][ERROR] single-member point-in-time restore is unsafe for an active MGR group; restore the whole group or recover into an isolated cluster" >&2; exit 1; }
+    [[ "$REPAIR_REPLICATION" != "true" ]] || { echo "[gmha-restore][ERROR] pt-table-sync async repair is not valid for an active MGR member" >&2; exit 1; }
+    echo "[gmha-restore][INFO] active MGR member detected; physical restore must rejoin ${MGR_EXPECTED_MEMBERS} ONLINE members"
+  fi
+fi
 
 echo "[gmha-restore][INFO] copying full backup into restore staging: $STAGING"
 mkdir -p "$STAGING"
@@ -174,13 +199,6 @@ copy_args+=(--copy-back "--target-dir=$STAGING" "--datadir=$DATA_DIR")
 for path in "${MANAGED_DIRS[@]}"; do chown -R "$MYSQL_OS_USER:$MYSQL_OS_USER" "$path"; done
 systemctl start "$SYSTEMD_UNIT"
 
-MYSQL_PWD="$(printf '%s' "$DB_PASSWORD_B64" | base64 -d)"
-AUTH_FILE="$(mktemp "/tmp/gmha-restore-auth-${PORT}.XXXXXX.cnf")"; chmod 600 "$AUTH_FILE"
-escaped_user="${DB_USER//\\/\\\\}"; escaped_user="${escaped_user//\"/\\\"}"
-escaped_password="${MYSQL_PWD//\\/\\\\}"; escaped_password="${escaped_password//\"/\\\"}"
-printf '[client]\nuser="%s"\npassword="%s"\n' "$escaped_user" "$escaped_password" > "$AUTH_FILE"
-mysql_args=("--defaults-extra-file=$AUTH_FILE" --batch "--port=$PORT")
-if [[ -n "$SOCKET" ]]; then mysql_args+=("--socket=$SOCKET"); else mysql_args+=(--host=127.0.0.1); fi
 for _ in $(seq 1 30); do mysql "${mysql_args[@]}" -e 'select 1' >/dev/null 2>&1 && break; sleep 1; done
 mysql "${mysql_args[@]}" -e 'select 1' >/dev/null 2>&1 || { echo "[gmha-restore][ERROR] MySQL did not become ready after restore" >&2; exit 1; }
 
@@ -203,7 +221,23 @@ if [[ "$RECOVERY_MODE" == "point_in_time" ]]; then
   echo "[gmha-restore][SUCCESS] point-in-time binlog replay completed"
 fi
 
-mysql "${mysql_args[@]}" -e 'START REPLICA' >/dev/null 2>&1 || mysql "${mysql_args[@]}" -e 'START SLAVE' >/dev/null 2>&1 || true
+if [[ "$MGR_WAS_ACTIVE" == "true" ]]; then
+  mgr_ready="false"
+  for _ in $(seq 1 120); do
+    mgr_verify="$(mysql "${mysql_args[@]}" -e "SELECT COALESCE(MAX(CASE WHEN MEMBER_ID=@@server_uuid THEN MEMBER_STATE END),''), COUNT(*), SUM(MEMBER_ROLE='PRIMARY'), COALESCE((SELECT COUNT_TRANSACTIONS_REMOTE_IN_APPLIER_QUEUE FROM performance_schema.replication_group_member_stats WHERE MEMBER_ID=@@server_uuid),0) FROM performance_schema.replication_group_members;" 2>/dev/null || true)"
+    if [[ -n "$mgr_verify" ]]; then
+      read -r mgr_self_state mgr_member_count mgr_primary_count mgr_queue <<< "$mgr_verify"
+      if [[ "$mgr_self_state" == "ONLINE" && "$mgr_member_count" == "$MGR_EXPECTED_MEMBERS" && "$mgr_primary_count" == "1" && "$mgr_queue" == "0" ]]; then
+        mgr_ready="true"; break
+      fi
+    fi
+    sleep 1
+  done
+  [[ "$mgr_ready" == "true" ]] || { echo "[gmha-restore][ERROR] restored MGR member did not return ONLINE with the original member count, one PRIMARY and an empty apply queue" >&2; exit 1; }
+  echo "[gmha-restore][SUCCESS] restored MGR member rejoined and caught up"
+else
+  mysql "${mysql_args[@]}" -e 'START REPLICA' >/dev/null 2>&1 || mysql "${mysql_args[@]}" -e 'START SLAVE' >/dev/null 2>&1 || true
+fi
 if [[ "$REPAIR_REPLICATION" == "true" ]]; then
   command -v pt-table-sync >/dev/null 2>&1 || { echo "[gmha-restore][ERROR] pt-table-sync is required for replication repair" >&2; exit 127; }
   echo "[gmha-restore][WARN] running pt-table-sync --sync-to-master to repair replica consistency"

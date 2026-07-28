@@ -65,6 +65,7 @@ func (u *CreateCollectMachineInfoUsecase) Execute(ctx context.Context, req Creat
 	stepID := fmt.Sprintf("task-step-%d", now.UnixNano())
 	task := taskdomain.Task{
 		ID:              taskID,
+		Visibility:      taskdomain.VisibilityInternal,
 		Type:            taskdomain.TypeCollectMachineInfo,
 		MachineID:       machine.ID,
 		AgentID:         agent.ID,

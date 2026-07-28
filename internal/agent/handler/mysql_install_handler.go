@@ -51,15 +51,16 @@ func (h *MySQLInstallHandler) Handle(ctx context.Context, task taskdomain.Dispat
 		managerHTTPAddr = h.managerHTTPAddr
 	}
 	runner := &mysqlInstallRunner{
-		ctx:        ctx,
-		task:       task,
-		reporter:   reporter,
-		spec:       spec,
-		client:     h.client,
-		baseURL:    managerHTTPAddr,
-		installDir: h.installDir,
-		stepStarts: make(map[string]time.Time),
-		runner:     agentcore.NewCommandRunner(),
+		ctx:           ctx,
+		task:          task,
+		reporter:      reporter,
+		spec:          spec,
+		client:        h.client,
+		baseURL:       managerHTTPAddr,
+		installDir:    h.installDir,
+		stepStarts:    make(map[string]time.Time),
+		streamedSteps: make(map[string]bool),
+		runner:        agentcore.NewCommandRunner(),
 	}
 	return runner.run()
 }
@@ -73,9 +74,10 @@ type mysqlInstallRunner struct {
 	baseURL    string
 	installDir string
 
-	stepStarts map[string]time.Time
-	runner     *agentcore.CommandRunner
-	topology   *taskdomain.MySQLTopologySpec
+	stepStarts    map[string]time.Time
+	streamedSteps map[string]bool
+	runner        *agentcore.CommandRunner
+	topology      *taskdomain.MySQLTopologySpec
 }
 
 func (r *mysqlInstallRunner) run() error {
@@ -134,7 +136,16 @@ func (r *mysqlInstallRunner) run() error {
 		func(step taskdomain.DispatchStep) error {
 			validate := mysqlConfigValidationCommand(filepath.Join(r.spec.BaseDir, "bin", "mysqld"), r.spec.MyCnfPath, r.spec.Version)
 			initialize := fmt.Sprintf("%s/bin/mysqld --defaults-file=%s --initialize-insecure --user=%s", shellEscape(r.spec.BaseDir), shellEscape(r.spec.MyCnfPath), shellEscape(r.spec.MySQLUser))
-			return r.runShellStep(step, "校验配置并初始化 MySQL", validate+" && "+initialize)
+			dataDir := shellEscape(r.spec.DataDir)
+			command := fmt.Sprintf(
+				"%s && if [ -d %s/mysql ] && [ -s %s/auto.cnf ]; then echo 'MySQL data directory is already initialized'; elif [ -n \"$(find %s -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)\" ]; then echo 'MySQL data directory is partially initialized; verify and clean it before retrying this step' >&2; exit 1; else %s; fi",
+				validate,
+				dataDir,
+				dataDir,
+				dataDir,
+				initialize,
+			)
+			return r.runShellStep(step, "校验配置并初始化 MySQL", command)
 		},
 		func(step taskdomain.DispatchStep) error {
 			prefix := ""
@@ -143,7 +154,7 @@ func (r *mysqlInstallRunner) run() error {
 				// system allocator must actively remove that persistent drop-in.
 				prefix = fmt.Sprintf("rm -f -- /etc/systemd/system/%s.service.d/allocator.conf; ", shellEscape(strings.TrimSuffix(r.spec.SystemdUnitName, ".service")))
 			}
-			return r.runShellStep(step, "启动 MySQL", prefix+fmt.Sprintf("systemctl daemon-reload && systemctl enable %s && systemctl restart %s", shellEscape(r.spec.SystemdUnitName), shellEscape(r.spec.SystemdUnitName)))
+			return r.runShellStep(step, "启动 MySQL 并设置开机自启", prefix+mysqlSystemdActivationCommand(r.spec.SystemdUnitName))
 		},
 		func(step taskdomain.DispatchStep) error {
 			return r.waitMySQLReadyStep(step, "")
@@ -188,6 +199,9 @@ func (r *mysqlInstallRunner) run() error {
 
 	for i, fn := range steps {
 		step := r.task.Steps[i]
+		if step.Status == taskdomain.StepSuccess {
+			continue
+		}
 		if err := fn(step); err != nil {
 			return err
 		}
@@ -259,6 +273,19 @@ func managerResourceURL(managerHTTPAddr, rawURL, managedPathPrefix string) strin
 	return base + "/" + strings.TrimLeft(rawURL, "/")
 }
 
+// mysqlSystemdActivationCommand starts the new instance, enables it for future
+// boots, and verifies both states before the installation may continue.
+func mysqlSystemdActivationCommand(unit string) string {
+	unit = strings.TrimSuffix(strings.TrimSpace(unit), ".service")
+	escapedUnit := shellEscape(unit + ".service")
+	return fmt.Sprintf(
+		"systemctl daemon-reload && systemctl enable --now %s && systemctl is-enabled --quiet %s && systemctl is-active --quiet %s",
+		escapedUnit,
+		escapedUnit,
+		escapedUnit,
+	)
+}
+
 func querySuffix(query string) string {
 	if query == "" {
 		return ""
@@ -314,6 +341,14 @@ func (r *mysqlInstallRunner) checkEnvCommand() string {
 	if r.spec.SystemdUnitName == "" {
 		service = "mysqld.service"
 	}
+	ptBundleCheck := ":"
+	if r.spec.InstallPTTools && !strings.Contains(strings.ToLower(filepath.Base(r.spec.PTToolsPackageName)), "offline") {
+		message := fmt.Sprintf(
+			"Percona Toolkit package %q is a source archive without offline Perl dependencies; upload and select a *-offline-*.tar.gz bundle before installing MySQL",
+			r.spec.PTToolsPackageName,
+		)
+		ptBundleCheck = fmt.Sprintf("echo %s >&2; exit 1", shellEscape(message))
+	}
 	instanceDir := filepath.Clean(r.spec.InstanceDir)
 	dataDir := filepath.Clean(r.spec.DataDir)
 	baseDir := filepath.Clean(r.spec.BaseDir)
@@ -323,6 +358,7 @@ func (r *mysqlInstallRunner) checkEnvCommand() string {
 		`test "$(id -u)" = "0" || { echo 'mysql install must run as root'; exit 1; }`,
 		`command -v tar >/dev/null 2>&1 || { echo 'missing tar'; exit 1; }`,
 		`command -v systemctl >/dev/null 2>&1 || { echo 'missing systemctl'; exit 1; }`,
+		ptBundleCheck,
 		`command -v apt-get >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1 || { echo 'missing supported package manager: apt-get/dnf/yum'; exit 1; }`,
 		fmt.Sprintf(`if systemctl list-unit-files %s 2>/dev/null | awk '{print $1}' | grep -qx %s || [ -e %s ] || [ -e %s ]; then echo 'mysql systemd unit already exists, uninstall before reinstall'; exit 1; fi`, shellEscape(service), shellEscape(service), shellEscape("/etc/systemd/system/"+service), shellEscape("/usr/lib/systemd/system/"+service)),
 		fmt.Sprintf(`if command -v ss >/dev/null 2>&1 && ss -ltnH 2>/dev/null | awk '{print $4}' | grep -Eq '(^|:)%d$'; then echo 'mysql port %d is already listening'; exit 1; fi`, r.spec.Port, r.spec.Port),
@@ -349,7 +385,7 @@ func installDependenciesCommand() string {
 	return strings.Join([]string{
 		`run_with_timeout() { if command -v timeout >/dev/null 2>&1; then timeout 300 "$@"; else "$@"; fi; }`,
 		`missing=""`,
-		`if command -v apt-get >/dev/null 2>&1; then for p in xz-utils libncurses6 numactl openssl perl curl ca-certificates; do dpkg -s "$p" >/dev/null 2>&1 || missing="$missing $p"; done; dpkg -s libaio1 >/dev/null 2>&1 || dpkg -s libaio1t64 >/dev/null 2>&1 || missing="$missing libaio1"; if [ -n "$missing" ]; then DEBIAN_FRONTEND=noninteractive run_with_timeout apt-get -y install --no-install-recommends $missing libaio-dev || { DEBIAN_FRONTEND=noninteractive run_with_timeout apt-get update && DEBIAN_FRONTEND=noninteractive run_with_timeout apt-get -y install --no-install-recommends xz-utils libaio1t64 libaio-dev libncurses6 numactl openssl perl curl ca-certificates; }; else echo "dependencies already installed"; fi; dpkg -s libncurses5 >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive run_with_timeout apt-get -y install --no-install-recommends libncurses5 >/dev/null 2>&1 || true`,
+		`if command -v apt-get >/dev/null 2>&1; then apt_pick() { for candidate in "$@"; do apt-cache show "$candidate" >/dev/null 2>&1 && { echo "$candidate"; return 0; }; done; return 1; }; ncurses_pkg=$(apt_pick libncurses6 libncurses5) || { DEBIAN_FRONTEND=noninteractive run_with_timeout apt-get update; ncurses_pkg=$(apt_pick libncurses6 libncurses5); }; aio_pkg=$(apt_pick libaio1 libaio1t64) || { DEBIAN_FRONTEND=noninteractive run_with_timeout apt-get update; aio_pkg=$(apt_pick libaio1 libaio1t64); }; test -n "$ncurses_pkg" || { echo "no compatible ncurses runtime package found" >&2; exit 1; }; test -n "$aio_pkg" || { echo "no compatible libaio runtime package found" >&2; exit 1; }; for p in xz-utils "$ncurses_pkg" numactl openssl perl curl ca-certificates "$aio_pkg" libaio-dev; do dpkg -s "$p" >/dev/null 2>&1 || missing="$missing $p"; done; if [ -n "$missing" ]; then DEBIAN_FRONTEND=noninteractive run_with_timeout apt-get -y install --no-install-recommends $missing || { DEBIAN_FRONTEND=noninteractive run_with_timeout apt-get update && DEBIAN_FRONTEND=noninteractive run_with_timeout apt-get -y install --no-install-recommends $missing; }; else echo "dependencies already installed"; fi; dpkg -s libncurses5 >/dev/null 2>&1 || apt-cache show libncurses5 >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive run_with_timeout apt-get -y install --no-install-recommends libncurses5 >/dev/null 2>&1 || true`,
 		`elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then rpm -qa >/dev/null || { echo "rpmdb is broken, run: rpm --rebuilddb"; exit 1; }; pm=dnf; command -v dnf >/dev/null 2>&1 || pm=yum; for p in xz libaio numactl-libs openssl perl curl ca-certificates; do rpm -q "$p" >/dev/null 2>&1 || missing="$missing $p"; done; rpm -q libaio-devel >/dev/null 2>&1 || missing="$missing libaio-devel"; if ! rpm -q ncurses-compat-libs >/dev/null 2>&1 && ! rpm -q ncurses >/dev/null 2>&1; then missing="$missing ncurses-compat-libs"; fi; if [ -n "$missing" ]; then run_with_timeout $pm -y install $missing || run_with_timeout $pm -y install xz libaio libaio-devel numactl-libs ncurses openssl perl curl ca-certificates; else echo "dependencies already installed"; fi`,
 		`fi`,
 		`if ! ldconfig -p 2>/dev/null | grep -q "libaio.so.1 "; then for p in /usr/lib/*/libaio.so.1t64 /lib/*/libaio.so.1t64; do if [ -e "$p" ]; then ln -sfn "$p" "$(dirname "$p")/libaio.so.1"; fi; done; ldconfig 2>/dev/null || true; fi`,
@@ -369,11 +405,13 @@ func installPTToolsCommand(mysqlBaseDir, packageName, packageURL string) string 
 		`download "$pt_package_url" "$pt_archive"`,
 		`test -s "$pt_archive" && rm -rf "$pt_stage" && mkdir -p "$pt_stage" && tar -xzf "$pt_archive" -C "$pt_stage"`,
 		`pt_source=$(find "$pt_stage" -type f -path '*/bin/pt-table-sync' -print -quit); [ -n "$pt_source" ] || { echo "invalid offline PT bundle: bin/pt-table-sync not found" >&2; exit 1; }; pt_source=$(dirname "$(dirname "$pt_source")")`,
-		`pt_packages=$(find "$pt_stage" -type d -name packages -print -quit); if [ -n "$pt_packages" ]; then debs=$(find "$pt_packages" -type f -name '*.deb' -print); rpms=$(find "$pt_packages" -type f -name '*.rpm' -print); apks=$(find "$pt_packages" -type f -name '*.apk' -print); archpkgs=$(find "$pt_packages" -type f \( -name '*.pkg.tar.zst' -o -name '*.pkg.tar.xz' \) -print); if [ -n "$debs" ] && command -v dpkg >/dev/null 2>&1; then dpkg -i $debs; elif [ -n "$rpms" ] && command -v rpm >/dev/null 2>&1; then rpm -Uvh --replacepkgs $rpms; elif [ -n "$apks" ] && command -v apk >/dev/null 2>&1; then apk add --no-network --allow-untrusted $apks; elif [ -n "$archpkgs" ] && command -v pacman >/dev/null 2>&1; then pacman -U --noconfirm $archpkgs; fi; fi`,
+		`pt_packages=$(find "$pt_stage" -type d -name packages -print -quit); if [ -n "$pt_packages" ]; then debs=$(find "$pt_packages" -type f -name '*.deb' -print); rpms=$(find "$pt_packages" -type f -name '*.rpm' -print); apks=$(find "$pt_packages" -type f -name '*.apk' -print); archpkgs=$(find "$pt_packages" -type f \( -name '*.pkg.tar.zst' -o -name '*.pkg.tar.xz' \) -print); if [ -n "$debs" ] && command -v dpkg >/dev/null 2>&1; then dpkg -i $debs || true; elif [ -n "$rpms" ] && command -v dnf >/dev/null 2>&1; then dnf -y --disablerepo='*' install $rpms || true; elif [ -n "$rpms" ] && command -v yum >/dev/null 2>&1; then yum -y --disablerepo='*' localinstall $rpms || true; elif [ -n "$rpms" ] && command -v rpm >/dev/null 2>&1; then rpm -Uvh --replacepkgs $rpms || true; elif [ -n "$apks" ] && command -v apk >/dev/null 2>&1; then apk add --no-network --allow-untrusted $apks || true; elif [ -n "$archpkgs" ] && command -v pacman >/dev/null 2>&1; then pacman -U --noconfirm $archpkgs || true; fi; fi`,
 		`command -v perl >/dev/null 2>&1 || { echo "offline PT bundle does not contain a Perl package compatible with this Linux distribution" >&2; exit 1; }`,
 		`rm -rf "$pt_install" && mkdir -p "$(dirname "$pt_install")" && cp -a "$pt_source" "$pt_install"`,
 		`pt_perl5lib="$pt_install/vendor/perl5:$pt_install/lib/perl5:$pt_install/lib"; export PERL5LIB="$pt_perl5lib${PERL5LIB:+:$PERL5LIB}"`,
-		`perl -MDBI -MDBD::mysql -MIO::Socket::SSL -MTerm::ReadKey -MDigest::MD5 -MTime::HiRes -e 1 || { echo "offline PT dependencies are incomplete; bundle vendor/perl5 or native packages under packages/" >&2; exit 1; }`,
+		`check_pt_modules() { missing=""; for perl_module in DBI DBD::mysql IO::Socket::SSL Term::ReadKey; do perl "-M$perl_module" -e 1 >/dev/null 2>&1 || missing="$missing $perl_module"; done; printf '%s' "$missing"; }`,
+		`missing_perl_modules=$(check_pt_modules); if [ -n "$missing_perl_modules" ]; then echo "offline PT bundle is missing usable Perl modules:$missing_perl_modules; trying configured OS package repositories" >&2; run_with_timeout() { if command -v timeout >/dev/null 2>&1; then timeout 300 "$@"; else "$@"; fi; }; if command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive run_with_timeout apt-get -y install --no-install-recommends libdbi-perl libdbd-mysql-perl libio-socket-ssl-perl libterm-readkey-perl || true; elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then pm=dnf; command -v dnf >/dev/null 2>&1 || pm=yum; run_with_timeout "$pm" -y install perl-DBI perl-DBD-MySQL perl-IO-Socket-SSL perl-TermReadKey || true; elif command -v zypper >/dev/null 2>&1; then run_with_timeout zypper --non-interactive install perl-DBI perl-DBD-mysql perl-IO-Socket-SSL perl-TermReadKey || true; elif command -v apk >/dev/null 2>&1; then run_with_timeout apk add perl-dbi perl-dbd-mysql perl-io-socket-ssl perl-term-readkey || true; fi; fi`,
+		`missing_perl_modules=$(check_pt_modules); [ -z "$missing_perl_modules" ] || { echo "Percona Toolkit dependencies are unavailable; missing Perl modules:$missing_perl_modules. Upload a complete offline bundle or enable the target OS package repository, then retry" >&2; exit 1; }`,
 		`for pt_script in "$pt_install"/bin/pt-*; do [ -f "$pt_script" ] || continue; pt_cmd=$(basename "$pt_script"); printf '#!/bin/sh\nPT_HOME=%s\nexport PERL5LIB="$PT_HOME/vendor/perl5:$PT_HOME/lib/perl5:$PT_HOME/lib${PERL5LIB:+:$PERL5LIB}"\nexec perl "$PT_HOME/bin/%s" "$@"\n' "$pt_install" "$pt_cmd" > "/usr/local/bin/$pt_cmd" && chmod 0755 "/usr/local/bin/$pt_cmd"; done`,
 		`hash -r`,
 		`pt_version=$(pt-table-sync --version 2>/dev/null | sed -nE 's/.* ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -1)`,
@@ -449,7 +487,10 @@ func (r *mysqlInstallRunner) setRootPasswordCommand() string {
 		mysqlSQLEscape(password),
 	)
 	return fmt.Sprintf(
-		"%s --protocol=socket --socket=%s -uroot -e %s || %s --socket=%s -uroot flush-privileges password %s",
+		"if %s --connect-timeout=5 --socket=%s -uroot -p%s ping >/dev/null 2>&1; then echo 'root password is already configured'; else %s --protocol=socket --socket=%s -uroot -e %s || %s --socket=%s -uroot flush-privileges password %s; fi",
+		shellEscape(mysqladmin),
+		shellEscape(socket),
+		shellEscape(password),
 		shellEscape(mysql),
 		shellEscape(socket),
 		shellEscape(sql),
@@ -849,7 +890,37 @@ func (r *mysqlInstallRunner) runShellStep(step taskdomain.DispatchStep, message,
 }
 
 func (r *mysqlInstallRunner) runShellCommand(step taskdomain.DispatchStep, command string) (string, error) {
-	output, err := r.runner.RunShell(r.ctx, r.task.ID, step.StepName, command)
+	startedAt := r.stepStartedAt(step, time.Now().UTC())
+	stepProgress := progress(step.StepNo, len(r.task.Steps))
+	_ = r.reporter.Report(taskdomain.ReportEnvelope{
+		TaskID:      r.task.ID,
+		Status:      taskdomain.StatusRunning,
+		Progress:    stepProgress,
+		CurrentStep: step.StepName,
+		Step: &taskdomain.StepReport{
+			StepID:    step.ID,
+			StepNo:    step.StepNo,
+			StepName:  step.StepName,
+			Status:    taskdomain.StepRunning,
+			Message:   "命令已启动，等待输出",
+			StartedAt: &startedAt,
+		},
+		Event: &taskdomain.Event{
+			TaskID:    r.task.ID,
+			StepID:    step.ID,
+			EventType: taskdomain.EventInfo,
+			Content:   "开始执行：" + step.StepName,
+		},
+	})
+	liveOutput := agentcore.NewLiveOutputReporter(r.reporter, r.task.ID, step, stepProgress, startedAt)
+	output, err := r.runner.RunShellWithOutput(r.ctx, r.task.ID, step.StepName, command, liveOutput.Add)
+	liveOutput.Flush()
+	if liveOutput.Emitted() {
+		if r.streamedSteps == nil {
+			r.streamedSteps = make(map[string]bool)
+		}
+		r.streamedSteps[step.ID] = true
+	}
 	return mysqlCommandOutput(output, ""), err
 }
 
@@ -871,7 +942,7 @@ func (r *mysqlInstallRunner) successStep(step taskdomain.DispatchStep, message, 
 			FinishedAt: &now,
 		},
 	}
-	if strings.TrimSpace(logText) != "" {
+	if strings.TrimSpace(logText) != "" && !r.streamedSteps[step.ID] {
 		report.Event = &taskdomain.Event{
 			TaskID:    r.task.ID,
 			StepID:    step.ID,
@@ -954,6 +1025,9 @@ func (r *mysqlInstallRunner) finalResultWithAccounts(accountResult mysqlapp.Acco
 func (r *mysqlInstallRunner) failStep(step taskdomain.DispatchStep, err error) error {
 	now := time.Now().UTC()
 	startedAt := r.stepStartedAt(step, now)
+	fullError := strings.TrimSpace(err.Error())
+	stepMessage := truncateTaskText(fullError, 600, false)
+	eventContent := truncateTaskText(fullError, 12*1024, true)
 	_ = r.reporter.Report(taskdomain.ReportEnvelope{
 		TaskID:      r.task.ID,
 		Status:      taskdomain.StatusFailed,
@@ -964,7 +1038,7 @@ func (r *mysqlInstallRunner) failStep(step taskdomain.DispatchStep, err error) e
 			StepNo:     step.StepNo,
 			StepName:   step.StepName,
 			Status:     taskdomain.StepFailed,
-			Message:    err.Error(),
+			Message:    stepMessage,
 			StartedAt:  &startedAt,
 			FinishedAt: &now,
 		},
@@ -972,10 +1046,21 @@ func (r *mysqlInstallRunner) failStep(step taskdomain.DispatchStep, err error) e
 			TaskID:    r.task.ID,
 			StepID:    step.ID,
 			EventType: taskdomain.EventError,
-			Content:   err.Error(),
+			Content:   eventContent,
 		},
 	})
 	return agentcore.ReportedTaskError{Err: err}
+}
+
+func truncateTaskText(value string, maxRunes int, keepTail bool) string {
+	runes := []rune(strings.TrimSpace(value))
+	if len(runes) <= maxRunes {
+		return string(runes)
+	}
+	if keepTail {
+		return "…（已省略前部内容，完整过程见实时日志）\n" + string(runes[len(runes)-maxRunes:])
+	}
+	return string(runes[:maxRunes]) + "…"
 }
 
 func (r *mysqlInstallRunner) markStepStarted(step taskdomain.DispatchStep) time.Time {

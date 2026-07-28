@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -40,6 +41,9 @@ func TestMySQLRestartCommandsPreserveTopologyAndVerifyData(t *testing.T) {
 	all := ""
 	for _, command := range commands {
 		all += "\n" + command.Command
+		if output, syntaxErr := exec.Command("bash", "-n", "-c", command.Command).CombinedOutput(); syntaxErr != nil {
+			t.Fatalf("restart workflow shell syntax is invalid: %v\n%s\n%s", syntaxErr, output, command.Command)
+		}
 	}
 	for _, required := range []string{
 		mysqlDefaultsFilePlaceholder,
@@ -49,6 +53,8 @@ func TestMySQLRestartCommandsPreserveTopologyAndVerifyData(t *testing.T) {
 		"SHOW REPLICA STATUS",
 		"SHOW SLAVE STATUS",
 		"GTID_SUBSET",
+		"replication_group_members",
+		"GMHA_MGR_HEALTH_OK",
 		"pt-table-checksum",
 		"systemctl restart",
 		"Another MySQL lifecycle operation is active",
@@ -61,6 +67,38 @@ func TestMySQLRestartCommandsPreserveTopologyAndVerifyData(t *testing.T) {
 	for _, forbidden := range []string{"--password=", "MYSQL_PWD", "poweroff", "shutdown -h"} {
 		if strings.Contains(all, forbidden) {
 			t.Fatalf("restart workflow contains unsafe credential or host action %q", forbidden)
+		}
+	}
+}
+
+func TestMySQLLifecycleCommandsVerifyMGRQuorum(t *testing.T) {
+	target := mysqlapp.Instance{Port: 3306, SystemdUnit: "mysqld-3306.service"}
+	members := []app.MySQLInstanceTarget{
+		{Machine: machinedomain.Machine{IP: "10.0.0.1"}, Instance: target},
+		{Machine: machinedomain.Machine{IP: "10.0.0.2"}, Instance: mysqlapp.Instance{Port: 3306}},
+		{Machine: machinedomain.Machine{IP: "10.0.0.3"}, Instance: mysqlapp.Instance{Port: 3306}},
+	}
+	commands, err := mysqlLifecycleCommands(target, "10.0.0.1", members, "shutdown", "/tmp/gmha-test", "/var/lock/gmha-test", true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := ""
+	for _, command := range commands {
+		all += "\n" + command.Command
+		if output, syntaxErr := exec.Command("bash", "-n", "-c", command.Command).CombinedOutput(); syntaxErr != nil {
+			t.Fatalf("MGR shutdown workflow shell syntax is invalid: %v\n%s\n%s", syntaxErr, output, command.Command)
+		}
+	}
+	for _, required := range []string{
+		"mgr_member_state",
+		"mgr_group_health",
+		"members=3",
+		"members=2",
+		"10.0.0.2",
+		"async PT checksum step skipped",
+	} {
+		if !strings.Contains(all, required) {
+			t.Fatalf("MGR lifecycle workflow missing %q", required)
 		}
 	}
 }

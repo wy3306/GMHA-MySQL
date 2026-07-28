@@ -1,0 +1,48 @@
+name: Linux compatibility
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  unit-and-cross-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test compatibility and installers
+        run: go test ./internal/platform/linuxcompat ./internal/usecase/agent ./internal/agent/handler ./internal/usecase/task
+      - name: Cross-build static Agents
+        run: |
+          mkdir -p dist/linux-compat
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o dist/linux-compat/agentd-amd64 ./cmd/agent
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o dist/linux-compat/agentd-arm64 ./cmd/agent
+          file dist/linux-compat/agentd-amd64 dist/linux-compat/agentd-arm64
+
+  distro-smoke:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - ubuntu:18.04
+          - ubuntu:20.04
+          - ubuntu:22.04
+          - ubuntu:24.04
+          - centos:7
+          - quay.io/centos/centos:stream8
+          - quay.io/centos/centos:stream9
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build static amd64 Agent
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /tmp/gmha-agentd ./cmd/agent
+      - name: Run Agent binary in distribution container
+        run: docker run --rm -v /tmp/gmha-agentd:/usr/local/bin/gmha-agentd:ro "${{ matrix.image }}" /usr/local/bin/gmha-agentd --version

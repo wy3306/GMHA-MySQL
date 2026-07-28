@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,11 +19,12 @@ import (
 )
 
 type alertMemoryRepo struct {
-	rules    []alertdomain.Rule
-	events   map[string]alertdomain.Event
-	states   map[string]alertdomain.EvaluationState
-	channels []alertdomain.Channel
-	filters  []alertdomain.Filter
+	rules                 []alertdomain.Rule
+	events                map[string]alertdomain.Event
+	states                map[string]alertdomain.EvaluationState
+	channels              []alertdomain.Channel
+	filters               []alertdomain.Filter
+	restartClassification alertdomain.MySQLRestartClassification
 }
 
 func newAlertMemoryRepo() *alertMemoryRepo {
@@ -83,6 +85,9 @@ func (r *alertMemoryRepo) GetEvaluationState(_ context.Context, fp string) (aler
 func (r *alertMemoryRepo) SaveEvaluationState(_ context.Context, x alertdomain.EvaluationState) error {
 	r.states[x.Fingerprint] = x
 	return nil
+}
+func (r *alertMemoryRepo) ClassifyMySQLRestart(context.Context, string, int, time.Time, time.Time) (alertdomain.MySQLRestartClassification, error) {
+	return r.restartClassification, nil
 }
 func (r *alertMemoryRepo) ListChannels(context.Context) ([]alertdomain.Channel, error) {
 	return r.channels, nil
@@ -267,6 +272,37 @@ func TestAlertChannelValidationRejectsInvalidEndpointAndPort(t *testing.T) {
 	if err == nil {
 		t.Fatal("invalid target ports must be rejected")
 	}
+	_, err = service.SaveChannel(context.Background(), alertdomain.Channel{
+		Name: "qq-email", Type: "email",
+		Config: map[string]string{
+			"host": "smtp.qq.com", "port": "265", "username": "sender@example.com",
+			"password": "authorization-code", "from": "sender@example.com", "to": "recipient@example.com",
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "465") || !strings.Contains(err.Error(), "587") {
+		t.Fatalf("mistyped SMTP port must explain the supported SSL ports: %v", err)
+	}
+}
+
+func TestBuildAlertEmailIncludesRFCHeaders(t *testing.T) {
+	from, recipients, message, err := buildAlertEmail(
+		"sender@example.com",
+		[]string{"recipient@example.com"},
+		"[GMHA][NOTICE] 告警通道测试",
+		"测试邮件",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if from != "sender@example.com" || len(recipients) != 1 || recipients[0] != "recipient@example.com" {
+		t.Fatalf("unexpected SMTP envelope: from=%q recipients=%v", from, recipients)
+	}
+	text := string(message)
+	for _, header := range []string{"From: ", "To: ", "Date: ", "Subject: =?UTF-8?", "MIME-Version: 1.0", "Content-Type: text/plain; charset=UTF-8"} {
+		if !strings.Contains(text, header) {
+			t.Fatalf("message is missing RFC header %q:\n%s", header, text)
+		}
+	}
 }
 
 func TestAlertFilterSuppressesByCIDRAndMessageRegex(t *testing.T) {
@@ -353,6 +389,89 @@ func TestAlertEvaluationDoesNotCountRepeatedCollectorSample(t *testing.T) {
 	service.evaluatePayload(context.Background(), payload)
 	if len(repo.events) != 1 {
 		t.Fatalf("a newer collector sample should complete the threshold: %+v", repo.events)
+	}
+}
+
+func TestMySQLRestartClassificationUsesCriticalForUnexpectedRestart(t *testing.T) {
+	repo := newAlertMemoryRepo()
+	service := NewAlertService(repo)
+	firstSample := time.Date(2026, 7, 28, 8, 0, 0, 0, time.UTC)
+	payload := hbdomain.HeartbeatPayload{
+		AgentID: "a1", MachineID: "m1", MachineName: "db-1", MachineIP: "10.0.0.8",
+		Metrics: []dynamicdomain.MetricResult{{
+			Name: "mysql_uptime", Category: "mysql", Success: true,
+			Value: float64(3600), CollectedAt: firstSample,
+			Labels: map[string]string{"mysql_port": "3306", "metric_scope": "mysql"},
+		}},
+	}
+	service.evaluatePayload(context.Background(), payload)
+	payload.Metrics[0].Value = float64(15)
+	payload.Metrics[0].CollectedAt = firstSample.Add(10 * time.Second)
+	service.evaluatePayload(context.Background(), payload)
+
+	if len(repo.events) != 1 {
+		t.Fatalf("unexpected restart should create one event, got %+v", repo.events)
+	}
+	for _, event := range repo.events {
+		if event.Severity != alertdomain.SeverityCritical || event.RuleName != "MySQL 意外重启" {
+			t.Fatalf("unexpected restart should be critical: %+v", event)
+		}
+		if event.Labels["restart_type"] != "unexpected" || event.Labels["mysql_port"] != "3306" {
+			t.Fatalf("restart classification labels are incomplete: %+v", event.Labels)
+		}
+	}
+}
+
+func TestMySQLRestartClassificationUsesNoticeForManualRestart(t *testing.T) {
+	repo := newAlertMemoryRepo()
+	repo.restartClassification = alertdomain.MySQLRestartClassification{
+		Manual: true, TaskID: "task-restart-1", Operation: "mysql_restart",
+	}
+	service := NewAlertService(repo)
+	firstSample := time.Date(2026, 7, 28, 8, 0, 0, 0, time.UTC)
+	payload := hbdomain.HeartbeatPayload{
+		AgentID: "a1", MachineID: "m1",
+		Metrics: []dynamicdomain.MetricResult{{
+			Name: "mysql_uptime", Category: "mysql", Success: true,
+			Value: float64(600), CollectedAt: firstSample,
+			Labels: map[string]string{"mysql_port": "3307"},
+		}},
+	}
+	service.evaluatePayload(context.Background(), payload)
+	payload.Metrics[0].Value = float64(5)
+	payload.Metrics[0].CollectedAt = firstSample.Add(5 * time.Second)
+	service.evaluatePayload(context.Background(), payload)
+
+	if len(repo.events) != 1 {
+		t.Fatalf("manual restart should create one event, got %+v", repo.events)
+	}
+	for _, event := range repo.events {
+		if event.Severity != alertdomain.SeverityNotice || event.RuleName != "MySQL 手动重启" {
+			t.Fatalf("manual restart should be a notice: %+v", event)
+		}
+		if event.Labels["restart_type"] != "manual" || event.Labels["manual_task_id"] != "task-restart-1" || event.AutomationState != "skipped" {
+			t.Fatalf("manual restart audit labels are incomplete: %+v", event)
+		}
+	}
+}
+
+func TestMySQLUptimeIncreaseDoesNotCreateRestartEvent(t *testing.T) {
+	repo := newAlertMemoryRepo()
+	service := NewAlertService(repo)
+	firstSample := time.Date(2026, 7, 28, 8, 0, 0, 0, time.UTC)
+	payload := hbdomain.HeartbeatPayload{
+		MachineID: "m1",
+		Metrics: []dynamicdomain.MetricResult{{
+			Name: "mysql_uptime", Success: true, Value: float64(600), CollectedAt: firstSample,
+			Labels: map[string]string{"mysql_port": "3306"},
+		}},
+	}
+	service.evaluatePayload(context.Background(), payload)
+	payload.Metrics[0].Value = float64(610)
+	payload.Metrics[0].CollectedAt = firstSample.Add(10 * time.Second)
+	service.evaluatePayload(context.Background(), payload)
+	if len(repo.events) != 0 {
+		t.Fatalf("normal uptime growth must not create a restart event: %+v", repo.events)
 	}
 }
 

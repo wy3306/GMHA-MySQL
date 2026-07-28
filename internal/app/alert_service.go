@@ -11,8 +11,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
+	"net/mail"
 	"net/smtp"
 	"net/url"
 	"regexp"
@@ -404,7 +406,9 @@ func (s *AlertService) evaluatePayload(ctx context.Context, payload hbdomain.Hea
 			byMetric[r.Metric] = append(byMetric[r.Metric], r)
 		}
 	}
-	for _, metric := range alertEvaluationMetrics(payload.Metrics) {
+	metrics := alertEvaluationMetrics(payload.Metrics)
+	s.observeMySQLRestarts(ctx, payload, metrics, filters)
+	for _, metric := range metrics {
 		numeric, _ := metricNumber(metric.Value)
 		for _, rule := range byMetric[metric.Name] {
 			if rule.ClusterID != "" && rule.ClusterID != payload.ClusterID {
@@ -422,6 +426,121 @@ func (s *AlertService) evaluatePayload(ctx context.Context, payload hbdomain.Hea
 			}
 			s.evaluate(ctx, rule, payload, metric, numeric)
 		}
+	}
+}
+
+const mysqlRestartMetric = "mysql_restart_detected"
+
+func (s *AlertService) observeMySQLRestarts(ctx context.Context, payload hbdomain.HeartbeatPayload, metrics []dynamicdomain.MetricResult, filters []alertdomain.Filter) {
+	for _, metric := range metrics {
+		if metric.Name != "mysql_uptime" {
+			continue
+		}
+		uptime, ok := metricNumber(metric.Value)
+		if !ok || uptime < 0 {
+			continue
+		}
+		s.observeMySQLRestart(ctx, payload, metric, uptime, filters)
+	}
+}
+
+func (s *AlertService) observeMySQLRestart(ctx context.Context, payload hbdomain.HeartbeatPayload, metric dynamicdomain.MetricResult, uptime float64, filters []alertdomain.Filter) {
+	sampledAt := metric.CollectedAt.UTC()
+	if sampledAt.IsZero() {
+		sampledAt = payload.SentAt.UTC()
+	}
+	if sampledAt.IsZero() {
+		sampledAt = time.Now().UTC()
+	}
+	stateFingerprint := fingerprint(stableID("system", "mysql-restart-observer"), payload.MachineID, metric.Labels)
+	state, found, err := s.repo.GetEvaluationState(ctx, stateFingerprint)
+	if err != nil {
+		return
+	}
+	if found && !state.LastSampleAt.IsZero() && !sampledAt.After(state.LastSampleAt) {
+		return
+	}
+	next := alertdomain.EvaluationState{
+		Fingerprint: stateFingerprint, RuleID: stableID("system", "mysql-restart-observer"),
+		Consecutive: 0, LastValue: uptime, LastSampleAt: sampledAt, UpdatedAt: time.Now().UTC(),
+	}
+	if !found || state.LastSampleAt.IsZero() {
+		_ = s.repo.SaveEvaluationState(ctx, next)
+		return
+	}
+
+	previousBootAt := state.LastSampleAt.Add(-time.Duration(state.LastValue * float64(time.Second)))
+	currentBootAt := sampledAt.Add(-time.Duration(uptime * float64(time.Second)))
+	// Uptime is sampled with second precision. A 30-second boot-time movement
+	// absorbs collection jitter while still detecting a normal MySQL restart.
+	if !currentBootAt.After(previousBootAt.Add(30 * time.Second)) {
+		_ = s.repo.SaveEvaluationState(ctx, next)
+		return
+	}
+
+	port, _ := strconv.Atoi(strings.TrimSpace(metric.Labels["mysql_port"]))
+	classification := alertdomain.MySQLRestartClassification{}
+	if classifier, ok := s.repo.(alertdomain.MySQLRestartClassifier); ok {
+		classification, _ = classifier.ClassifyMySQLRestart(ctx, payload.MachineID, port, currentBootAt, sampledAt)
+	}
+	restartType, ruleName, severity := "unexpected", "MySQL 意外重启", alertdomain.SeverityCritical
+	if classification.Manual {
+		restartType, ruleName, severity = "manual", "MySQL 手动重启", alertdomain.SeverityNotice
+	}
+	labels := cloneLabels(metric.Labels)
+	labels["restart_type"] = restartType
+	labels["restart_boot_time"] = currentBootAt.Truncate(time.Second).Format(time.RFC3339)
+	labels["previous_uptime_seconds"] = strconv.FormatInt(int64(state.LastValue), 10)
+	labels["current_uptime_seconds"] = strconv.FormatInt(int64(uptime), 10)
+	labels["machine_name"], labels["machine_ip"], labels["alert_category"] = alertMachineName(payload), payload.MachineIP, "mysql"
+	if classification.TaskID != "" {
+		labels["manual_task_id"] = classification.TaskID
+	}
+	if classification.Operation != "" {
+		labels["manual_operation"] = classification.Operation
+	}
+	restartRule := alertdomain.Rule{
+		ID: stableID("system", mysqlRestartMetric), Name: ruleName,
+		Description: "检测到 MySQL 启动时间发生变化", Metric: mysqlRestartMetric,
+		Operator: "==", Threshold: 1, Severity: severity,
+	}
+	restartMetric := dynamicdomain.MetricResult{
+		Name: mysqlRestartMetric, Category: "mysql", Success: true,
+		ValueType: dynamicdomain.ValueTypeFloat, Value: float64(1),
+		Labels: labels, CollectedAt: sampledAt,
+	}
+	if !alertFiltered(filters, restartRule, payload, restartMetric) {
+		s.recordMySQLRestartEvent(ctx, payload, restartRule, restartMetric, classification, currentBootAt)
+	}
+	_ = s.repo.SaveEvaluationState(ctx, next)
+}
+
+func (s *AlertService) recordMySQLRestartEvent(ctx context.Context, payload hbdomain.HeartbeatPayload, rule alertdomain.Rule, metric dynamicdomain.MetricResult, classification alertdomain.MySQLRestartClassification, bootAt time.Time) {
+	now := time.Now().UTC()
+	eventFingerprint := stableID(rule.ID, payload.MachineID, metric.Labels["mysql_port"], bootAt.Truncate(time.Second).Format(time.RFC3339))
+	eventID := stableID("event", eventFingerprint)
+	if _, found, err := s.repo.GetActiveEvent(ctx, eventFingerprint); err != nil {
+		return
+	} else if found {
+		return
+	}
+	event := alertdomain.Event{
+		ID: eventID, Fingerprint: eventFingerprint, RuleID: rule.ID, RuleName: rule.Name,
+		Metric: mysqlRestartMetric, MachineID: payload.MachineID, AgentID: payload.AgentID,
+		ClusterID: payload.ClusterID, Labels: cloneLabels(metric.Labels),
+		Severity: rule.Severity, Status: "firing", Value: 1, Threshold: 1, Operator: "==",
+		OccurrenceCount: 1, FirstSeenAt: now, LastSeenAt: now, AutomationState: "pending",
+	}
+	if classification.Manual {
+		event.AutomationState = "skipped"
+	}
+	if err := s.repo.SaveEvent(ctx, event); err != nil {
+		return
+	}
+	if s.enqueue(event) {
+		event.NotificationCount = 1
+		event.LastNotifiedAt = &now
+		_ = s.repo.SaveEvent(ctx, event)
 	}
 }
 
@@ -844,8 +963,10 @@ func validateChannelConfig(c alertdomain.Channel) error {
 		if err := require("host", "username", "password", "from", "to"); err != nil {
 			return err
 		}
-		if err := validatePort(c.Config["port"], 25); err != nil {
-			return err
+		switch strings.TrimSpace(c.Config["port"]) {
+		case "465", "587":
+		default:
+			return alertdomain.Invalid("SMTP 端口只能使用 465（SSL）或 587（STARTTLS）")
 		}
 		return nil
 	case "dingtalk", "feishu":
@@ -894,7 +1015,7 @@ func (s *AlertService) deliver(ctx context.Context, c alertdomain.Channel, e ale
 	text := fmt.Sprintf("%s\n状态: %s\n机器: %s\n指标: %s\n当前值: %v %s 阈值: %v\n时间: %s", title, e.Status, e.MachineID, e.Metric, e.Value, e.Operator, e.Threshold, e.LastSeenAt.Format(time.RFC3339))
 	switch c.Type {
 	case "email":
-		return sendAlertEmail(c.Config, title, text)
+		return sendAlertEmail(ctx, c.Config, title, text)
 	case "dingtalk":
 		return s.postJSON(ctx, c.Config["webhook"], map[string]any{"msgtype": "markdown", "markdown": map[string]string{"title": title, "text": text}})
 	case "feishu":
@@ -961,84 +1082,106 @@ func (s *AlertService) postJSON(ctx context.Context, url string, payload any) er
 	}
 	return nil
 }
-func sendAlertEmail(cfg map[string]string, subject, body string) error {
-	host := cfg["host"]
-	port := cfg["port"]
-	if port == "" {
-		port = "25"
+func sendAlertEmail(ctx context.Context, cfg map[string]string, subject, body string) error {
+	host := strings.TrimSpace(cfg["host"])
+	port := strings.TrimSpace(cfg["port"])
+	from := strings.TrimSpace(cfg["from"])
+	to := make([]string, 0)
+	for _, recipient := range strings.Split(cfg["to"], ",") {
+		if recipient = strings.TrimSpace(recipient); recipient != "" {
+			to = append(to, recipient)
+		}
 	}
-	from := cfg["from"]
-	to := strings.Split(cfg["to"], ",")
 	if host == "" || from == "" || len(to) == 0 {
 		return errors.New("email host, from and to are required")
 	}
-	addr := host + ":" + port
-	auth := smtp.PlainAuth("", cfg["username"], cfg["password"], host)
-	msg := []byte("To: " + strings.Join(to, ",") + "\r\nSubject: " + subject + "\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n" + body)
-	if cfg["tls"] != "true" && cfg["starttls"] != "true" {
-		return smtp.SendMail(addr, auth, from, to, msg)
-	}
-	if cfg["starttls"] == "true" {
-		client, err := smtp.Dial(addr)
-		if err != nil {
-			return err
-		}
-		defer client.Close()
-		if err = client.StartTLS(&tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}); err != nil {
-			return err
-		}
-		if cfg["username"] != "" {
-			if err = client.Auth(auth); err != nil {
-				return err
-			}
-		}
-		if err = client.Mail(from); err != nil {
-			return err
-		}
-		for _, x := range to {
-			if err = client.Rcpt(strings.TrimSpace(x)); err != nil {
-				return err
-			}
-		}
-		w, err := client.Data()
-		if err != nil {
-			return err
-		}
-		if _, err = w.Write(msg); err != nil {
-			return err
-		}
-		return w.Close()
-	}
-	conn, err := tls.Dial("tcp", addr, &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12})
+	fromAddress, recipients, msg, err := buildAlertEmail(from, to, subject, body)
 	if err != nil {
 		return err
+	}
+	addr := net.JoinHostPort(host, port)
+	auth := smtp.PlainAuth("", cfg["username"], cfg["password"], host)
+	dialer := &net.Dialer{Timeout: 8 * time.Second}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return fmt.Errorf("无法连接 SMTP 服务器 %s，请检查地址、端口和网络: %w", addr, err)
+	}
+	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+	if port == "465" {
+		tlsConn := tls.Client(conn, &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12})
+		if err = tlsConn.HandshakeContext(ctx); err != nil {
+			_ = conn.Close()
+			return fmt.Errorf("SMTP SSL 握手失败；465 端口必须使用 SSL，请确认端口填写正确: %w", err)
+		}
+		conn = tlsConn
 	}
 	client, err := smtp.NewClient(conn, host)
 	if err != nil {
-		return err
+		_ = conn.Close()
+		return fmt.Errorf("SMTP 服务器未返回有效欢迎信息；请确认端口与加密方式匹配（465 使用 SSL，587 使用 STARTTLS）: %w", err)
 	}
 	defer client.Close()
-	if cfg["username"] != "" {
-		if err = client.Auth(auth); err != nil {
-			return err
+	if port == "587" {
+		ok, _ := client.Extension("STARTTLS")
+		if !ok {
+			return errors.New("SMTP 服务器不支持 STARTTLS；587 端口必须使用 STARTTLS")
+		}
+		if err = client.StartTLS(&tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}); err != nil {
+			return fmt.Errorf("SMTP STARTTLS 握手失败；请确认 587 端口可用: %w", err)
 		}
 	}
-	if err = client.Mail(from); err != nil {
-		return err
+	if cfg["username"] != "" {
+		if err = client.Auth(auth); err != nil {
+			return fmt.Errorf("SMTP 登录失败，请检查发件邮箱和授权码: %w", err)
+		}
 	}
-	for _, x := range to {
-		if err = client.Rcpt(strings.TrimSpace(x)); err != nil {
-			return err
+	if err = client.Mail(fromAddress); err != nil {
+		return fmt.Errorf("SMTP 服务器拒绝发件地址 %s: %w", fromAddress, err)
+	}
+	for _, x := range recipients {
+		if err = client.Rcpt(x); err != nil {
+			return fmt.Errorf("SMTP 服务器拒绝收件地址 %s: %w", x, err)
 		}
 	}
 	w, err := client.Data()
 	if err != nil {
-		return err
+		return fmt.Errorf("SMTP 服务器拒绝邮件内容: %w", err)
 	}
 	if _, err = w.Write(msg); err != nil {
-		return err
+		return fmt.Errorf("写入 SMTP 邮件内容失败: %w", err)
 	}
-	return w.Close()
+	if err = w.Close(); err != nil {
+		return fmt.Errorf("SMTP 邮件发送失败: %w", err)
+	}
+	return nil
+}
+
+func buildAlertEmail(from string, to []string, subject, body string) (string, []string, []byte, error) {
+	fromAddress, err := mail.ParseAddress(strings.TrimSpace(from))
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("发件邮箱地址格式无效: %w", err)
+	}
+	recipients := make([]string, 0, len(to))
+	toHeaders := make([]string, 0, len(to))
+	for _, raw := range to {
+		address, parseErr := mail.ParseAddress(strings.TrimSpace(raw))
+		if parseErr != nil {
+			return "", nil, nil, fmt.Errorf("收件邮箱地址 %s 格式无效: %w", raw, parseErr)
+		}
+		recipients = append(recipients, address.Address)
+		toHeaders = append(toHeaders, address.String())
+	}
+	headers := []string{
+		"From: " + fromAddress.String(),
+		"To: " + strings.Join(toHeaders, ", "),
+		"Date: " + time.Now().Format(time.RFC1123Z),
+		"Subject: " + mime.QEncoding.Encode("UTF-8", subject),
+		"MIME-Version: 1.0",
+		"Content-Type: text/plain; charset=UTF-8",
+		"Content-Transfer-Encoding: 8bit",
+	}
+	message := strings.Join(headers, "\r\n") + "\r\n\r\n" + strings.ReplaceAll(body, "\n", "\r\n")
+	return fromAddress.Address, recipients, []byte(message), nil
 }
 
 func metricNumber(v any) (float64, bool) {

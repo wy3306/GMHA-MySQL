@@ -88,7 +88,7 @@ func (r *taskTreeDisplayRepo) UpdateStep(context.Context, taskdomain.Step) error
 func (r *taskTreeDisplayRepo) AppendEvent(context.Context, taskdomain.Event) error { return nil }
 func (r *taskTreeDisplayRepo) DeleteTask(context.Context, string) error            { return nil }
 
-func TestListTaskPageNestsSanitizedChildrenUnderParent(t *testing.T) {
+func TestListTaskPageReturnsOneBusinessRowWithoutExecutionChildren(t *testing.T) {
 	now := time.Now().UTC()
 	childSpec, _ := json.Marshal(taskdomain.MySQLInstallSpec{Port: 3306, RootPassword: "must-not-leak", PackageName: "mysql-8.4.tar.xz"})
 	repo := &taskTreeDisplayRepo{
@@ -101,15 +101,11 @@ func TestListTaskPageNestsSanitizedChildrenUnderParent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if page.Total != 1 || len(page.Items) != 1 || len(page.Items[0].Children) != 1 {
-		t.Fatalf("expected one parent with one nested child: %+v", page)
+	if page.Total != 1 || len(page.Items) != 1 {
+		t.Fatalf("expected one business task row: %+v", page)
 	}
-	child := page.Items[0].Children[0]
-	if child.ID != "execution-child" || child.ParentTaskID != "business-parent" {
-		t.Fatalf("unexpected nested child: %+v", child)
-	}
-	if strings.Contains(string(child.SpecJSON), "must-not-leak") {
-		t.Fatalf("nested child leaked execution secret: %s", child.SpecJSON)
+	if len(page.Items[0].Children) != 0 {
+		t.Fatalf("execution children must stay in task detail, not list rows: %+v", page.Items[0].Children)
 	}
 }
 

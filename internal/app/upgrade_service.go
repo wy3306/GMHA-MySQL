@@ -46,12 +46,15 @@ type UpgradeJob struct {
 }
 
 type UpgradeOverview struct {
-	ManagerVersion  string                `json:"manager_version"`
-	AgentTotal      int                   `json:"agent_total"`
-	AgentVersions   []UpgradeVersionCount `json:"agent_versions"`
-	ManagerPackages []UpgradePackageView  `json:"manager_packages"`
-	AgentPackages   []UpgradePackageView  `json:"agent_packages"`
-	Storage         UpgradeStorageInfo    `json:"storage"`
+	ManagerVersion       string                `json:"manager_version"`
+	ManagerLatestVersion string                `json:"manager_latest_version"`
+	AgentRunningVersion  string                `json:"agent_running_latest_version"`
+	AgentLatestVersion   string                `json:"agent_latest_version"`
+	AgentTotal           int                   `json:"agent_total"`
+	AgentVersions        []UpgradeVersionCount `json:"agent_versions"`
+	ManagerPackages      []UpgradePackageView  `json:"manager_packages"`
+	AgentPackages        []UpgradePackageView  `json:"agent_packages"`
+	Storage              UpgradeStorageInfo    `json:"storage"`
 }
 
 type UpgradeVersionCount struct {
@@ -62,6 +65,7 @@ type UpgradeVersionCount struct {
 type UpgradePackageView struct {
 	PackageItem
 	Relation         string `json:"relation"`
+	Latest           bool   `json:"latest"`
 	UpgradeableCount int    `json:"upgradeable_count"`
 	CurrentCount     int    `json:"current_count"`
 	DowngradeCount   int    `json:"downgrade_count"`
@@ -133,14 +137,22 @@ func (s *UpgradeService) Overview(ctx context.Context) (UpgradeOverview, error) 
 		return ok && comparison > 0
 	})
 	managerViews := make([]UpgradePackageView, 0, len(managerPackages))
+	managerKnownVersions := []string{managerVersion}
 	for _, item := range managerPackages {
 		item.Version = componentVersion(item.Version)
+		managerKnownVersions = append(managerKnownVersions, item.Version)
 		relation := versionRelation(managerVersion, item.Version)
 		managerViews = append(managerViews, UpgradePackageView{PackageItem: item, Relation: relation})
 	}
 	agentViews := make([]UpgradePackageView, 0, len(agentPackages))
+	agentKnownVersions := make([]string, 0, len(versionCounts)+len(agentPackages))
+	for version := range versionCounts {
+		agentKnownVersions = append(agentKnownVersions, version)
+	}
+	agentRunningVersion := highestComponentVersion(agentKnownVersions...)
 	for _, item := range agentPackages {
 		item.Version = componentVersion(item.Version)
+		agentKnownVersions = append(agentKnownVersions, item.Version)
 		view := UpgradePackageView{PackageItem: item, Relation: "mixed"}
 		for version, count := range versionCounts {
 			comparison, ok := compareComponentVersions(version, item.Version)
@@ -156,6 +168,12 @@ func (s *UpgradeService) Overview(ctx context.Context) (UpgradeOverview, error) 
 		}
 		agentViews = append(agentViews, view)
 	}
+	managerLatestVersion := highestComponentVersion(managerKnownVersions...)
+	agentLatestVersion := highestComponentVersion(agentKnownVersions...)
+	markLatestUpgradePackages(managerViews, managerLatestVersion)
+	markLatestUpgradePackages(agentViews, agentLatestVersion)
+	sortUpgradePackageViews(managerViews)
+	sortUpgradePackageViews(agentViews)
 	settings := s.packages.Settings()
 	executable, _ := os.Executable()
 	storage := UpgradeStorageInfo{
@@ -163,7 +181,17 @@ func (s *UpgradeService) Overview(ctx context.Context) (UpgradeOverview, error) 
 		PackageIndex: filepath.Join(settings.StoragePath, packageIndexName), JobState: s.statePath, ManagerExecutable: executable,
 		ManagerBackupPattern: executable + ".backup-<version>", AgentInstallPattern: "<Agent InstallDir>/agentd", AgentBackupPattern: "<Agent InstallDir>/agentd.backup-<version>",
 	}
-	return UpgradeOverview{ManagerVersion: managerVersion, AgentTotal: len(agents), AgentVersions: versions, ManagerPackages: managerViews, AgentPackages: agentViews, Storage: storage}, nil
+	return UpgradeOverview{
+		ManagerVersion:       managerVersion,
+		ManagerLatestVersion: managerLatestVersion,
+		AgentRunningVersion:  agentRunningVersion,
+		AgentLatestVersion:   agentLatestVersion,
+		AgentTotal:           len(agents),
+		AgentVersions:        versions,
+		ManagerPackages:      managerViews,
+		AgentPackages:        agentViews,
+		Storage:              storage,
+	}, nil
 }
 
 func (s *UpgradeService) List() []UpgradeJob {
@@ -571,6 +599,55 @@ func versionRelation(current, target string) string {
 		return "downgrade"
 	}
 	return "current"
+}
+
+func highestComponentVersion(versions ...string) string {
+	highest := ""
+	for _, version := range versions {
+		version = componentVersion(version)
+		if _, ok := parseComponentVersion(version); !ok {
+			continue
+		}
+		if highest == "" {
+			highest = version
+			continue
+		}
+		if comparison, ok := compareComponentVersions(version, highest); ok && comparison > 0 {
+			highest = version
+		}
+	}
+	return highest
+}
+
+func markLatestUpgradePackages(items []UpgradePackageView, latestVersion string) {
+	for index := range items {
+		comparison, ok := compareComponentVersions(items[index].Version, latestVersion)
+		items[index].Latest = ok && comparison == 0
+	}
+}
+
+func sortUpgradePackageViews(items []UpgradePackageView) {
+	sort.SliceStable(items, func(i, j int) bool {
+		comparison, comparable := compareComponentVersions(items[i].Version, items[j].Version)
+		if comparable && comparison != 0 {
+			return comparison > 0
+		}
+		leftValid := false
+		rightValid := false
+		if _, ok := parseComponentVersion(items[i].Version); ok {
+			leftValid = true
+		}
+		if _, ok := parseComponentVersion(items[j].Version); ok {
+			rightValid = true
+		}
+		if leftValid != rightValid {
+			return leftValid
+		}
+		if items[i].Arch != items[j].Arch {
+			return items[i].Arch < items[j].Arch
+		}
+		return items[i].Name < items[j].Name
+	})
 }
 
 func normalizeComponentArch(arch string) string {

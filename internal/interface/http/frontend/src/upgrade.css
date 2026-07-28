@@ -267,6 +267,15 @@
 .manager-upgrade-head p, .agent-upgrade-head p { margin: 0; color: #718096; font-size: 10px; line-height: 1.55; }
 .manager-upgrade-head .secondary, .agent-upgrade-head .secondary { flex: none; padding: 8px 11px; font-size: 10px; }
 .agent-version-head-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+.upgrade-head-side { display: flex; align-items: center; justify-content: flex-end; gap: 10px; }
+.upgrade-version-summaries { display: flex; align-items: stretch; gap: 6px; }
+.upgrade-latest-summary { min-width: 105px; display: grid; gap: 2px; padding: 7px 10px; border: 1px solid #bfdbfe; border-radius: 8px; background: #eff6ff; }
+.upgrade-latest-summary.secondary { border-color: #dbe3ed; background: #f8fafc; }
+.manager-upgrade-head .upgrade-latest-summary small, .agent-upgrade-head .upgrade-latest-summary small { color: #64748b; font-size: 8px; line-height: 1.2; }
+.manager-upgrade-head .upgrade-latest-summary b, .agent-upgrade-head .upgrade-latest-summary b { color: #1d4ed8; font-size: 13px; line-height: 1.2; }
+.manager-upgrade-head .upgrade-latest-summary.secondary b, .agent-upgrade-head .upgrade-latest-summary.secondary b { color: #334155; }
+.upgrade-package-option > span b { display: flex; align-items: center; gap: 6px; }
+.upgrade-package-option > span b .upgrade-latest-mark { flex: none; padding: 2px 5px; border-radius: 999px; background: #dbeafe; color: #1d4ed8; font-size: 8px; font-style: normal; font-weight: 700; }
 .manager-runtime-version { display: inline-flex; align-items: center; align-self: flex-end; padding: 5px 10px; border: 1px solid #bae6fd; border-radius: 999px; background: #f0f9ff; color: #075985; font-size: 13px; line-height: 1; font-weight: 800; letter-spacing: .02em; }
 .manager-upgrade-body > .upgrade-package-list { grid-template-columns: repeat(3,minmax(0,1fr)); }
 .manager-upgrade-body > .upgrade-steps { margin: 12px 20px; }

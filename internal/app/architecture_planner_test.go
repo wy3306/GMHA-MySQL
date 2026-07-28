@@ -73,6 +73,43 @@ func TestArchitecturePlanRepairsLegacyMHAPrivilegesWhenRootBootstrapProvided(t *
 	}
 }
 
+func TestArchitecturePlanRepairsPrivilegesWithPerNodeRootCredentials(t *testing.T) {
+	steps := architecturePlanSteps(hadomain.ArchitectureAdjustmentRequest{
+		Architecture:  hadomain.ArchitectureMGRRouter,
+		RootPasswords: map[string]string{"db-1": "one", "db-2": "two", "db-3": "three"},
+	})
+	if len(steps) < 2 || steps[1].Code != "repair_management_privileges" {
+		t.Fatalf("per-node root credentials must schedule management privilege repair: %+v", steps)
+	}
+}
+
+func TestArchitectureManagementRepairIncludesMGRPrivileges(t *testing.T) {
+	modern := architectureManagementPrivileges(true)
+	for _, required := range []string{"GROUP_REPLICATION_ADMIN", "PERSIST_RO_VARIABLES_ADMIN", "CONNECTION_ADMIN", "REPLICATION_APPLIER"} {
+		if !strings.Contains(modern, required) {
+			t.Fatalf("management repair privilege set is missing %s", required)
+		}
+	}
+	legacy := architectureManagementPrivileges(false)
+	if !strings.Contains(legacy, "SUPER") || strings.Contains(legacy, "GROUP_REPLICATION_ADMIN") {
+		t.Fatalf("legacy privilege set is not version-safe: %s", legacy)
+	}
+}
+
+func TestMGRDynamicAdminPrivilegesFollowServerVersion(t *testing.T) {
+	if got := strings.Join(mgrDynamicAdminPrivileges("8.0.17"), ","); strings.Contains(got, "REPLICATION_APPLIER") {
+		t.Fatalf("MySQL 8.0.17 must not receive REPLICATION_APPLIER: %s", got)
+	}
+	for _, version := range []string{"8.0.18", "8.4.10", "9.7.1"} {
+		got := strings.Join(mgrDynamicAdminPrivileges(version), ",")
+		for _, required := range []string{"GROUP_REPLICATION_ADMIN", "PERSIST_RO_VARIABLES_ADMIN", "REPLICATION_APPLIER", "BACKUP_ADMIN", "CLONE_ADMIN"} {
+			if !strings.Contains(got, required) {
+				t.Fatalf("MySQL %s MGR grant is missing %s: %s", version, required, got)
+			}
+		}
+	}
+}
+
 func TestValidateArchitectureRequestRejectsDelayedMaster(t *testing.T) {
 	req := hadomain.ArchitectureAdjustmentRequest{
 		Architecture: hadomain.ArchitectureMasterSlave,
@@ -110,6 +147,258 @@ func TestValidateArchitectureRequestRejectsTwoNodeMultiMaster(t *testing.T) {
 	}
 	if err := validateArchitectureRequest(req); err == nil || !strings.Contains(err.Error(), "at least three masters") {
 		t.Fatalf("expected multi-master validation error, got %v", err)
+	}
+}
+
+func TestValidateMGRRouterArchitecture(t *testing.T) {
+	valid := hadomain.ArchitectureAdjustmentRequest{
+		Architecture:                hadomain.ArchitectureMGRRouter,
+		PreferredNewMasterMachineID: "db-1",
+		MGRPort:                     33061,
+		RouterPort:                  6446,
+		Nodes: []hadomain.ArchitectureNodeRequest{
+			{MachineID: "db-1", Port: 3306, Role: "M"},
+			{MachineID: "db-2", Port: 3306, Role: "S"},
+			{MachineID: "db-3", Port: 3306, Role: "S"},
+		},
+	}
+	if err := validateArchitectureRequest(valid); err != nil {
+		t.Fatalf("three-member MGR should be valid: %v", err)
+	}
+	tests := []struct {
+		name   string
+		mutate func(*hadomain.ArchitectureAdjustmentRequest)
+		want   string
+	}{
+		{"even members", func(req *hadomain.ArchitectureAdjustmentRequest) {
+			req.Nodes = append(req.Nodes, hadomain.ArchitectureNodeRequest{MachineID: "db-4", Port: 3306, Role: "S"})
+		}, "odd number"},
+		{"two primaries", func(req *hadomain.ArchitectureAdjustmentRequest) { req.Nodes[1].Role = "M" }, "exactly one"},
+		{"preferred secondary", func(req *hadomain.ArchitectureAdjustmentRequest) { req.PreferredNewMasterMachineID = "db-2" }, "must reference"},
+		{"async source", func(req *hadomain.ArchitectureAdjustmentRequest) { req.Nodes[1].SourceMachineID = "db-1" }, "cannot declare"},
+		{"vip", func(req *hadomain.ArchitectureAdjustmentRequest) { req.MoveVIP = true }, "cannot migrate"},
+		{"router port pair", func(req *hadomain.ArchitectureAdjustmentRequest) { req.RouterPort = 65535 }, "leave room"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			req := valid
+			req.Nodes = append([]hadomain.ArchitectureNodeRequest(nil), valid.Nodes...)
+			test.mutate(&req)
+			if err := validateArchitectureRequest(req); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("expected %q error, got %v", test.want, err)
+			}
+		})
+	}
+}
+
+func TestMGRRouterCommandsAreDeterministicAndUsePrimaryPort(t *testing.T) {
+	groupA := deterministicMGRUUID("production")
+	groupB := deterministicMGRUUID("production")
+	if groupA != groupB || len(groupA) != 36 {
+		t.Fatalf("group UUID must be stable: %q / %q", groupA, groupB)
+	}
+	req := hadomain.ArchitectureAdjustmentRequest{
+		Architecture: hadomain.ArchitectureMGRRouter, RouterPort: 6446,
+		ReplicationUser: "mha", ReplicationPassword: "secret",
+	}
+	command := mysqlRouterDeployCommand(
+		"production", req, hadomain.ArchitectureNodeRequest{MachineID: "db-2", Port: 4406},
+		machinedomain.Machine{IP: "10.0.0.1"}, 3306,
+		"https://manager/router-x86.tar.xz", "https://manager/router-arm.tar.xz", "abc", "def",
+	)
+	for _, required := range []string{"mha@10.0.0.1:3306", "--conf-base-port=6446", "sha256sum -c", "mysqlrouter-gmha_"} {
+		if !strings.Contains(command, required) {
+			t.Fatalf("Router deploy command missing %q: %s", required, command)
+		}
+	}
+	if strings.Contains(command, "mha@10.0.0.1:4406") {
+		t.Fatalf("Router bootstrap must use the primary MySQL port, not the local member port: %s", command)
+	}
+	specialUserReq := req
+	specialUserReq.ReplicationUser = "mha@ops"
+	specialUserCommand := mysqlRouterDeployCommand(
+		"production", specialUserReq, hadomain.ArchitectureNodeRequest{MachineID: "db-2", Port: 4406},
+		machinedomain.Machine{IP: "10.0.0.1"}, 3306,
+		"https://manager/router-x86.tar.xz", "", strings.Repeat("a", 64), "",
+	)
+	if !strings.Contains(specialUserCommand, "mha%40ops@10.0.0.1:3306") {
+		t.Fatalf("Router bootstrap URI must percent-encode the account name: %s", specialUserCommand)
+	}
+	shellCommand := mysqlShellDeployCommand("https://manager/shell-x86.tar.gz", "", "abc", "")
+	for _, required := range []string{"sha256sum -c", "/opt/gmha/mysql-shell/current/bin/mysqlsh --version"} {
+		if !strings.Contains(shellCommand, required) {
+			t.Fatalf("MySQL Shell deploy command missing %q: %s", required, shellCommand)
+		}
+	}
+	configCommand := mgrConfigCommand(
+		hadomain.ArchitectureAdjustmentRequest{MGRGroupName: groupA, MGRPort: 33061},
+		hadomain.ArchitectureNodeRequest{MachineID: "db-1", Port: 3306},
+		machinedomain.Machine{IP: "10.0.0.1"},
+		mysqlapp.Instance{Port: 3306, ServerID: 101, Version: "8.4.10", BaseDir: "/opt/mysql", MyCnfPath: "/data/3306/my.cnf", SystemdUnit: "mysqld-3306"},
+		"10.0.0.1:33061,10.0.0.2:33061,10.0.0.3:33061",
+		"10.0.0.1,10.0.0.2,10.0.0.3",
+	)
+	legacyConfigCommand := mgrConfigCommand(
+		hadomain.ArchitectureAdjustmentRequest{MGRGroupName: groupA, MGRPort: 33061},
+		hadomain.ArchitectureNodeRequest{MachineID: "db-1", Port: 3306},
+		machinedomain.Machine{IP: "10.0.0.1"},
+		mysqlapp.Instance{Port: 3306, ServerID: 102, Version: "8.0.17", BaseDir: "/opt/mysql", MyCnfPath: "/data/3306/my.cnf", SystemdUnit: "mysqld-3306"},
+		"10.0.0.1:33061,10.0.0.2:33061,10.0.0.3:33061",
+		"10.0.0.1,10.0.0.2,10.0.0.3",
+	)
+	bootstrapCommand := mgrBootstrapPrimaryCommand("mysql --defaults-extra-file=/tmp/client.cnf")
+	for _, required := range []string{"group_replication_bootstrap_group=ON", "START GROUP_REPLICATION", "group_replication_bootstrap_group=OFF", "if !"} {
+		if !strings.Contains(bootstrapCommand, required) {
+			t.Fatalf("MGR bootstrap command missing fail-closed cleanup %q: %s", required, bootstrapCommand)
+		}
+	}
+	resetGTIDCommand := mgrResetEmptyGTIDCommand("mysql --defaults-extra-file=/tmp/client.cnf", "", 3306)
+	for _, required := range []string{"RESET BINARY LOGS AND GTIDS", "RESET MASTER", "super_read_only=ON", "MGR_GTID_EMPTY"} {
+		if !strings.Contains(resetGTIDCommand, required) {
+			t.Fatalf("MGR empty-node GTID reset command missing %q: %s", required, resetGTIDCommand)
+		}
+	}
+	for _, required := range []string{"server_id=101", "MGR_SERVER_ID_OK", "group_replication_ip_allowlist=", "log_replica_updates=ON", "group_replication_recovery_use_ssl=ON"} {
+		if !strings.Contains(configCommand, required) {
+			t.Fatalf("modern MGR config missing %q: %s", required, configCommand)
+		}
+	}
+	for _, required := range []string{"group_replication_ip_whitelist=", "log_slave_updates=ON", "transaction_write_set_extraction=XXHASH64"} {
+		if !strings.Contains(legacyConfigCommand, required) {
+			t.Fatalf("MySQL 8.0.17 MGR config missing %q: %s", required, legacyConfigCommand)
+		}
+	}
+	for name, script := range map[string]string{
+		"Router deploy":  command,
+		"Shell deploy":   shellCommand,
+		"MGR config":     configCommand,
+		"legacy config":  legacyConfigCommand,
+		"MGR bootstrap":  bootstrapCommand,
+		"MGR GTID reset": resetGTIDCommand,
+		"Router cleanup": mysqlRouterCleanupCommand("production"),
+	} {
+		if output, syntaxErr := exec.Command("bash", "-n", "-c", script).CombinedOutput(); syntaxErr != nil {
+			t.Fatalf("%s command has invalid shell syntax: %v\n%s\n%s", name, syntaxErr, output, script)
+		}
+	}
+}
+
+func TestPlannedMGRServerIDsRepairDuplicatesDeterministically(t *testing.T) {
+	req := hadomain.ArchitectureAdjustmentRequest{
+		Architecture: hadomain.ArchitectureMGRRouter,
+		MGRGroupName: deterministicMGRUUID("production"),
+		Nodes: []hadomain.ArchitectureNodeRequest{
+			{MachineID: "db-1", Port: 3306, Role: "M"},
+			{MachineID: "db-2", Port: 3306, Role: "S"},
+			{MachineID: "db-3", Port: 3306, Role: "S"},
+		},
+	}
+	instances := map[string]mysqlapp.Instance{
+		"db-1": {MachineID: "db-1", Port: 3306, ServerID: 1},
+		"db-2": {MachineID: "db-2", Port: 3306, ServerID: 1},
+		"db-3": {MachineID: "db-3", Port: 3306, ServerID: 3},
+	}
+	first := plannedMGRServerIDs(req, instances)
+	second := plannedMGRServerIDs(req, instances)
+	if first["db-1"] == 1 || first["db-2"] == 1 {
+		t.Fatalf("every member of a duplicate server_id set should be repaired: %#v", first)
+	}
+	if first["db-3"] != 3 {
+		t.Fatalf("an already unique server_id should be preserved: %#v", first)
+	}
+	seen := map[int]bool{}
+	for _, node := range req.Nodes {
+		serverID := first[node.MachineID]
+		if serverID <= 0 || seen[serverID] {
+			t.Fatalf("planned server_id must be positive and unique: %#v", first)
+		}
+		if second[node.MachineID] != serverID {
+			t.Fatalf("planned server_id must be deterministic: first=%#v second=%#v", first, second)
+		}
+		seen[serverID] = true
+	}
+}
+
+func TestMGRVersionFloorSupportsVersionAwareRollingUpgrade(t *testing.T) {
+	for _, version := range []string{"8.0.17", "8.0.44", "8.4.10", "9.7.1"} {
+		if !mgrVersionSupported(version) {
+			t.Errorf("mgrVersionSupported(%q)=false", version)
+		}
+	}
+	for _, version := range []string{"", "5.7.44", "8.0.11", "8.0.16"} {
+		if mgrVersionSupported(version) {
+			t.Errorf("mgrVersionSupported(%q)=true", version)
+		}
+	}
+}
+
+func TestMGRToolArtifactsRequireVerifiedSHA256(t *testing.T) {
+	valid := strings.Repeat("ab", 32)
+	if !validSHA256Hex(valid) {
+		t.Fatal("valid SHA256 was rejected")
+	}
+	for _, value := range []string{"", "abc", strings.Repeat("z", 64), strings.Repeat("a", 63)} {
+		if validSHA256Hex(value) {
+			t.Fatalf("invalid SHA256 was accepted: %q", value)
+		}
+	}
+}
+
+func TestMGRRouterPlanIncludesManagedShellAndRouter(t *testing.T) {
+	steps := architecturePlanSteps(hadomain.ArchitectureAdjustmentRequest{Architecture: hadomain.ArchitectureMGRRouter})
+	codes := make(map[string]int, len(steps))
+	for index, step := range steps {
+		codes[step.Code] = index
+		if step.Order != index+1 {
+			t.Fatalf("step %s order=%d, want %d", step.Code, step.Order, index+1)
+		}
+	}
+	if codes["deploy_mysql_shell"] <= codes["verify_group"] || codes["adopt_innodb_cluster"] <= codes["deploy_mysql_shell"] || codes["deploy_mysql_router"] <= codes["adopt_innodb_cluster"] {
+		t.Fatalf("invalid MGR dependency order: %+v", steps)
+	}
+	if codes["align_group_data"] <= codes["drain_business_sessions"] || codes["align_group_data"] >= codes["configure_group_replication"] {
+		t.Fatalf("MGR data/GTID alignment must run after fencing and before configuration: %+v", steps)
+	}
+}
+
+func TestExistingMGRPlanSwitchesPrimaryAndReconcilesRouter(t *testing.T) {
+	steps := architecturePlanSteps(hadomain.ArchitectureAdjustmentRequest{
+		Architecture:        hadomain.ArchitectureMGRRouter,
+		CurrentArchitecture: hadomain.ArchitectureMGRRouter,
+	})
+	codes := make(map[string]bool, len(steps))
+	for _, step := range steps {
+		codes[step.Code] = true
+	}
+	for _, required := range []string{"bootstrap_group", "verify_group", "deploy_mysql_shell", "adopt_innodb_cluster", "deploy_mysql_router", "verify_router"} {
+		if !codes[required] {
+			t.Fatalf("existing MGR primary switch is missing %s: %+v", required, steps)
+		}
+	}
+	for _, forbidden := range []string{"configure_group_replication"} {
+		if codes[forbidden] {
+			t.Fatalf("existing MGR primary switch must not run %s: %+v", forbidden, steps)
+		}
+	}
+}
+
+func TestMGRRouterCleanupIsScopedToCluster(t *testing.T) {
+	command := mysqlRouterCleanupCommand("production")
+	safeName := safeMGRClusterName("production")
+	for _, required := range []string{
+		"mysqlrouter-" + safeName,
+		"/etc/mysqlrouter/" + safeName,
+		`rm -f -- "/etc/systemd/system/${unit}.service"`,
+		`rm -rf -- "$config_dir"`,
+	} {
+		if !strings.Contains(command, required) {
+			t.Fatalf("Router cleanup command missing %q: %s", required, command)
+		}
+	}
+	for _, forbidden := range []string{"rm -rf /etc/mysqlrouter", "rm -rf /opt/gmha/mysql-router", "rm -rf /opt/gmha/mysql-shell"} {
+		if strings.Contains(command, forbidden) {
+			t.Fatalf("Router cleanup command is too broad (%q): %s", forbidden, command)
+		}
 	}
 }
 

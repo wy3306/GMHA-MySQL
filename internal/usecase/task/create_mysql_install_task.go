@@ -14,6 +14,7 @@ import (
 	taskdomain "gmha/internal/domain/task"
 	"gmha/internal/infrastructure/render"
 	mysqlapp "gmha/internal/mysql"
+	"gmha/internal/platform/linuxcompat"
 )
 
 // ErrMachineInfoNotFound 表示机器信息未找到，需要先采集机器信息。
@@ -171,6 +172,9 @@ func (u *CreateMySQLInstallTaskUsecase) Execute(ctx context.Context, req CreateM
 	}
 	if !ok {
 		return CreateMySQLInstallTaskResult{}, ErrMachineInfoNotFound
+	}
+	if compatibility := linuxcompat.Evaluate(info.OS, info.Arch, info.GlibcVersion); !compatibility.CanInstall {
+		return CreateMySQLInstallTaskResult{}, compatibility.Error()
 	}
 
 	profile, err := mysqlapp.LoadProfile("configs", req.Profile)
@@ -473,7 +477,7 @@ func mysqlInstallStepMessage(name string) string {
 		"generate_mycnf":             "生成 my.cnf",
 		"generate_systemd":           "生成 systemd 服务",
 		"initialize_mysql":           "初始化 MySQL 数据目录",
-		"start_mysql":                "启动 MySQL",
+		"start_mysql":                "启动 MySQL 并设置开机自启",
 		"wait_mysql_ready":           "等待 MySQL 就绪",
 		"set_root_password":          "设置 root 密码",
 		"verify_mysql":               "验证 MySQL 服务",

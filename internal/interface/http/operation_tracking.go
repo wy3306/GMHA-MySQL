@@ -46,7 +46,7 @@ func (w *trackingResponseWriter) Write(data []byte) (int, error) {
 
 func trackPlatformOperations(next http.Handler, tasks *app.TaskService) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if tasks == nil || !isMutatingMethod(r.Method) || isSystemMutation(r.URL.Path) {
+		if tasks == nil || !shouldTrackPlatformOperation(r.Method, r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -59,9 +59,6 @@ func trackPlatformOperations(next http.Handler, tasks *app.TaskService) http.Han
 			status = http.StatusOK
 		}
 		related := relatedTaskIDs(recorder.body.Bytes())
-		if status < http.StatusBadRequest && strings.HasPrefix(r.URL.Path, "/api/v1/tasks/") && len(related) <= 1 && !isBatchTaskEndpoint(r.URL.Path) {
-			return
-		}
 		operation, displayName, target := platformOperationMetadata(r.Method, r.URL.Path)
 		spec := taskdomain.PlatformOperationSpec{
 			Operation: operation, DisplayName: displayName, Method: r.Method, Path: r.URL.Path,
@@ -101,8 +98,78 @@ func isMutatingMethod(method string) bool {
 	}
 }
 
-func isSystemMutation(path string) bool {
-	return path == "/api/v1/agents/register" || path == "/api/v1/agents/heartbeat" || path == "/api/v1/tasks/cluster-automation/report" || path == "/api/v1/tasks" || path == "/api/v1/machines/batch-delete"
+// shouldTrackPlatformOperation is the task-center boundary. The default is to
+// retain user-initiated execution, while resource CRUD, configuration writes,
+// callbacks and platform collection stay outside the business task timeline.
+func shouldTrackPlatformOperation(method, path string) bool {
+	if !isMutatingMethod(method) {
+		return false
+	}
+	path = strings.TrimSuffix(path, "/")
+	if path == "" {
+		path = "/"
+	}
+	if isInternalPlatformMutation(path) || isResourceMaintenanceMutation(path) {
+		return false
+	}
+	return strings.HasPrefix(path, "/api/v1/")
+}
+
+func isInternalPlatformMutation(path string) bool {
+	if path == "/api/v1/agents/register" ||
+		path == "/api/v1/agents/heartbeat" ||
+		path == "/api/v1/agents/detect-version" ||
+		path == "/api/v1/tasks" ||
+		path == "/api/v1/tasks/collect-machine-info" ||
+		path == "/api/v1/tasks/cluster-automation/report" ||
+		path == "/api/v1/tasks/database-inspection/report" {
+		return true
+	}
+	return strings.HasSuffix(path, "/report") ||
+		strings.HasSuffix(path, "/results") ||
+		strings.HasSuffix(path, "/data") ||
+		strings.HasSuffix(path, "/vip/scan") ||
+		strings.Contains(path, "/artifacts/")
+}
+
+func isResourceMaintenanceMutation(path string) bool {
+	switch {
+	case strings.HasPrefix(path, "/api/v1/machines"):
+		// Batch deletion creates its own durable business parent before any
+		// remote cleanup starts; the generic "维护机器" wrapper is noise.
+		return true
+	case strings.HasPrefix(path, "/api/v1/ssh-credentials"):
+		return true
+	case path == "/api/v1/clusters" || strings.HasSuffix(path, "/members") || strings.HasSuffix(path, "/machines"):
+		return true
+	case path == "/api/v1/manager/config" || path == "/api/v1/manager/database/test":
+		return true
+	case path == "/api/v1/manager/ha/config" ||
+		path == "/api/v1/manager/ha/interfaces" ||
+		path == "/api/v1/manager/ha/bootstrap/config" ||
+		path == "/api/v1/manager/ha/bootstrap/binary":
+		return true
+	case path == "/api/v1/mysql/instances" || path == "/api/v1/mysql/account-presets":
+		return true
+	case path == "/api/v1/sql-diagnostics/config":
+		return true
+	case strings.HasPrefix(path, "/api/v1/backup/targets") || strings.HasPrefix(path, "/api/v1/backup/policies"):
+		return true
+	case strings.HasPrefix(path, "/api/v1/performance/flamegraphs/schedules"):
+		return true
+	case path == "/api/v1/package-settings":
+		return true
+	case strings.HasPrefix(path, "/api/v1/dynamic-collect/") || strings.HasPrefix(path, "/api/v1/mysql-dynamic-collect/"):
+		return true
+	case strings.HasPrefix(path, "/api/v1/alerts/"):
+		return true
+	case path == "/api/v1/ai" || strings.HasPrefix(path, "/api/v1/ai/"):
+		// AI actions create their own workflow/audit tasks. Chat/session writes
+		// are not operational tasks.
+		return true
+	default:
+		return false
+	}
 }
 
 func platformOperationMetadata(method, path string) (string, string, string) {
@@ -159,7 +226,7 @@ func relatedTaskIDs(data []byte) []string {
 				walk(child, key)
 			}
 		case string:
-			if (key == "task_id" || key == "run_id" || key == "id") && isTrackableTaskID(typed) {
+			if isTaskReferenceKey(key) && isTrackableTaskID(typed) {
 				set[typed] = struct{}{}
 			}
 		}
@@ -171,6 +238,17 @@ func relatedTaskIDs(data []byte) []string {
 	}
 	sort.Strings(result)
 	return result
+}
+
+func isTaskReferenceKey(key string) bool {
+	return key == "id" ||
+		key == "run_id" ||
+		key == "task_id" ||
+		key == "task_ids" ||
+		key == "related_task_ids" ||
+		strings.HasSuffix(key, "_task_id") ||
+		strings.HasSuffix(key, "_task_ids") ||
+		strings.HasSuffix(key, "_tasks")
 }
 
 func isTrackableTaskID(value string) bool {

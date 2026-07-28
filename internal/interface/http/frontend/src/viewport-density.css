@@ -1,0 +1,459 @@
+/*
+ * Desktop viewport density
+ *
+ * Large desktop displays keep the original, relaxed spacing. Laptop-sized
+ * viewports use a more compact shell and content rhythm without shrinking
+ * text below a readable size or changing the mobile navigation behavior.
+ */
+
+:root {
+  --gmha-header-height: 56px;
+  --gmha-sidebar-width: 208px;
+  --gmha-page-gutter: 24px;
+}
+
+/* Every navigation level shares one text baseline, including the highlighted
+ * cluster group that previously added an extra horizontal inset. */
+.sidebar .cluster-nav-group {
+  margin-right: 0;
+  margin-left: 0;
+}
+
+/* Multi-cluster automation is a two-pane workbench. Keep both panes the same
+ * height so a short target list does not leave a large grey void beside the
+ * operation builder. */
+.automation-page {
+  gap: 12px;
+}
+
+.automation-hero {
+  min-height: 96px;
+  padding: 18px 22px;
+}
+
+.automation-workspace {
+  grid-template-columns: minmax(280px, .7fr) minmax(0, 1.55fr);
+  align-items: stretch;
+  gap: 12px;
+}
+
+.automation-workspace > .panel {
+  height: 100%;
+}
+
+.automation-targets,
+.automation-config {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.automation-cluster-list {
+  grid-template-columns: 1fr;
+  align-content: start;
+  flex: 1;
+  max-height: none;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.automation-config .automation-form-grid {
+  align-content: start;
+  flex: 1;
+}
+
+.automation-submit {
+  margin-top: auto;
+}
+
+@media (max-width: 1000px) {
+  .automation-workspace {
+    grid-template-columns: 1fr;
+  }
+
+  .automation-workspace > .panel {
+    height: auto;
+  }
+
+  .automation-cluster-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    max-height: 280px;
+  }
+}
+
+@media (max-width: 650px) {
+  .automation-cluster-list {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (min-width: 901px) and (max-width: 1720px) {
+  :root {
+    --gmha-header-height: 50px;
+    --gmha-sidebar-width: 176px;
+    --gmha-page-gutter: clamp(14px, 1.25vw, 20px);
+  }
+
+  .shell {
+    grid-template:
+      var(--gmha-header-height) minmax(0, 1fr) /
+      var(--gmha-sidebar-width) minmax(0, 1fr);
+  }
+
+  .global-header {
+    height: var(--gmha-header-height);
+    padding: 0 16px;
+  }
+
+  .global-brand {
+    width: var(--gmha-sidebar-width);
+    height: var(--gmha-header-height);
+    flex-basis: var(--gmha-sidebar-width);
+    gap: 9px;
+    margin-left: -16px;
+    padding-left: 16px;
+  }
+
+  .global-brand .brand-mark {
+    width: 28px;
+    height: 28px;
+  }
+
+  .global-brand strong {
+    font-size: 14px;
+  }
+
+  .environment-badge {
+    padding: 3px 7px;
+    font-size: 10px;
+  }
+
+  .global-actions {
+    gap: 16px;
+    font-size: 12px;
+  }
+
+  .sidebar {
+    top: var(--gmha-header-height);
+    width: var(--gmha-sidebar-width);
+    height: calc(100vh - var(--gmha-header-height));
+    padding: 8px 0 14px;
+  }
+
+  .nav-parent {
+    min-height: 42px;
+    gap: 10px;
+    padding: 9px 16px;
+    font-size: 14px;
+  }
+
+  .nav-item {
+    min-height: 36px;
+    padding: 7px 14px 7px 44px;
+    font-size: 13px;
+    line-height: 20px;
+  }
+
+  .sidebar-footer {
+    margin-right: 14px;
+    margin-left: 14px;
+    padding-top: 10px;
+  }
+
+  .content,
+  .shell > .mysql-dashboard,
+  .shell > .cluster-dashboard {
+    min-height: calc(100vh - var(--gmha-header-height));
+    padding: 14px var(--gmha-page-gutter) 36px;
+  }
+
+  .topbar {
+    min-height: 40px;
+    margin-bottom: 10px;
+  }
+
+  .topbar h1 {
+    font-size: 21px;
+  }
+
+  .primary,
+  .secondary {
+    min-height: 32px;
+    padding: 6px 12px;
+    font-size: 12px;
+  }
+
+  .icon-button {
+    width: 30px;
+    height: 30px;
+    font-size: 16px;
+  }
+
+  .hero,
+  .manager-hero,
+  .cluster-hero {
+    padding: 18px 20px;
+  }
+
+  .hero h2,
+  .manager-hero h2,
+  .cluster-hero h2 {
+    font-size: 20px;
+  }
+
+  .hero-grid {
+    gap: 26px;
+    padding-right: 12px;
+  }
+
+  .hero-grid div {
+    padding-left: 17px;
+  }
+
+  .hero-grid b {
+    font-size: 22px;
+  }
+
+  .metric-grid,
+  .cluster-dashboard .cluster-summary {
+    gap: 10px;
+    margin: 10px 0;
+  }
+
+  .metric-card,
+  .cluster-dashboard .cluster-summary article {
+    min-height: 78px;
+    padding: 12px 14px;
+  }
+
+  .metric-card p {
+    margin-bottom: 6px;
+  }
+
+  .metric-card strong,
+  .cluster-dashboard .cluster-summary b {
+    margin-top: 5px;
+    font-size: 22px;
+  }
+
+  .panel + .panel {
+    margin-top: 10px;
+  }
+
+  .panel-head {
+    min-height: 46px;
+    padding: 10px 14px;
+  }
+
+  .panel-head h3 {
+    font-size: 15px;
+  }
+
+  th {
+    height: 38px;
+    padding: 8px 14px;
+    font-size: 11px;
+  }
+
+  td {
+    height: 43px;
+    padding: 8px 14px;
+    font-size: 12px;
+  }
+
+  .pager,
+  .cluster-pager {
+    min-height: 42px;
+    padding: 7px 14px;
+  }
+
+  .overview-kv-grid {
+    column-gap: 24px;
+    padding: 2px 14px 10px;
+  }
+
+  .overview-kv-grid > div {
+    padding: 9px 0;
+  }
+
+  .cluster-machine-mysql > .panel-head {
+    min-height: 64px;
+    gap: 12px 20px;
+    padding: 12px 16px;
+  }
+
+  .cluster-machine-mysql .cluster-machine-table th,
+  .cluster-machine-mysql .cluster-machine-table td {
+    padding: 9px 10px;
+  }
+
+  .mysql-tabs {
+    gap: 22px;
+    margin-bottom: 14px;
+    padding: 0 16px;
+  }
+
+  .mysql-tabs button {
+    min-height: 42px;
+    padding: 11px 1px 9px;
+  }
+
+  .mysql-summary,
+  .mysql-shortcuts,
+  .mysql-workspace,
+  .mysql-task-panel,
+  .mysql-preset-panel {
+    margin-right: 14px;
+    margin-left: 14px;
+  }
+
+  .mysql-summary {
+    gap: 10px;
+    margin-bottom: 10px;
+  }
+
+  .mysql-summary article {
+    min-height: 78px;
+    padding: 12px 14px;
+  }
+
+  .mysql-summary article b {
+    margin-top: 5px;
+    font-size: 22px;
+  }
+
+  .mysql-shortcuts {
+    gap: 10px;
+  }
+
+  .mysql-shortcuts button {
+    min-height: 88px;
+    padding: 14px;
+  }
+
+  .package-recommendation-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .package-catalog-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .topology-architecture-layout {
+    grid-template-columns: minmax(0, 1fr) 320px;
+    gap: 14px;
+  }
+
+  .topology-inspector {
+    gap: 10px;
+  }
+
+  .topology-inspector section > header,
+  .topology-inspector-form,
+  .topology-vip-editor-body {
+    padding-right: 14px;
+    padding-left: 14px;
+  }
+
+  .topology-inspector-form {
+    gap: 10px;
+  }
+
+  .topology-inspector-form input,
+  .topology-inspector-form select,
+  .topology-vip-editor-body input,
+  .topology-vip-editor-body select {
+    height: 36px;
+    font-size: 13px;
+  }
+
+  .shell.cluster-focus-mode {
+    --cluster-primary-nav-width: var(--gmha-sidebar-width);
+  }
+
+  .shell.cluster-focus-mode > .cluster-sidebar-edge-trigger,
+  .shell.cluster-focus-mode > .cluster-dashboard,
+  .shell.cluster-focus-mode > .cluster-dashboard .cluster-context-nav {
+    top: var(--gmha-header-height);
+  }
+
+  .shell.cluster-focus-mode > .cluster-dashboard,
+  .shell.cluster-focus-mode > .cluster-dashboard .cluster-context-nav {
+    height: calc(100vh - var(--gmha-header-height));
+  }
+}
+
+/* Short laptop viewports need additional vertical breathing room. */
+@media (min-width: 901px) and (max-width: 1720px) and (max-height: 820px) {
+  :root {
+    --gmha-header-height: 48px;
+  }
+
+  .global-brand .brand-mark {
+    width: 26px;
+    height: 26px;
+  }
+
+  .sidebar {
+    padding-top: 5px;
+  }
+
+  .nav-parent {
+    min-height: 38px;
+    padding-top: 7px;
+    padding-bottom: 7px;
+  }
+
+  .nav-item {
+    min-height: 32px;
+    padding-top: 5px;
+    padding-bottom: 5px;
+  }
+
+  .content,
+  .shell > .mysql-dashboard,
+  .shell > .cluster-dashboard {
+    padding-top: 10px;
+    padding-bottom: 24px;
+  }
+
+  .topbar {
+    min-height: 36px;
+    margin-bottom: 8px;
+  }
+
+  .panel-head {
+    min-height: 42px;
+    padding-top: 8px;
+    padding-bottom: 8px;
+  }
+
+  th {
+    height: 35px;
+    padding-top: 6px;
+    padding-bottom: 6px;
+  }
+
+  td {
+    height: 39px;
+    padding-top: 6px;
+    padding-bottom: 6px;
+  }
+}
+
+/* Keep card groups balanced on smaller notebooks before mobile mode starts. */
+@media (min-width: 901px) and (max-width: 1280px) {
+  :root {
+    --gmha-sidebar-width: 164px;
+    --gmha-page-gutter: 12px;
+  }
+
+  .metric-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .package-catalog-grid,
+  .package-recommendation-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

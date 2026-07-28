@@ -85,12 +85,18 @@ func (h *ExecHandler) Handle(ctx context.Context, task taskdomain.DispatchTask, 
 		step := task.Steps[i]
 		startedAt := time.Now().UTC()
 		progress := i * 100 / len(commands)
-		_ = reporter.Report(taskdomain.ReportEnvelope{TaskID: task.ID, Status: taskdomain.StatusRunning, Progress: progress, CurrentStep: step.StepName, Step: &taskdomain.StepReport{StepID: step.ID, StepNo: step.StepNo, StepName: step.StepName, Status: taskdomain.StepRunning, Message: "执行命令", StartedAt: &startedAt}})
+		_ = reporter.Report(taskdomain.ReportEnvelope{
+			TaskID: task.ID, Status: taskdomain.StatusRunning, Progress: progress, CurrentStep: step.StepName,
+			Step:  &taskdomain.StepReport{StepID: step.ID, StepNo: step.StepNo, StepName: step.StepName, Status: taskdomain.StepRunning, Message: "命令已启动，等待输出", StartedAt: &startedAt},
+			Event: &taskdomain.Event{TaskID: task.ID, StepID: step.ID, EventType: taskdomain.EventInfo, Content: "开始执行：" + step.StepName},
+		})
 		command := replaceExecCommandPlaceholders(item.Command, h.managerHTTPAddr, credentialPath)
+		liveOutput := agentcore.NewLiveOutputReporter(reporter, task.ID, step, progress, startedAt)
 		lastOnlinePercent := -1
 		lastArchiveRows := int64(-1)
 		var onlineProgressMu sync.Mutex
 		onOutput := func(line string) {
+			liveOutput.Add(line)
 			if strings.Contains(item.Command, "pt-archiver") && !strings.Contains(item.Command, "--dry-run") {
 				rows, ok := ptArchiverProgress(line)
 				if !ok {
@@ -132,24 +138,33 @@ func (h *ExecHandler) Handle(ctx context.Context, task taskdomain.DispatchTask, 
 			})
 		}
 		output, runErr := runner.RunShellWithOutput(ctx, task.ID, step.StepName, command, onOutput)
+		liveOutput.Flush()
 		finishedAt := time.Now().UTC()
 		content := joinOutput(output, "")
 		if runErr != nil {
 			if rollback := strings.TrimSpace(spec.RollbackCommand); rollback != "" {
 				rollback = replaceExecCommandPlaceholders(rollback, h.managerHTTPAddr, credentialPath)
-				rollbackOutput, rollbackErr := runner.RunShell(ctx, task.ID, "自动回滚", rollback)
+				liveOutput.Add("开始自动回滚")
+				rollbackOutput, rollbackErr := runner.RunShellWithOutput(ctx, task.ID, "自动回滚", rollback, liveOutput.Add)
+				liveOutput.Flush()
 				content += "\n\n自动回滚:\n" + joinOutput(rollbackOutput, "")
 				if rollbackErr != nil {
 					content += "\n自动回滚失败: " + rollbackErr.Error()
+					content += "\nGMHA_ROLLBACK_RESULT=failed"
+				} else {
+					content += "\nGMHA_ROLLBACK_RESULT=success"
 				}
 			}
-			return reporter.Report(taskdomain.ReportEnvelope{TaskID: task.ID, Status: taskdomain.StatusFailed, Progress: 100, CurrentStep: step.StepName, Step: &taskdomain.StepReport{StepID: step.ID, StepNo: step.StepNo, StepName: step.StepName, Status: taskdomain.StepFailed, Message: content, StartedAt: &startedAt, FinishedAt: &finishedAt}, Event: &taskdomain.Event{TaskID: task.ID, StepID: step.ID, EventType: taskdomain.EventError, Content: content}, Error: fmt.Sprintf("exec failed: %v", runErr)})
+			errorSummary := fmt.Sprintf("执行失败：%v", runErr)
+			errorDetail := truncateTaskText(content, 12*1024, true)
+			return reporter.Report(taskdomain.ReportEnvelope{TaskID: task.ID, Status: taskdomain.StatusFailed, Progress: 100, CurrentStep: step.StepName, Step: &taskdomain.StepReport{StepID: step.ID, StepNo: step.StepNo, StepName: step.StepName, Status: taskdomain.StepFailed, Message: truncateTaskText(errorSummary, 600, false), StartedAt: &startedAt, FinishedAt: &finishedAt}, Event: &taskdomain.Event{TaskID: task.ID, StepID: step.ID, EventType: taskdomain.EventError, Content: errorDetail}, Error: fmt.Sprintf("exec failed: %v", runErr)})
 		}
 		status := taskdomain.StatusRunning
 		if i == len(commands)-1 {
 			status = taskdomain.StatusSuccess
 		}
-		if err := reporter.Report(taskdomain.ReportEnvelope{TaskID: task.ID, Status: status, Progress: (i + 1) * 100 / len(commands), CurrentStep: step.StepName, Step: &taskdomain.StepReport{StepID: step.ID, StepNo: step.StepNo, StepName: step.StepName, Status: taskdomain.StepSuccess, Message: content, StartedAt: &startedAt, FinishedAt: &finishedAt}, Event: &taskdomain.Event{TaskID: task.ID, StepID: step.ID, EventType: taskdomain.EventLog, Content: content}}); err != nil {
+		successMessage := liveOutput.SuccessMessage("执行成功")
+		if err := reporter.Report(taskdomain.ReportEnvelope{TaskID: task.ID, Status: status, Progress: (i + 1) * 100 / len(commands), CurrentStep: step.StepName, Step: &taskdomain.StepReport{StepID: step.ID, StepNo: step.StepNo, StepName: step.StepName, Status: taskdomain.StepSuccess, Message: successMessage, StartedAt: &startedAt, FinishedAt: &finishedAt}, Event: &taskdomain.Event{TaskID: task.ID, StepID: step.ID, EventType: taskdomain.EventInfo, Content: successMessage}}); err != nil {
 			return err
 		}
 	}

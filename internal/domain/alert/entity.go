@@ -177,6 +177,21 @@ type EventSummaryReader interface {
 	SummarizeEvents(context.Context, time.Time) (EventSummary, error)
 }
 
+// MySQLRestartClassification describes whether a detected MySQL restart
+// overlaps an operator-initiated task recorded by GMHA.
+type MySQLRestartClassification struct {
+	Manual    bool
+	TaskID    string
+	Operation string
+}
+
+// MySQLRestartClassifier is optional. Persistent repositories can correlate a
+// restart detected from MySQL uptime with the task audit trail without making
+// the alert service depend on the task domain.
+type MySQLRestartClassifier interface {
+	ClassifyMySQLRestart(context.Context, string, int, time.Time, time.Time) (MySQLRestartClassification, error)
+}
+
 // ActiveEventReader supports lifecycle reconciliation when collector metadata
 // changes. Fingerprints are an optimization, while rule + machine + stable
 // resource labels are the durable identity of an alert target.

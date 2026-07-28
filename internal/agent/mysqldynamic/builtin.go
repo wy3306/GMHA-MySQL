@@ -77,6 +77,8 @@ func (c *BuiltinCollector) collect(ctx context.Context, env *CollectEnv, spec dy
 		return collectStatusSum(ctx, env, "Com_commit", "Com_rollback")
 	case "mysql_replication_basic_status", "mysql_replication_thread_status":
 		return collectReplicationBasic(ctx, env)
+	case "mysql_group_replication_status":
+		return collectGroupReplicationStatus(ctx, env)
 	case "mysql_replica_io_thread":
 		return collectReplicaField(ctx, env, spec, "Replica_IO_Running", "Slave_IO_Running")
 	case "mysql_replica_sql_thread":
@@ -670,6 +672,61 @@ func collectReplicationBasic(ctx context.Context, env *CollectEnv) (map[string]a
 	}, nil
 }
 
+func collectGroupReplicationStatus(ctx context.Context, env *CollectEnv) (map[string]any, error) {
+	if noDBCredential(env) {
+		return skippedValue("mysql credential not configured"), nil
+	}
+	members, err := env.QueryRows(ctx, `
+		SELECT MEMBER_ID AS member_id, MEMBER_HOST AS member_host,
+		       MEMBER_PORT AS member_port, MEMBER_STATE AS member_state,
+		       MEMBER_ROLE AS member_role, MEMBER_VERSION AS member_version
+		FROM performance_schema.replication_group_members
+		ORDER BY MEMBER_ROLE, MEMBER_HOST, MEMBER_PORT`)
+	if err != nil {
+		return skippedValue("group replication metadata unavailable: " + err.Error()), nil
+	}
+	if len(members) == 0 {
+		return map[string]any{"active": false, "members": []map[string]any{}}, nil
+	}
+	selfRows, err := env.QueryRows(ctx, `
+		SELECT m.MEMBER_ID AS member_id, m.MEMBER_HOST AS member_host,
+		       m.MEMBER_PORT AS member_port, m.MEMBER_STATE AS member_state,
+		       m.MEMBER_ROLE AS member_role, m.MEMBER_VERSION AS member_version,
+		       COALESCE(s.COUNT_TRANSACTIONS_IN_QUEUE,0) AS transactions_in_queue,
+		       COALESCE(s.COUNT_TRANSACTIONS_REMOTE_IN_APPLIER_QUEUE,0) AS remote_applier_queue
+		FROM performance_schema.replication_group_members m
+		LEFT JOIN performance_schema.replication_group_member_stats s
+		  ON s.MEMBER_ID=m.MEMBER_ID
+		WHERE m.MEMBER_ID=@@server_uuid`)
+	if err != nil {
+		return nil, err
+	}
+	groupName, _ := env.QueryGlobalVariable(ctx, "group_replication_group_name")
+	primaryCount, onlineCount := 0, 0
+	for _, member := range members {
+		if strings.EqualFold(toString(firstMapValue(member, "member_role", "MEMBER_ROLE")), "PRIMARY") {
+			primaryCount++
+		}
+		if strings.EqualFold(toString(firstMapValue(member, "member_state", "MEMBER_STATE")), "ONLINE") {
+			onlineCount++
+		}
+	}
+	var self map[string]any
+	if len(selfRows) > 0 {
+		self = selfRows[0]
+	}
+	return map[string]any{
+		"active":        true,
+		"group_name":    groupName,
+		"member_count":  len(members),
+		"online_count":  onlineCount,
+		"primary_count": primaryCount,
+		"quorum":        onlineCount > len(members)/2,
+		"self":          self,
+		"members":       members,
+	}, nil
+}
+
 func collectReplicaField(ctx context.Context, env *CollectEnv, spec dyndomain.CollectTaskSpec, replicaField, slaveField string) (any, error) {
 	if noDBCredential(env) {
 		return skippedValue("mysql credential not configured"), nil
@@ -690,6 +747,13 @@ func collectReplicaField(ctx context.Context, env *CollectEnv, spec dyndomain.Co
 func collectRole(ctx context.Context, env *CollectEnv) (string, error) {
 	if noDBCredential(env) {
 		return "unknown", nil
+	}
+	if rows, groupErr := env.QueryRows(ctx, "SELECT MEMBER_ROLE, MEMBER_STATE FROM performance_schema.replication_group_members WHERE MEMBER_ID=@@server_uuid"); groupErr == nil && len(rows) > 0 {
+		role := strings.ToLower(toString(firstMapValue(rows[0], "MEMBER_ROLE", "member_role")))
+		state := strings.ToLower(toString(firstMapValue(rows[0], "MEMBER_STATE", "member_state")))
+		if role != "" {
+			return "mgr_" + role + "_" + state, nil
+		}
 	}
 	status, err := env.QueryReplicaStatus(ctx)
 	if err == nil && len(status) > 0 {

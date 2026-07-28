@@ -106,6 +106,12 @@ func TestCapabilitiesFollowPatchLevelBoundaries(t *testing.T) {
 	if !SupportsPerconaToolkit("9.7.1") {
 		t.Fatal("MySQL 9.7 should use the current Percona Toolkit compatibility path")
 	}
+	if SupportsDynamicPrivilegeForVersion("8.0.17", "REPLICATION_APPLIER") {
+		t.Fatal("REPLICATION_APPLIER was introduced in MySQL 8.0.18")
+	}
+	if !SupportsDynamicPrivilegeForVersion("8.0.18", "REPLICATION_APPLIER") {
+		t.Fatal("MySQL 8.0.18 should support REPLICATION_APPLIER")
+	}
 }
 
 func TestApplyRuntimeParametersForMySQL57UsesLegacyConfigSemantics(t *testing.T) {

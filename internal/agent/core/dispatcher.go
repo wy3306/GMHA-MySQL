@@ -65,7 +65,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, envelope taskdomain.DispatchE
 	}
 
 	startedAt := time.Now().UTC()
-	firstStep := firstStep(envelope.Task.Steps)
+	firstStep := firstIncompleteStep(envelope.Task.Steps)
 	_ = reporter.Report(taskdomain.ReportEnvelope{
 		TaskID:      envelope.Task.ID,
 		Status:      taskdomain.StatusRunning,
@@ -159,4 +159,13 @@ func firstStep(steps []taskdomain.DispatchStep) taskdomain.DispatchStep {
 		return taskdomain.DispatchStep{ID: "", StepNo: 1, StepName: "exec"}
 	}
 	return steps[0]
+}
+
+func firstIncompleteStep(steps []taskdomain.DispatchStep) taskdomain.DispatchStep {
+	for _, step := range steps {
+		if step.Status != taskdomain.StepSuccess {
+			return step
+		}
+	}
+	return firstStep(steps)
 }

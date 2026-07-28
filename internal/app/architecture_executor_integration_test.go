@@ -26,10 +26,24 @@ import (
 // records the exact exec task received by an Agent and reports completion only
 // after TaskService has persisted the dispatched state.
 type recordingArchitectureAgent struct {
-	service  *TaskService
-	serverID int
-	mu       sync.Mutex
-	commands []string
+	service      *TaskService
+	serverID     int
+	failMGRGuard bool
+	mu           sync.Mutex
+	commands     []string
+}
+
+func TestArchitectureProbeOutputPrefersAgentLogOverGenericStepSummary(t *testing.T) {
+	detail := TaskDetail{
+		Steps: []taskdomain.Step{{Message: "执行成功（共输出 1 行）"}},
+		Events: []taskdomain.Event{
+			{EventType: taskdomain.EventInfo, Content: "开始执行"},
+			{EventType: taskdomain.EventLog, Content: "MGR_PREFLIGHT|uuid|2|ON|0|0|YES||||"},
+		},
+	}
+	if got, want := architectureProbeOutput(detail), "MGR_PREFLIGHT|uuid|2|ON|0|0|YES||||"; got != want {
+		t.Fatalf("architecture probe output=%q, want %q", got, want)
+	}
 }
 
 func (a *recordingArchitectureAgent) Send(envelope taskdomain.DispatchEnvelope) error {
@@ -49,14 +63,20 @@ func (a *recordingArchitectureAgent) Send(envelope taskdomain.DispatchEnvelope) 
 			if err == nil && found && task.Status == taskdomain.StatusSent {
 				now := time.Now().UTC()
 				message := "OK"
+				status := taskdomain.StatusSuccess
+				stepStatus := taskdomain.StepSuccess
 				if strings.Contains(command, "CONCAT_WS") && strings.Contains(command, "@@global.gtid_executed") {
 					message = strings.Join([]string{strconv.Itoa(a.serverID), "ON", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1-10", "0", "0"}, "|")
 				} else if strings.Contains(command, "CONCAT_WS") && strings.Contains(command, "@@global.gtid_mode") {
 					message = strings.Join([]string{strconv.Itoa(a.serverID), "ON", "0", "0"}, "|")
+				} else if a.failMGRGuard && strings.Contains(command, "replication_group_members") && strings.Contains(command, "active MGR member") {
+					message = "active MGR member cannot be uninstalled individually"
+					status = taskdomain.StatusFailed
+					stepStatus = taskdomain.StepFailed
 				}
 				_ = a.service.HandleReport(context.Background(), taskdomain.ReportEnvelope{
-					TaskID: envelope.Task.ID, Status: taskdomain.StatusSuccess, Progress: 100, CurrentStep: step.StepName,
-					Step: &taskdomain.StepReport{StepID: step.ID, StepNo: step.StepNo, StepName: step.StepName, Status: taskdomain.StepSuccess, Message: message, StartedAt: &now, FinishedAt: &now},
+					TaskID: envelope.Task.ID, Status: status, Progress: 100, CurrentStep: step.StepName,
+					Step: &taskdomain.StepReport{StepID: step.ID, StepNo: step.StepNo, StepName: step.StepName, Status: stepStatus, Message: message, StartedAt: &now, FinishedAt: &now},
 				})
 				return
 			}

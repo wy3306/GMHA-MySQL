@@ -1,6 +1,8 @@
 package app
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -23,7 +25,7 @@ import (
 
 const defaultPackageRoot = "software"
 
-var packageCategories = []string{"gmha-manager", "gmha-agent", "mysql", "percona-toolkit", "mysql-router", "xtrabackup", "binlog2sql", "mycat", "proxysql", "sysbench", "other"}
+var packageCategories = []string{"gmha-manager", "gmha-agent", "mysql", "percona-toolkit", "mysql-shell", "mysql-router", "xtrabackup", "binlog2sql", "mycat", "proxysql", "sysbench", "other"}
 
 const packageIndexName = ".gmha-package-index.json"
 
@@ -161,6 +163,10 @@ func officialPackageCatalog() []PackageCatalogItem {
 		{ID: "mysql-9.7.1-aarch64", Category: "mysql", Name: "mysql-9.7.1-linux-glibc2.28-aarch64.tar.xz", Version: "9.7.1", Arch: "aarch64", SourceURL: "https://dev.mysql.com/get/Downloads/MySQL-9.7/mysql-9.7.1-linux-glibc2.28-aarch64.tar.xz", Description: "MySQL Community Server 9.7.1 LTS Linux Generic ARM64"},
 		{ID: "mysql-router-9.7.1-x86_64", Category: "mysql-router", Name: "mysql-router-9.7.1-linux-glibc2.28-x86_64.tar.xz", Version: "9.7.1", Arch: "x86_64", SourceURL: "https://dev.mysql.com/get/Downloads/MySQL-Router/mysql-router-9.7.1-linux-glibc2.28-x86_64.tar.xz", Description: "Oracle MySQL Router 9.7.1 Linux Generic"},
 		{ID: "mysql-router-9.7.1-aarch64", Category: "mysql-router", Name: "mysql-router-9.7.1-linux-glibc2.28-aarch64.tar.xz", Version: "9.7.1", Arch: "aarch64", SourceURL: "https://dev.mysql.com/get/Downloads/MySQL-Router/mysql-router-9.7.1-linux-glibc2.28-aarch64.tar.xz", Description: "Oracle MySQL Router 9.7.1 Linux Generic"},
+		{ID: "mysql-shell-8.0.46-x86_64", Category: "mysql-shell", Name: "mysql-shell-8.0.46-linux-glibc2.28-x86-64bit.tar.gz", Version: "8.0.46", Arch: "x86_64", SourceURL: "https://dev.mysql.com/get/Downloads/MySQL-Shell/mysql-shell-8.0.46-linux-glibc2.28-x86-64bit.tar.gz", Description: "Oracle MySQL Shell 8.0.46 Linux Generic，用于 MySQL 8.0 InnoDB Cluster 元数据管理"},
+		{ID: "mysql-shell-8.0.46-aarch64", Category: "mysql-shell", Name: "mysql-shell-8.0.46-linux-glibc2.28-arm-64bit.tar.gz", Version: "8.0.46", Arch: "aarch64", SourceURL: "https://dev.mysql.com/get/Downloads/MySQL-Shell/mysql-shell-8.0.46-linux-glibc2.28-arm-64bit.tar.gz", Description: "Oracle MySQL Shell 8.0.46 Linux Generic ARM64，用于 MySQL 8.0 InnoDB Cluster 元数据管理"},
+		{ID: "mysql-shell-9.7.1-x86_64", Category: "mysql-shell", Name: "mysql-shell-9.7.1-linux-glibc2.28-x86-64bit.tar.gz", Version: "9.7.1", Arch: "x86_64", SourceURL: "https://dev.mysql.com/get/Downloads/MySQL-Shell/mysql-shell-9.7.1-linux-glibc2.28-x86-64bit.tar.gz", Description: "Oracle MySQL Shell 9.7.1 Linux Generic，用于 InnoDB Cluster 元数据管理"},
+		{ID: "mysql-shell-9.7.1-aarch64", Category: "mysql-shell", Name: "mysql-shell-9.7.1-linux-glibc2.28-arm-64bit.tar.gz", Version: "9.7.1", Arch: "aarch64", SourceURL: "https://dev.mysql.com/get/Downloads/MySQL-Shell/mysql-shell-9.7.1-linux-glibc2.28-arm-64bit.tar.gz", Description: "Oracle MySQL Shell 9.7.1 Linux Generic ARM64，用于 InnoDB Cluster 元数据管理"},
 		{ID: "binlog2sql-5a8e65c", Category: "binlog2sql", Name: "binlog2sql-5a8e65c-noarch.tar.gz", Version: "5a8e65c", Arch: "noarch", SourceURL: "https://github.com/danfengcao/binlog2sql/archive/5a8e65c432e74950b48b7ead28f424ec931b755d.tar.gz", Description: "MySQL binlog 解析与回滚 SQL 生成工具"},
 		{ID: "mycat-1.6", Category: "mycat", Name: "Mycat-server-1.6-RELEASE-linux-noarch.tar.gz", Version: "1.6", Arch: "noarch", SourceURL: "https://raw.githubusercontent.com/MyCATApache/Mycat-download/master/1.6-RELEASE/Mycat-server-1.6-RELEASE-20161028204710-linux.tar.gz", Description: "Mycat Server 1.6 Linux 发行包"},
 		{ID: "mycat2-1.22-source", Category: "mycat", Name: "Mycat2-v1.22-2022-6-25-source-noarch.tar.gz", Version: "1.22", Arch: "noarch", SourceURL: "https://github.com/MyCATApache/Mycat2/archive/refs/tags/v1.22-2022-6-25.tar.gz", Description: "Mycat2 v1.22 官方源码包（需 Java 8/Maven 构建）"},
@@ -176,8 +182,8 @@ func officialPackageCatalog() []PackageCatalogItem {
 }
 
 func officialPackageBundles() []PackageBundleProfile {
-	commonX86 := []string{"mysql-router-9.7.1-x86_64", "sysbench-1.0.20-source"}
-	commonARM := []string{"mysql-router-9.7.1-aarch64", "sysbench-1.0.20-source"}
+	commonX86 := []string{"mysql-shell-9.7.1-x86_64", "mysql-router-9.7.1-x86_64", "sysbench-1.0.20-source"}
+	commonARM := []string{"mysql-shell-9.7.1-aarch64", "mysql-router-9.7.1-aarch64", "sysbench-1.0.20-source"}
 	return []PackageBundleProfile{
 		{
 			ID: "mysql-5.7.44-x86_64", Label: "MySQL 5.7.44 · x86_64", MySQLVersion: "5.7.44", Arch: "x86_64",
@@ -410,9 +416,9 @@ func (s *PackageService) List(category, keyword string) ([]PackageItem, error) {
 	return items, nil
 }
 
-// ResolvePerconaToolkitPackage selects a local Toolkit archive for the target
-// architecture. A noarch source archive is preferred because the core pt-*
-// commands are Perl programs and can be deployed to both x86_64 and aarch64.
+// ResolvePerconaToolkitPackage selects an installable offline Toolkit bundle
+// for the target architecture and Linux family. A plain upstream source archive
+// is not installable by itself because it does not include Perl DBI dependencies.
 func (s *PackageService) ResolvePerconaToolkitPackage(arch, osName string) (string, error) {
 	items, err := s.List("percona-toolkit", "")
 	if err != nil {
@@ -420,11 +426,24 @@ func (s *PackageService) ResolvePerconaToolkitPackage(arch, osName string) (stri
 	}
 	arch = normalizePackageArch(arch)
 	bestName, bestScore := "", -1
+	invalidBundles := make([]string, 0)
 	for _, item := range items {
 		if item.Format != "tar.gz" && item.Format != "tgz" {
 			continue
 		}
 		score := perconaToolkitPackageScore(item, arch, osName)
+		if score < 0 {
+			continue
+		}
+		path, openErr := s.Open("percona-toolkit", item.Name)
+		if openErr != nil {
+			invalidBundles = append(invalidBundles, item.Name+": "+openErr.Error())
+			continue
+		}
+		if validateErr := validatePerconaToolkitOfflineBundle(path); validateErr != nil {
+			invalidBundles = append(invalidBundles, item.Name+": "+validateErr.Error())
+			continue
+		}
 		if score > bestScore {
 			bestName, bestScore = item.Name, score
 		}
@@ -432,10 +451,89 @@ func (s *PackageService) ResolvePerconaToolkitPackage(arch, osName string) (stri
 	if bestName != "" {
 		return bestName, nil
 	}
-	return "", fmt.Errorf("no local Percona Toolkit package matches architecture %s", arch)
+	if len(invalidBundles) > 0 {
+		return "", fmt.Errorf("offline Percona Toolkit bundle validation failed: %s", strings.Join(invalidBundles, "; "))
+	}
+	return "", fmt.Errorf("no installable offline Percona Toolkit bundle matches %s on architecture %s; upload a *-offline-*.tar.gz bundle containing Perl DBI, DBD::mysql, IO::Socket::SSL and Term::ReadKey dependencies", strings.TrimSpace(osName), arch)
+}
+
+func validatePerconaToolkitOfflineBundle(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	gzipReader, err := gzip.NewReader(file)
+	if err != nil {
+		return fmt.Errorf("not a valid tar.gz archive: %w", err)
+	}
+	defer gzipReader.Close()
+
+	required := map[string]bool{
+		"DBI":             false,
+		"DBD::mysql":      false,
+		"IO::Socket::SSL": false,
+		"Term::ReadKey":   false,
+	}
+	foundToolkit := false
+	reader := tar.NewReader(gzipReader)
+	for {
+		header, readErr := reader.Next()
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return fmt.Errorf("read archive: %w", readErr)
+		}
+		name := strings.ToLower(filepath.ToSlash(strings.TrimPrefix(header.Name, "./")))
+		base := strings.ToLower(filepath.Base(name))
+		hasPayload := (header.Typeflag == tar.TypeReg || header.Typeflag == tar.TypeRegA) && header.Size > 0
+		switch {
+		case hasPayload && (strings.HasSuffix(name, "/bin/pt-table-sync") || name == "bin/pt-table-sync"):
+			foundToolkit = true
+		case hasPayload && (strings.HasSuffix(name, "/dbi.pm") || name == "dbi.pm"):
+			required["DBI"] = true
+		case hasPayload && (strings.HasSuffix(name, "/dbd/mysql.pm") || name == "dbd/mysql.pm"):
+			required["DBD::mysql"] = true
+		case hasPayload && (strings.HasSuffix(name, "/io/socket/ssl.pm") || name == "io/socket/ssl.pm"):
+			required["IO::Socket::SSL"] = true
+		case hasPayload && (strings.HasSuffix(name, "/term/readkey.pm") || name == "term/readkey.pm"):
+			required["Term::ReadKey"] = true
+		}
+		if !hasPayload || !strings.Contains(name, "/packages/") {
+			continue
+		}
+		switch {
+		case strings.Contains(base, "libdbi-perl") || strings.Contains(base, "perl-dbi"):
+			required["DBI"] = true
+		case strings.Contains(base, "libdbd-mysql-perl") || strings.Contains(base, "perl-dbd-mysql"):
+			required["DBD::mysql"] = true
+		case strings.Contains(base, "libio-socket-ssl-perl") || strings.Contains(base, "perl-io-socket-ssl"):
+			required["IO::Socket::SSL"] = true
+		case strings.Contains(base, "libterm-readkey-perl") || strings.Contains(base, "perl-term-readkey") || strings.Contains(base, "perl-termreadkey"):
+			required["Term::ReadKey"] = true
+		}
+	}
+	if !foundToolkit {
+		return errors.New("bin/pt-table-sync is missing")
+	}
+	missing := make([]string, 0, len(required))
+	for _, module := range []string{"DBI", "DBD::mysql", "IO::Socket::SSL", "Term::ReadKey"} {
+		if !required[module] {
+			missing = append(missing, module)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("missing Perl module payloads: %s; rebuild with scripts/build-pt-offline-bundle.sh", strings.Join(missing, ", "))
+	}
+	return nil
 }
 
 func perconaToolkitPackageScore(item PackageItem, targetArch, osName string) int {
+	name := strings.ToLower(item.Name)
+	if !strings.Contains(name, "offline") {
+		return -1
+	}
 	score := -1
 	switch normalizePackageArch(item.Arch) {
 	case targetArch:
@@ -445,11 +543,10 @@ func perconaToolkitPackageScore(item PackageItem, targetArch, osName string) int
 	default:
 		return -1
 	}
-	name := strings.ToLower(item.Name)
 	targetFamily := linuxPackageFamily(osName)
 	familyMarkers := map[string][]string{
 		"debian": {"ubuntu", "debian"},
-		"rhel":   {"rhel", "centos", "rocky", "alma"},
+		"rhel":   {"rhel", "centos", "rocky", "alma", "anolis", "oraclelinux"},
 		"suse":   {"opensuse", "sles", "suse"},
 		"alpine": {"alpine"},
 		"arch":   {"archlinux"},
@@ -478,7 +575,7 @@ func linuxPackageFamily(osName string) string {
 	switch {
 	case strings.Contains(name, "ubuntu"), strings.Contains(name, "debian"):
 		return "debian"
-	case strings.Contains(name, "red hat"), strings.Contains(name, "rhel"), strings.Contains(name, "centos"), strings.Contains(name, "rocky"), strings.Contains(name, "alma"):
+	case strings.Contains(name, "red hat"), strings.Contains(name, "rhel"), strings.Contains(name, "centos"), strings.Contains(name, "rocky"), strings.Contains(name, "alma"), strings.Contains(name, "anolis"), strings.Contains(name, "oracle linux"):
 		return "rhel"
 	case strings.Contains(name, "suse"), strings.Contains(name, "sles"):
 		return "suse"
@@ -720,6 +817,12 @@ func (s *PackageService) save(category, name string, content io.Reader, metadata
 	info, err := os.Stat(path)
 	if err != nil {
 		return PackageItem{}, err
+	}
+	if category == "percona-toolkit" && strings.Contains(strings.ToLower(name), "offline") {
+		if err := validatePerconaToolkitOfflineBundle(path); err != nil {
+			_ = os.Remove(path)
+			return PackageItem{}, fmt.Errorf("invalid offline Percona Toolkit bundle: %w", err)
+		}
 	}
 	item := newPackageItem(category, name, info)
 	if validArchitecture(metadata.Arch) {

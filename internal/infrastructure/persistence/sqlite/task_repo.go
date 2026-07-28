@@ -18,7 +18,7 @@ type TaskRepository struct {
 }
 
 func (r *TaskRepository) ListTaskPage(ctx context.Context, query taskdomain.ListQuery) ([]taskdomain.Task, int, error) {
-	where := []string{"parent_task_id = ''", "type not in ('collect_machine_info', 'collect_static_info')"}
+	where := []string{"parent_task_id = ''", "visibility = 'user'"}
 	args := make([]any, 0)
 	if keyword := strings.ToLower(strings.TrimSpace(query.Keyword)); keyword != "" {
 		where = append(where, `(lower(id) like ? or lower(type) like ? or lower(machine_id) like ? or lower(current_step) like ? or lower(spec_json) like ?)`)
@@ -51,7 +51,7 @@ func (r *TaskRepository) ListTaskPage(ctx context.Context, query taskdomain.List
 	}
 	pageArgs := append(append([]any{}, args...), query.Limit, query.Offset)
 	rows, err := r.db.QueryContext(ctx, fmt.Sprintf(`
-		select id, parent_task_id, type, machine_id, agent_id, status, progress_percent, current_step, spec_json, created_at, started_at, finished_at
+		select id, parent_task_id, visibility, type, machine_id, agent_id, status, progress_percent, current_step, spec_json, created_at, started_at, finished_at
 		from tasks%s order by created_at desc, id desc limit ? offset ?`, whereSQL), pageArgs...)
 	if err != nil {
 		return nil, 0, err
@@ -77,6 +77,7 @@ func (r *TaskRepository) Migrate() error {
 		create table if not exists tasks (
 			id text primary key,
 			parent_task_id text not null default '',
+			visibility text not null default 'user',
 			type text not null,
 			machine_id text not null,
 			agent_id text not null,
@@ -115,6 +116,38 @@ func (r *TaskRepository) Migrate() error {
 	}
 	if _, alterErr := r.db.Exec(`alter table tasks add column parent_task_id text not null default ''`); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column") && !strings.Contains(strings.ToLower(alterErr.Error()), "already exists") {
 		return alterErr
+	}
+	if _, alterErr := r.db.Exec(`alter table tasks add column visibility text not null default 'user'`); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column") && !strings.Contains(strings.ToLower(alterErr.Error()), "already exists") {
+		return alterErr
+	}
+	if _, err = r.db.Exec(`update tasks set visibility = 'internal' where type in ('collect_machine_info', 'collect_static_info')`); err != nil {
+		return err
+	}
+	// Older releases recorded every resource/configuration write as a generic
+	// platform task. Keep those audit rows in storage, but remove the legacy
+	// machine-maintenance and automatic collection noise from the task center.
+	if _, err = r.db.Exec(`
+		update tasks set visibility = 'internal'
+		where type = 'platform_operation' and (
+			spec_json like '%"/api/v1/machines%' or
+			spec_json like '%"/api/v1/ssh-credentials%' or
+			spec_json like '%"/api/v1/dynamic-collect/%' or
+			spec_json like '%"/api/v1/mysql-dynamic-collect/%' or
+			spec_json like '%"/api/v1/tasks/collect-machine-info%' or
+			spec_json like '%"/api/v1/tasks/database-inspection/report%' or
+			spec_json like '%"/api/v1/agents/heartbeat%' or
+			spec_json like '%"/api/v1/agents/register%'
+		)`); err != nil {
+		return err
+	}
+	if _, err = r.db.Exec(`
+		update tasks set visibility = 'internal'
+		where (type = 'batch_operation' and spec_json like '%"operation":"vip_scan"%')
+		   or (type = 'exec' and (
+				spec_json like '%"operation":"mgr_status"%'
+				or spec_json like '%"operation":"mgr_member_status"%'
+		   ))`); err != nil {
+		return err
 	}
 	_, err = r.db.Exec(`create index if not exists idx_tasks_parent_created on tasks(parent_task_id, created_at desc)`)
 	if err == nil {
@@ -211,6 +244,13 @@ func (r *TaskRepository) backfillPlatformTaskParents() error {
 }
 
 func (r *TaskRepository) CreateTask(ctx context.Context, task taskdomain.Task, steps []taskdomain.Step, events []taskdomain.Event) error {
+	if task.Visibility == "" {
+		if task.Type == taskdomain.TypeCollectMachineInfo || task.Type == taskdomain.TypeCollectStaticInfo {
+			task.Visibility = taskdomain.VisibilityInternal
+		} else {
+			task.Visibility = taskdomain.VisibilityUser
+		}
+	}
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -218,9 +258,9 @@ func (r *TaskRepository) CreateTask(ctx context.Context, task taskdomain.Task, s
 	defer tx.Rollback()
 
 	if _, err := tx.ExecContext(ctx, `
-		insert into tasks (id, parent_task_id, type, machine_id, agent_id, status, progress_percent, current_step, spec_json, created_at, started_at, finished_at)
-		values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, task.ID, task.ParentTaskID, string(task.Type), task.MachineID, task.AgentID, string(task.Status), task.ProgressPercent, task.CurrentStep, string(task.SpecJSON), formatDatabaseTime(task.CreatedAt), formatNullableTime(task.StartedAt), formatNullableTime(task.FinishedAt)); err != nil {
+		insert into tasks (id, parent_task_id, visibility, type, machine_id, agent_id, status, progress_percent, current_step, spec_json, created_at, started_at, finished_at)
+		values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, task.ID, task.ParentTaskID, string(task.Visibility), string(task.Type), task.MachineID, task.AgentID, string(task.Status), task.ProgressPercent, task.CurrentStep, string(task.SpecJSON), formatDatabaseTime(task.CreatedAt), formatNullableTime(task.StartedAt), formatNullableTime(task.FinishedAt)); err != nil {
 		return err
 	}
 	for _, step := range steps {
@@ -244,7 +284,7 @@ func (r *TaskRepository) CreateTask(ctx context.Context, task taskdomain.Task, s
 
 func (r *TaskRepository) GetTask(ctx context.Context, taskID string) (taskdomain.Task, bool, error) {
 	row := r.db.QueryRowContext(ctx, `
-		select id, parent_task_id, type, machine_id, agent_id, status, progress_percent, current_step, spec_json, created_at, started_at, finished_at
+		select id, parent_task_id, visibility, type, machine_id, agent_id, status, progress_percent, current_step, spec_json, created_at, started_at, finished_at
 		from tasks where id = ?
 	`, taskID)
 	item, err := scanTask(row)
@@ -262,8 +302,8 @@ func (r *TaskRepository) ListTasks(ctx context.Context, limit int) ([]taskdomain
 		limit = 20
 	}
 	rows, err := r.db.QueryContext(ctx, `
-		select id, parent_task_id, type, machine_id, agent_id, status, progress_percent, current_step, spec_json, created_at, started_at, finished_at
-		from tasks where parent_task_id = '' and type not in ('collect_machine_info', 'collect_static_info')
+		select id, parent_task_id, visibility, type, machine_id, agent_id, status, progress_percent, current_step, spec_json, created_at, started_at, finished_at
+		from tasks where parent_task_id = '' and visibility = 'user'
 		order by created_at desc
 		limit ?
 	`, limit)
@@ -287,7 +327,7 @@ func (r *TaskRepository) ListTasksByStatus(ctx context.Context, status taskdomai
 		limit = 20
 	}
 	rows, err := r.db.QueryContext(ctx, `
-		select id, parent_task_id, type, machine_id, agent_id, status, progress_percent, current_step, spec_json, created_at, started_at, finished_at
+		select id, parent_task_id, visibility, type, machine_id, agent_id, status, progress_percent, current_step, spec_json, created_at, started_at, finished_at
 		from tasks
 		where status = ?
 		order by created_at asc
@@ -330,7 +370,7 @@ func (r *TaskRepository) ListSteps(ctx context.Context, taskID string) ([]taskdo
 
 func (r *TaskRepository) ListChildTasks(ctx context.Context, parentTaskID string) ([]taskdomain.Task, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		select id, parent_task_id, type, machine_id, agent_id, status, progress_percent, current_step, spec_json, created_at, started_at, finished_at
+		select id, parent_task_id, visibility, type, machine_id, agent_id, status, progress_percent, current_step, spec_json, created_at, started_at, finished_at
 		from tasks where parent_task_id = ? order by created_at asc, id asc
 	`, parentTaskID)
 	if err != nil {
@@ -548,7 +588,7 @@ func scanTask(scanner taskScanner) (taskdomain.Task, error) {
 	var taskType, status, createdAt string
 	var specJSON sql.NullString
 	var startedAt, finishedAt sql.NullString
-	if err := scanner.Scan(&item.ID, &item.ParentTaskID, &taskType, &item.MachineID, &item.AgentID, &status, &item.ProgressPercent, &item.CurrentStep, &specJSON, &createdAt, &startedAt, &finishedAt); err != nil {
+	if err := scanner.Scan(&item.ID, &item.ParentTaskID, &item.Visibility, &taskType, &item.MachineID, &item.AgentID, &status, &item.ProgressPercent, &item.CurrentStep, &specJSON, &createdAt, &startedAt, &finishedAt); err != nil {
 		return taskdomain.Task{}, err
 	}
 	item.Type = taskdomain.Type(taskType)

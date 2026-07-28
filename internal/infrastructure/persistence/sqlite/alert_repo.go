@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	alertdomain "gmha/internal/domain/alert"
@@ -293,6 +294,84 @@ func (r *AlertRepository) GetEvaluationState(ctx context.Context, fp string) (al
 func (r *AlertRepository) SaveEvaluationState(ctx context.Context, x alertdomain.EvaluationState) error {
 	_, err := r.db.ExecContext(ctx, `insert into alert_evaluation_state(fingerprint,rule_id,consecutive,last_value,last_sample_at,updated_at) values(?,?,?,?,?,?) on conflict(fingerprint) do update set consecutive=excluded.consecutive,last_value=excluded.last_value,last_sample_at=excluded.last_sample_at,updated_at=excluded.updated_at`, x.Fingerprint, x.RuleID, x.Consecutive, x.LastValue, formatAlertTimeValue(x.LastSampleAt), x.UpdatedAt.Format(time.RFC3339Nano))
 	return err
+}
+
+func (r *AlertRepository) ClassifyMySQLRestart(ctx context.Context, machineID string, port int, bootAt, observedAt time.Time) (alertdomain.MySQLRestartClassification, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		select id,type,status,spec_json,created_at,coalesce(started_at,''),coalesce(finished_at,'')
+		from tasks
+		where machine_id=? and created_at>=? and created_at<=?
+		order by created_at desc`,
+		machineID, observedAt.Add(-24*time.Hour).Format(time.RFC3339Nano), observedAt.Add(2*time.Minute).Format(time.RFC3339Nano))
+	if err != nil {
+		return alertdomain.MySQLRestartClassification{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, taskType, status, rawSpec, createdText, startedText, finishedText string
+		if err := rows.Scan(&id, &taskType, &status, &rawSpec, &createdText, &startedText, &finishedText); err != nil {
+			return alertdomain.MySQLRestartClassification{}, err
+		}
+		if status == "pending" || status == "skipped" {
+			continue
+		}
+		startedAt := parseAlertTime(startedText)
+		if startedAt.IsZero() {
+			startedAt = parseAlertTime(createdText)
+		}
+		finishedAt := parseAlertTime(finishedText)
+		if bootAt.Before(startedAt.Add(-2 * time.Minute)) {
+			continue
+		}
+		if !finishedAt.IsZero() && bootAt.After(finishedAt.Add(10*time.Minute)) {
+			continue
+		}
+		var spec struct {
+			Operation string `json:"operation"`
+			Port      int    `json:"port"`
+			Command   string `json:"command"`
+			Commands  []struct {
+				Command string `json:"command"`
+			} `json:"commands"`
+		}
+		if json.Unmarshal([]byte(rawSpec), &spec) != nil {
+			continue
+		}
+		if port > 0 && spec.Port > 0 && port != spec.Port {
+			continue
+		}
+		if !manualMySQLRestartTask(taskType, spec.Operation, spec.Command, spec.Commands) {
+			continue
+		}
+		return alertdomain.MySQLRestartClassification{Manual: true, TaskID: id, Operation: spec.Operation}, nil
+	}
+	return alertdomain.MySQLRestartClassification{}, rows.Err()
+}
+
+func manualMySQLRestartTask(taskType, operation, command string, commands []struct {
+	Command string `json:"command"`
+}) bool {
+	operation = strings.ToLower(strings.TrimSpace(operation))
+	switch operation {
+	case "mysql_restart", "ai_restart_mysql", "mysql_parameters_apply", "mysql_upgrade",
+		"mysql_architecture_step", "mysql_cluster_rolling_upgrade":
+		return true
+	}
+	for _, prefix := range []string{"mysql_cluster_upgrade_", "mysql_restore_"} {
+		if strings.HasPrefix(operation, prefix) {
+			return true
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(taskType)) {
+	case "mysql_upgrade", "mysql_topology", "architecture_adjustment", "mysql_cluster_bootstrap", "mysql_cluster_upgrade":
+		return true
+	}
+	combined := strings.ToLower(command)
+	for _, step := range commands {
+		combined += "\n" + strings.ToLower(step.Command)
+	}
+	return strings.Contains(combined, "restart") &&
+		(strings.Contains(combined, "mysqld") || strings.Contains(combined, "mysql"))
 }
 
 func (r *AlertRepository) ListChannels(ctx context.Context) ([]alertdomain.Channel, error) {

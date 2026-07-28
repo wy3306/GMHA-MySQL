@@ -113,7 +113,7 @@ func TestAccountSQLStepsForMHA(t *testing.T) {
 		"CREATE USER IF NOT EXISTS 'mha'@'%' IDENTIFIED BY 'p''ass'",
 		"ALTER USER 'mha'@'%' IDENTIFIED BY 'p''ass'",
 		"GRANT CREATE, CREATE USER, ALTER, DROP, INSERT, UPDATE, DELETE, SELECT",
-		"GRANT CONNECTION_ADMIN, SYSTEM_VARIABLES_ADMIN, REPLICATION_SLAVE_ADMIN, BACKUP_ADMIN, CLONE_ADMIN ON *.* TO 'mha'@'%' WITH GRANT OPTION",
+		"GRANT CONNECTION_ADMIN, SYSTEM_VARIABLES_ADMIN, REPLICATION_SLAVE_ADMIN, REPLICATION_APPLIER, BACKUP_ADMIN, CLONE_ADMIN, GROUP_REPLICATION_ADMIN, PERSIST_RO_VARIABLES_ADMIN ON *.* TO 'mha'@'%' WITH GRANT OPTION",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("generated SQL missing %q:\n%s", want, joined)
@@ -122,6 +122,27 @@ func TestAccountSQLStepsForMHA(t *testing.T) {
 	for _, line := range text {
 		if strings.HasPrefix(line, "grant_") && !strings.HasSuffix(line, "WITH GRANT OPTION") {
 			t.Fatalf("MHA grant must include grant option: %s", line)
+		}
+	}
+}
+
+func TestAccountSQLStepsVersionGateReplicationApplier(t *testing.T) {
+	for _, tt := range []struct {
+		version string
+		want    bool
+	}{
+		{version: "8.0.17", want: false},
+		{version: "8.0.18", want: true},
+		{version: "8.4.10", want: true},
+	} {
+		steps := accountSQLStepsForVersion(AccountSpec{Role: AccountRoleMHA, Username: "mha", Password: "secret", Host: "%", Enabled: true}, tt.version)
+		var sqlText strings.Builder
+		for _, step := range steps {
+			sqlText.WriteString(step.SQL)
+			sqlText.WriteByte('\n')
+		}
+		if got := strings.Contains(sqlText.String(), "REPLICATION_APPLIER"); got != tt.want {
+			t.Fatalf("REPLICATION_APPLIER for MySQL %s = %v, want %v:\n%s", tt.version, got, tt.want, sqlText.String())
 		}
 	}
 }

@@ -45,11 +45,15 @@ GMHA_MANAGER_PUBKEY=/opt/gmha/manager_ed25519.pub ./start-web.sh
 
 ## 版本升级
 
-Manager 和 Agent 的当前版本均为 `V0.0.4`。执行 `scripts/build-release.sh V0.0.4`
-会在 `dist/` 额外生成可直接上传到 Web 控制台的两个升级制品：
+Manager 和 Agent 的当前版本均为 `V0.1.0`。执行 `scripts/build-release.sh V0.1.0`
+会在 `dist/` 额外生成可直接上传到 Web 控制台的三个升级制品：
 
-- `gmha-manager-V0.0.4-linux-amd64.bin`：上传到 `GMHA Manager` 分类。
-- `gmha-agent-V0.0.4-linux-amd64.bin`：上传到 `GMHA Agent` 分类。
+- `gmha-manager-V0.1.0-linux-amd64.bin`：上传到 `GMHA Manager` 分类。
+- `gmha-agent-V0.1.0-linux-amd64.bin`：x86_64 目标机，上传到 `GMHA Agent` 分类。
+- `gmha-agent-V0.1.0-linux-arm64.bin`：aarch64 目标机，上传到 `GMHA Agent` 分类。
+
+完整发行版支持范围与老版本限制见 `docs/linux-compatibility.md`。Agent 安装会在
+上传前核对目标发行版、systemd 和 ELF 架构；MySQL 安装会再次核对 glibc 与制品。
 
 上传后进入“平台运维 → 版本升级”。Manager 升级会校验候选版本、备份当前程序、
 原子替换并重启；Agent 升级会检查在线状态与架构，逐台备份替换，并以新鲜心跳上报的
@@ -68,14 +72,31 @@ Manager 和 Agent 的当前版本均为 `V0.0.4`。执行 `scripts/build-release
   percona-toolkit-3.7.1-ubuntu22-offline-x86_64.tar.gz
 ```
 
+依赖目录至少要包含目标发行版对应的 `DBI`、`DBD::mysql`、
+`IO::Socket::SSL`、`Term::ReadKey` 软件包及其传递依赖。例如 RHEL、
+Rocky Linux、AlmaLinux 可在同版本制品机上执行：
+
+```sh
+dnf download --resolve --alldeps --destdir ./pt-dependencies \
+  perl-DBI perl-DBD-MySQL perl-IO-Socket-SSL perl-TermReadKey
+```
+
+Debian、Ubuntu 对应的直接依赖包名为 `libdbi-perl`、
+`libdbd-mysql-perl`、`libio-socket-ssl-perl`、`libterm-readkey-perl`，
+制作制品时也需要一并下载这些包的传递依赖。构建脚本会检查四个关键模块；
+依赖不完整时直接拒绝生成离线包。检查基于 `.rpm`/`.deb` 等安装包内的真实
+文件清单，不再仅凭文件名判断；把普通源码包改名为 `offline` 会在上传时被
+Manager 拒绝。
+
 把生成文件上传到 Manager 的 `percona-toolkit` 分类。Agent 会从 Manager
 下载制品，按目标机的本地包格式离线安装依赖，并将 PT 安装到
 `/opt/gmha-tools/percona-toolkit`。同一套流程支持 Debian/Ubuntu、
 RHEL/CentOS/Rocky/Alma/openSUSE、Alpine 和 Arch 系发行版；不同 ABI 或架构
 应分别制作离线包，并在文件名中保留 `ubuntu`、`debian`、`rocky`、`rhel`、
-`centos`、`alma`、`suse`、`alpine` 或 `archlinux` 发行版标识，Manager 会按
+`centos`、`alma`、`anolis`、`suse`、`alpine` 或 `archlinux` 发行版标识，Manager 会按
 目标机 OS 自动选择。也可以在包内提供 `toolkit/vendor/perl5`，安装器会自动
-加入 `PERL5LIB`。
+加入 `PERL5LIB`。如果旧离线包缺少模块但目标机已配置可用的系统软件仓库，
+Agent 会尝试从该仓库补齐依赖并再次验证；不会添加 Percona 或其他外部软件源。
 
 ## MySQL 版本兼容矩阵
 
@@ -119,8 +140,8 @@ Go、Node.js 或 FlameGraph Perl 脚本。PID/进程模式在没有 `perf` 时�
 
 ```sh
 ./scripts/build-flamegraph-offline-bundle.sh \
-  V0.0.4 amd64 ./perf-packages \
-  ./dist/gmha-flamegraph-V0.0.4-linux-amd64-offline.tar.gz
+  V0.1.0 amd64 ./perf-packages \
+  ./dist/gmha-flamegraph-V0.1.0-linux-amd64-offline.tar.gz
 ```
 
 将包内 `bin/agentd` 通过“平台运维 → 版本升级”分发；目标机解压后执行 `sudo ./install.sh`

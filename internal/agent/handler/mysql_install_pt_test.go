@@ -20,10 +20,16 @@ func TestInstallPTToolsCommandUsesManagerPackage(t *testing.T) {
 		"tar -xzf",
 		"--no-network",
 		"dpkg -i",
+		"--disablerepo='*' install",
+		"--disablerepo='*' localinstall",
 		"rpm -Uvh --replacepkgs",
 		"vendor/perl5",
 		"PERL5LIB",
-		"perl -MDBI -MDBD::mysql -MIO::Socket::SSL",
+		"for perl_module in DBI DBD::mysql IO::Socket::SSL Term::ReadKey",
+		"trying configured OS package repositories",
+		"perl-DBI perl-DBD-MySQL perl-IO-Socket-SSL perl-TermReadKey",
+		"libdbi-perl libdbd-mysql-perl libio-socket-ssl-perl libterm-readkey-perl",
+		"missing Perl modules:$missing_perl_modules",
 		"pt-table-sync --version",
 		"pt-online-schema-change",
 		"pt-archiver",
@@ -133,6 +139,50 @@ func TestMySQLInstallPathsAndServiceArePortScoped(t *testing.T) {
 	for _, expected := range []string{"mysqld-3307.service", "port 3307 is already listening", "base_dir symlink is already used"} {
 		if !strings.Contains(command, expected) {
 			t.Fatalf("environment check does not contain %q", expected)
+		}
+	}
+}
+
+func TestMySQLInstallPrecheckRejectsToolkitSourceArchive(t *testing.T) {
+	runner := mysqlInstallRunner{spec: taskdomain.MySQLInstallSpec{
+		Port:               3306,
+		InstanceDir:        "/data/3306",
+		DataDir:            "/data/3306/data",
+		BaseDir:            "/usr/local/mysql-3306",
+		SystemdUnitName:    "mysqld-3306",
+		InstallPTTools:     true,
+		PTToolsPackageName: "percona-toolkit-3.7.1-noarch.tar.gz",
+	}}
+	command := runner.checkEnvCommand()
+	for _, expected := range []string{"source archive without offline Perl dependencies", "*-offline-*.tar.gz"} {
+		if !strings.Contains(command, expected) {
+			t.Fatalf("PT precheck does not contain %q: %s", expected, command)
+		}
+	}
+}
+
+func TestMySQLSystemdActivationEnablesBootStartupAndVerifiesState(t *testing.T) {
+	command := mysqlSystemdActivationCommand("mysqld-3306")
+	for _, expected := range []string{
+		"systemctl daemon-reload",
+		"systemctl enable --now 'mysqld-3306.service'",
+		"systemctl is-enabled --quiet 'mysqld-3306.service'",
+		"systemctl is-active --quiet 'mysqld-3306.service'",
+	} {
+		if !strings.Contains(command, expected) {
+			t.Fatalf("systemd activation command does not contain %q: %s", expected, command)
+		}
+	}
+}
+
+func TestSetRootPasswordCommandIsSafeToRetryAfterSuccess(t *testing.T) {
+	runner := mysqlInstallRunner{spec: taskdomain.MySQLInstallSpec{
+		BaseDir: "/usr/local/mysql-3306", SocketPath: "/data/3306/mysql.sock", RootPassword: "secret",
+	}}
+	command := runner.setRootPasswordCommand()
+	for _, expected := range []string{"mysqladmin", "root password is already configured", "ALTER USER"} {
+		if !strings.Contains(command, expected) {
+			t.Fatalf("retry-safe root password command does not contain %q: %s", expected, command)
 		}
 	}
 }

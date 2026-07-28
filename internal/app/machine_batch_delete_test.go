@@ -53,8 +53,8 @@ func TestBatchDeleteMachinesCreatesOneRootTask(t *testing.T) {
 	if page.Total != 1 || len(page.Items) != 1 || page.Items[0].ID != result.TaskID {
 		t.Fatalf("one batch action must expose exactly one root task: %+v", page)
 	}
-	if len(page.Items[0].Children) != 2 {
-		t.Fatalf("machine executions must be nested below the batch task: %+v", page.Items[0].Children)
+	if len(page.Items[0].Children) != 0 {
+		t.Fatalf("execution nodes must not be expanded into task-list rows: %+v", page.Items[0].Children)
 	}
 	detail, err := taskService.GetTaskDetail(ctx, result.TaskID)
 	if err != nil {

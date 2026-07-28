@@ -30,43 +30,52 @@ func NewClusterTopologyHandler(machines *app.MachineService, mysql *app.MySQLSer
 }
 
 type clusterTopologyView struct {
-	Cluster  string                `json:"cluster"`
-	Nodes    []clusterTopologyNode `json:"nodes"`
-	Edges    []clusterTopologyEdge `json:"edges"`
-	Overview clusterOverviewView   `json:"overview"`
+	Cluster      string                `json:"cluster"`
+	Architecture string                `json:"architecture"`
+	Nodes        []clusterTopologyNode `json:"nodes"`
+	Edges        []clusterTopologyEdge `json:"edges"`
+	Overview     clusterOverviewView   `json:"overview"`
 }
 
 type clusterTopologyNode struct {
-	MachineID   string `json:"machine_id"`
-	Name        string `json:"name"`
-	IP          string `json:"ip"`
-	Port        int    `json:"port"`
-	Role        string `json:"role"`
-	ServerID    int    `json:"server_id"`
-	ReadOnly    string `json:"read_only"`
-	SuperRO     string `json:"super_read_only"`
-	Heartbeat   string `json:"heartbeat"`
-	Version     string `json:"version"`
-	QPS         string `json:"qps,omitempty"`
-	TPS         string `json:"tps,omitempty"`
-	Connections string `json:"connections,omitempty"`
-	Uptime      string `json:"uptime,omitempty"`
-	LastUpdated string `json:"last_updated"`
-	Error       string `json:"error,omitempty"`
+	MachineID     string `json:"machine_id"`
+	Name          string `json:"name"`
+	IP            string `json:"ip"`
+	Port          int    `json:"port"`
+	Role          string `json:"role"`
+	ServerID      int    `json:"server_id"`
+	ReadOnly      string `json:"read_only"`
+	SuperRO       string `json:"super_read_only"`
+	Heartbeat     string `json:"heartbeat"`
+	Version       string `json:"version"`
+	QPS           string `json:"qps,omitempty"`
+	TPS           string `json:"tps,omitempty"`
+	Connections   string `json:"connections,omitempty"`
+	Uptime        string `json:"uptime,omitempty"`
+	LastUpdated   string `json:"last_updated"`
+	Error         string `json:"error,omitempty"`
+	GroupName     string `json:"group_name,omitempty"`
+	GroupState    string `json:"group_state,omitempty"`
+	GroupRole     string `json:"group_role,omitempty"`
+	GroupMemberID string `json:"group_member_id,omitempty"`
+	GroupMembers  int    `json:"group_members,omitempty"`
+	GroupOnline   int    `json:"group_online,omitempty"`
+	GroupQuorum   bool   `json:"group_quorum,omitempty"`
 }
 
 type clusterTopologyEdge struct {
-	SourceIP   string `json:"source_ip"`
-	SourcePort int    `json:"source_port"`
-	TargetIP   string `json:"target_ip"`
-	TargetPort int    `json:"target_port"`
-	SourceName string `json:"source_name,omitempty"`
-	TargetName string `json:"target_name,omitempty"`
-	IORunning  string `json:"io_running,omitempty"`
-	SQLRunning string `json:"sql_running,omitempty"`
-	Lag        string `json:"lag,omitempty"`
-	SQLDelay   int    `json:"sql_delay"`
-	LastError  string `json:"last_error,omitempty"`
+	SourceIP        string `json:"source_ip"`
+	SourcePort      int    `json:"source_port"`
+	TargetIP        string `json:"target_ip"`
+	TargetPort      int    `json:"target_port"`
+	SourceName      string `json:"source_name,omitempty"`
+	TargetName      string `json:"target_name,omitempty"`
+	IORunning       string `json:"io_running,omitempty"`
+	SQLRunning      string `json:"sql_running,omitempty"`
+	Lag             string `json:"lag,omitempty"`
+	SQLDelay        int    `json:"sql_delay"`
+	LastError       string `json:"last_error,omitempty"`
+	ReplicationType string `json:"replication_type,omitempty"`
 }
 
 // HandleTopology 返回指定集群的 MySQL 节点与实时复制关系；没有实例时返回空拓扑而非错误。
@@ -173,6 +182,8 @@ func (h *ClusterTopologyHandler) buildAt(ctx context.Context, cluster string, ra
 				if edge, ok := topologyEdgeFromMetric(*node, metric.Value); ok {
 					view.Edges = append(view.Edges, edge)
 				}
+			case "mysql_group_replication_status":
+				applyTopologyGroupReplication(node, metric.Value)
 			case "mysql_qps":
 				node.QPS = topologyString(metric.Value)
 			case "mysql_tps":
@@ -199,6 +210,11 @@ func (h *ClusterTopologyHandler) buildAt(ctx context.Context, cluster string, ra
 	for i := range view.Nodes {
 		node := &view.Nodes[i]
 		key := topologyEndpoint(node.IP, node.Port)
+		if node.GroupRole != "" {
+			node.Role = "MGR_" + strings.ToUpper(node.GroupRole)
+			view.Architecture = "mgr_router"
+			continue
+		}
 		switch {
 		case incoming[key] && outgoing[key]:
 			node.Role = "M/S"
@@ -208,6 +224,31 @@ func (h *ClusterTopologyHandler) buildAt(ctx context.Context, cluster string, ra
 			node.Role = "S"
 		case strings.EqualFold(node.ReadOnly, "true") || strings.EqualFold(node.ReadOnly, "on"):
 			node.Role = "readonly"
+		}
+	}
+	if view.Architecture == "mgr_router" {
+		// SHOW REPLICA STATUS can expose the internal distributed-recovery
+		// channel. It is not an asynchronous business topology edge.
+		view.Edges = view.Edges[:0]
+		var primary *clusterTopologyNode
+		for i := range view.Nodes {
+			if strings.EqualFold(view.Nodes[i].GroupRole, "PRIMARY") && strings.EqualFold(view.Nodes[i].GroupState, "ONLINE") {
+				primary = &view.Nodes[i]
+				break
+			}
+		}
+		if primary != nil {
+			for i := range view.Nodes {
+				target := &view.Nodes[i]
+				if target.MachineID == primary.MachineID || target.GroupName != primary.GroupName {
+					continue
+				}
+				view.Edges = append(view.Edges, clusterTopologyEdge{
+					SourceIP: primary.IP, SourcePort: primary.Port, TargetIP: target.IP, TargetPort: target.Port,
+					SourceName: primary.Name, TargetName: target.Name, IORunning: target.GroupState,
+					SQLRunning: target.GroupState, ReplicationType: "group_replication",
+				})
+			}
 		}
 	}
 	instanceSelector := ""
@@ -229,6 +270,22 @@ func (h *ClusterTopologyHandler) buildAt(ctx context.Context, cluster string, ra
 	}
 	view.Overview = h.buildOverview(ctx, cluster, overviewNodes, rangeMinutes, endAt, instanceSelector)
 	return view, nil
+}
+
+func applyTopologyGroupReplication(node *clusterTopologyNode, value any) {
+	status := topologyMap(value)
+	active, _ := status["active"].(bool)
+	if !active {
+		return
+	}
+	self := topologyMap(status["self"])
+	node.GroupName = topologyFirstString(status, "group_name")
+	node.GroupMemberID = topologyFirstString(self, "member_id", "MEMBER_ID")
+	node.GroupState = topologyFirstString(self, "member_state", "MEMBER_STATE")
+	node.GroupRole = topologyFirstString(self, "member_role", "MEMBER_ROLE")
+	node.GroupMembers, _ = topologyInt(status["member_count"])
+	node.GroupOnline, _ = topologyInt(status["online_count"])
+	node.GroupQuorum, _ = status["quorum"].(bool)
 }
 
 func (h *ClusterTopologyHandler) build(ctx context.Context, cluster string, ranges ...int) (clusterTopologyView, error) {

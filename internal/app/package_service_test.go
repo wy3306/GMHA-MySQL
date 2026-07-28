@@ -1,6 +1,9 @@
 package app
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"io"
 	"net/http"
@@ -15,6 +18,45 @@ type packageRoundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (fn packageRoundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return fn(req)
+}
+
+func perconaToolkitOfflineBundle(t *testing.T, includeDependencies bool) []byte {
+	t.Helper()
+	var output bytes.Buffer
+	gzipWriter := gzip.NewWriter(&output)
+	tarWriter := tar.NewWriter(gzipWriter)
+	files := []string{"toolkit/bin/pt-table-sync", "toolkit/bin/pt-archiver"}
+	if includeDependencies {
+		files = append(files,
+			"toolkit/vendor/perl5/DBI.pm",
+			"toolkit/vendor/perl5/DBD/mysql.pm",
+			"toolkit/vendor/perl5/IO/Socket/SSL.pm",
+			"toolkit/vendor/perl5/Term/ReadKey.pm",
+		)
+	}
+	for _, name := range files {
+		content := []byte("# test payload\n")
+		if err := tarWriter.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(content))}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tarWriter.Write(content); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tarWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gzipWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return output.Bytes()
+}
+
+func writePerconaToolkitOfflineBundle(t *testing.T, path string) {
+	t.Helper()
+	if err := os.WriteFile(path, perconaToolkitOfflineBundle(t, true), 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestPackageServiceListsPerconaToolkitPackages(t *testing.T) {
@@ -39,7 +81,27 @@ func TestPackageServiceListsPerconaToolkitPackages(t *testing.T) {
 	}
 }
 
-func TestResolvePerconaToolkitPackagePrefersNoarch(t *testing.T) {
+func TestSaveUploadRejectsIncompletePerconaToolkitOfflineBundle(t *testing.T) {
+	root := t.TempDir()
+	if err := ensurePackageDirectories(root); err != nil {
+		t.Fatal(err)
+	}
+	service := &PackageService{storagePath: root}
+	_, err := service.SaveUpload(
+		"percona-toolkit",
+		"x86_64",
+		"percona-toolkit-3.7.1-rocky8-offline-x86_64.tar.gz",
+		bytes.NewReader(perconaToolkitOfflineBundle(t, false)),
+	)
+	if err == nil || !strings.Contains(err.Error(), "missing Perl module payloads") {
+		t.Fatalf("expected incomplete PT bundle validation error, got %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(root, "percona-toolkit", "percona-toolkit-3.7.1-rocky8-offline-x86_64.tar.gz")); !os.IsNotExist(statErr) {
+		t.Fatalf("invalid bundle should be removed, stat error=%v", statErr)
+	}
+}
+
+func TestResolvePerconaToolkitPackageRejectsPlainSourceArchive(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "percona-toolkit")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -54,12 +116,27 @@ func TestResolvePerconaToolkitPackagePrefersNoarch(t *testing.T) {
 		}
 	}
 	service := &PackageService{storagePath: root}
-	name, err := service.ResolvePerconaToolkitPackage("aarch64", "Ubuntu 22.04")
-	if err != nil {
+	if _, err := service.ResolvePerconaToolkitPackage("aarch64", "Ubuntu 22.04"); err == nil ||
+		!strings.Contains(err.Error(), "offline Percona Toolkit") ||
+		!strings.Contains(err.Error(), "DBI") {
+		t.Fatalf("expected actionable offline bundle error, got %v", err)
+	}
+}
+
+func TestResolvePerconaToolkitPackageRejectsRenamedIncompleteBundle(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "percona-toolkit")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if name != "percona-toolkit-3.7.1-noarch.tar.gz" {
-		t.Fatalf("selected package %q", name)
+	name := "percona-toolkit-3.7.1-rocky8-offline-x86_64.tar.gz"
+	if err := os.WriteFile(filepath.Join(dir, name), perconaToolkitOfflineBundle(t, false), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	service := &PackageService{storagePath: root}
+	if _, err := service.ResolvePerconaToolkitPackage("x86_64", "Anolis OS 8"); err == nil ||
+		!strings.Contains(err.Error(), "missing Perl module payloads") {
+		t.Fatalf("expected renamed incomplete bundle to be rejected, got %v", err)
 	}
 }
 
@@ -85,7 +162,10 @@ func TestResolvePerconaToolkitPackagePrefersNativeOfflineBundle(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"percona-toolkit-3.7.1-noarch.tar.gz", "percona-toolkit-3.7.1-linux-offline-x86_64.tar.gz"} {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte("package"), 0o644); err != nil {
+		path := filepath.Join(dir, name)
+		if strings.Contains(name, "offline") {
+			writePerconaToolkitOfflineBundle(t, path)
+		} else if err := os.WriteFile(path, []byte("package"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -109,9 +189,7 @@ func TestResolvePerconaToolkitPackageMatchesLinuxFamily(t *testing.T) {
 		"percona-toolkit-3.7.1-ubuntu22-offline-x86_64.tar.gz",
 		"percona-toolkit-3.7.1-rocky9-offline-x86_64.tar.gz",
 	} {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte("package"), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		writePerconaToolkitOfflineBundle(t, filepath.Join(dir, name))
 	}
 	service := &PackageService{storagePath: root}
 	name, err := service.ResolvePerconaToolkitPackage("x86_64", "Ubuntu 22.04.5 LTS")
@@ -119,6 +197,28 @@ func TestResolvePerconaToolkitPackageMatchesLinuxFamily(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(name, "ubuntu22") {
+		t.Fatalf("selected package %q", name)
+	}
+}
+
+func TestResolvePerconaToolkitPackageRecognizesAnolisAsRHELFamily(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "percona-toolkit")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{
+		"percona-toolkit-3.7.1-ubuntu22-offline-x86_64.tar.gz",
+		"percona-toolkit-3.7.1-anolis8-offline-x86_64.tar.gz",
+	} {
+		writePerconaToolkitOfflineBundle(t, filepath.Join(dir, name))
+	}
+	service := &PackageService{storagePath: root}
+	name, err := service.ResolvePerconaToolkitPackage("x86_64", "Anolis OS 8.8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(name, "anolis8") {
 		t.Fatalf("selected package %q", name)
 	}
 }
@@ -306,7 +406,7 @@ func TestOfficialCatalogCoversMySQLTools(t *testing.T) {
 			t.Fatalf("incomplete catalog entry: %#v", item)
 		}
 	}
-	for _, category := range []string{"mysql", "mysql-router", "xtrabackup", "percona-toolkit", "binlog2sql", "mycat", "proxysql", "sysbench"} {
+	for _, category := range []string{"mysql", "mysql-shell", "mysql-router", "xtrabackup", "percona-toolkit", "binlog2sql", "mycat", "proxysql", "sysbench"} {
 		if !categories[category] {
 			t.Fatalf("official catalog is missing %s", category)
 		}
@@ -352,7 +452,7 @@ func TestFetchPackageBundleDownloadsRecommendedOfficialItems(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.Complete || len(result.Results) != 4 {
+	if !result.Complete || len(result.Results) != 5 {
 		t.Fatalf("unexpected bundle result: %#v", result)
 	}
 	for _, item := range result.Results {

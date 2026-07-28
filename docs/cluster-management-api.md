@@ -120,12 +120,16 @@ Content-Type: application/json
 | POST | `/clusters/{cluster_name}/architecture/start` | 启动架构调整或 VIP 漂移 | 高 |
 | GET | `/clusters/{cluster_name}/architecture/{run_id}` | 查询执行状态 | 只读 |
 | POST | `/clusters/{cluster_name}/architecture/{run_id}/force` | 复制未追平时强制继续 | 极高 |
+| GET | `/clusters/{cluster_name}/mgr` | 查询 MGR 成员、Quorum、AdminAPI 与 Router 状态 | 只读 |
+| POST | `/clusters/{cluster_name}/mgr/actions` | 执行 MGR 专属管理操作 | 高/极高 |
 | POST | `/clusters/{cluster_name}/failover/plan` | 生成故障切换计划 | 只读 |
 | POST | `/clusters/{cluster_name}/failover/start` | 启动受保护的故障切换 | 极高 |
 | GET | `/clusters/{cluster_name}/failover/{failover_id}` | 查询故障切换状态 | 只读 |
 | POST | `/clusters/{cluster_name}/bootstrap` | 组合安装、架构和 VIP 初始化 | 极高 |
 
 架构预检与启动使用同一个请求结构。客户端必须先调用 `plan`，展示 `blocking_reasons`、`warnings` 和 `steps`，只有 `executable=true` 才能在审批后调用 `start`。
+
+支持的架构值包括 `standalone`、`master_slave`、`dual_master`、`multi_master` 与 `mgr_router`。`mgr_router` 使用 3–9 个奇数 MySQL 8.0.17+ 成员、恰好一个首选 PRIMARY，并通过 Manager 可信制品库部署 MySQL Shell 与 MySQL Router；它不使用数据库 VIP。
 
 ```json
 {
@@ -141,6 +145,42 @@ Content-Type: application/json
 }
 ```
 
+MGR + MySQL Router 示例：
+
+```json
+{
+  "architecture": "mgr_router",
+  "preferred_new_master_machine_id": "machine-01",
+  "mgr_port": 33061,
+  "router_port": 6446,
+  "move_vip": false,
+  "root_passwords": {
+    "machine-01": "请通过安全表单提供",
+    "machine-02": "请通过安全表单提供",
+    "machine-03": "请通过安全表单提供"
+  },
+  "nodes": [
+    {"machine_id":"machine-01","port":3306,"role":"M"},
+    {"machine_id":"machine-02","port":3306,"role":"S"},
+    {"machine_id":"machine-03","port":3306,"role":"S"}
+  ]
+}
+```
+
+执行器会依次验证 GTID/InnoDB/唯一键和 MGR 动态管理权限，冻结业务后建立数据与 GTID 屏障，再配置并启动 Group Replication：组合新装且无业务表时只清理空从节点的本地 GTID；已有业务数据时要求受管复制拓扑先追平且通过 PT 一致性校验，检测到分叉即停止。随后确认全部成员 `ONLINE` 且仅一个 `PRIMARY`，采用为 InnoDB Cluster 元数据，再在每个成员节点部署并验证 Router。一次性 root 凭据可按节点提供，用于补齐旧管理账号；未提供时，执行前会要求 Agent 管理账号已具备所需权限。`router_port` 是经典协议读写端点，下一端口是经典协议只读端点；Router 还会保留随后两个 X 协议端口，因此基础端口最大为 65532。现有 MGR 的手工 PRIMARY 切换和集群滚动升级都复用组内选主，不迁移 VIP。
+
+MGR 管理页与接口提供以下专属操作：
+
+- `set_primary`：目标必须是 `ONLINE SECONDARY`，确认文本为 `SET PRIMARY {machine_id}`。
+- `rejoin_member`：集群必须仍有 Quorum、目标 MySQL 可达且不为 `ONLINE`，确认文本为 `REJOIN {machine_id}`。
+- `rescan_metadata`：同步实际 Group Replication 成员与 InnoDB Cluster 元数据，确认文本为 `RESCAN {cluster_name}`。
+- `rotate_recovery_passwords`：仅在全部成员 `ONLINE` 且存在唯一 PRIMARY 时轮换 AdminAPI 内部恢复账户，确认文本为 `ROTATE RECOVERY {cluster_name}`。
+- `reboot_complete_outage`：仅在零成员 `ONLINE` 且所有成员 MySQL 均可达时执行，确认文本为 `REBOOT MGR {cluster_name}`。服务端不传 `force`，由 AdminAPI 校验 GTID 超集与成员可达性。
+
+所有写操作都会取得与架构调整、故障切换、滚动升级和 VIP 共用的集群互斥锁，并在执行期间续租；MySQL Shell 命令完成后会从任务记录中脱敏。状态接口在每个注册实例上直接读取成员角色、只读保护、应用队列和冲突数；存在 `ONLINE` 成员时再读取 AdminAPI 的扩展状态、Router 注册列表与 Router 选项。
+
+仓库提供 `scripts/mgr_router_smoke.sh` 作为容器化验收：它使用可信制品目录中的 MySQL Router，创建三节点单主 MGR、采用 InnoDB Cluster 元数据、验证 Router 读写与只读端口，并覆盖 PRIMARY 停机自动选主、Router 续写、AdminAPI PRIMARY 切换、元数据重扫、恢复账户轮换、成员重新加入，以及从全组停机状态恢复。脚本只创建带 `gmha-mgr-accept-` 前缀的临时容器与网络，结束后自动清理。
+
 ## 5. 集群备份
 
 | 方法 | 路径 | 作用 |
@@ -154,6 +194,8 @@ Content-Type: application/json
 | POST | `/backup/runs/{run_id}/restore` | 创建恢复任务 |
 
 恢复必须携带精确确认短语 `RESTORE {run_id}` 或 `FLASHBACK {run_id}`，具体取决于恢复模式。
+
+MGR 成员的物理恢复会在启动后等待其重新加入原复制组，并验证原成员数、唯一 PRIMARY 与空应用队列；任一条件未满足即回滚原目录。活动 MGR 不允许在单个成员上执行时间点恢复或异步 `pt-table-sync` 修复，这类操作必须恢复整个复制组或恢复到隔离集群。
 
 `POST /backup/cluster-runs` 只接收 `{"clusters":["prod"]}`，复用服务端策略中保存的凭据。响应中的 `parent_task_id` 是统一父任务；`items[].task_id` 是各策略的子任务。密码不会出现在 AI 对话、AI 计划或该请求中。
 

@@ -50,7 +50,7 @@ func (h *TaskHandler) HandleTasks(w http.ResponseWriter, r *http.Request) {
 		}
 		if r.URL.Query().Get("stats") == "true" {
 			stats := map[string]int{}
-			for _, status := range []string{"all", "running", "success", "failed"} {
+			for _, status := range []string{"all", "running", "success", "failed", "skipped"} {
 				result, err := h.service.ListTaskPage(r.Context(), app.TaskListQuery{Limit: 1, Statuses: taskStatusFilter(status)})
 				if err != nil {
 					writeError(w, http.StatusInternalServerError, err)
@@ -132,6 +132,26 @@ func (h *TaskHandler) HandleTasks(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// HandleTaskControl applies server-authorized task-center actions. The service
+// re-evaluates capability and confirmation at execution time.
+func (h *TaskHandler) HandleTaskControl(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var req app.TaskControlRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, errors.New("invalid task control request"))
+		return
+	}
+	result, err := h.service.ControlTask(r.Context(), req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
 func taskStatusFilter(value string) []taskdomain.Status {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "running":
@@ -140,6 +160,8 @@ func taskStatusFilter(value string) []taskdomain.Status {
 		return []taskdomain.Status{taskdomain.StatusSuccess}
 	case "failed":
 		return []taskdomain.Status{taskdomain.StatusFailed}
+	case "skipped":
+		return []taskdomain.Status{taskdomain.StatusSkipped}
 	default:
 		return nil
 	}
@@ -647,14 +669,18 @@ func (h *TaskHandler) HandleClusterAutomationResults(w http.ResponseWriter, r *h
 			result.Rows = append(result.Rows, row)
 			continue
 		}
-		if detail.Task.Status != taskdomain.StatusSuccess && detail.Task.Status != taskdomain.StatusFailed {
+		if !taskdomain.IsTerminalStatus(detail.Task.Status) {
 			result.Ready = false
 			result.Pending++
 			result.Rows = append(result.Rows, row)
 			continue
 		}
-		if detail.Task.Status == taskdomain.StatusFailed {
-			row.Error = automationTaskFailure(detail)
+		if detail.Task.Status == taskdomain.StatusFailed || detail.Task.Status == taskdomain.StatusSkipped {
+			if detail.Task.Status == taskdomain.StatusSkipped {
+				row.Error = "task was skipped before dispatch"
+			} else {
+				row.Error = automationTaskFailure(detail)
+			}
 			result.Failed++
 			result.Rows = append(result.Rows, row)
 			continue
@@ -804,15 +830,18 @@ var mysqlArchiveUnsafeWherePattern = regexp.MustCompile(`(?i)(;|--|#[^\n]*|/\*|\
 var mysqlPrivilegeSet = map[string]bool{
 	"SELECT": true, "INSERT": true, "UPDATE": true, "DELETE": true, "CREATE": true, "CREATE USER": true, "ALTER": true, "DROP": true,
 	"SHOW VIEW": true, "TRIGGER": true, "EVENT": true, "PROCESS": true, "RELOAD": true, "LOCK TABLES": true,
-	"REPLICATION CLIENT": true, "REPLICATION SLAVE": true, "SUPER": true, "CONNECTION_ADMIN": true, "SYSTEM_VARIABLES_ADMIN": true, "REPLICATION_SLAVE_ADMIN": true, "BACKUP_ADMIN": true, "CLONE_ADMIN": true,
+	"REPLICATION CLIENT": true, "REPLICATION SLAVE": true, "SUPER": true, "CONNECTION_ADMIN": true, "SYSTEM_VARIABLES_ADMIN": true, "REPLICATION_SLAVE_ADMIN": true, "REPLICATION_APPLIER": true, "BACKUP_ADMIN": true, "CLONE_ADMIN": true, "GROUP_REPLICATION_ADMIN": true, "PERSIST_RO_VARIABLES_ADMIN": true,
 }
 
 var mysqlDynamicPrivileges = map[string]bool{
-	"CONNECTION_ADMIN":        true,
-	"SYSTEM_VARIABLES_ADMIN":  true,
-	"REPLICATION_SLAVE_ADMIN": true,
-	"BACKUP_ADMIN":            true,
-	"CLONE_ADMIN":             true,
+	"CONNECTION_ADMIN":           true,
+	"SYSTEM_VARIABLES_ADMIN":     true,
+	"REPLICATION_SLAVE_ADMIN":    true,
+	"REPLICATION_APPLIER":        true,
+	"BACKUP_ADMIN":               true,
+	"CLONE_ADMIN":                true,
+	"GROUP_REPLICATION_ADMIN":    true,
+	"PERSIST_RO_VARIABLES_ADMIN": true,
 }
 
 func validateClusterAutomationRequest(req clusterAutomationRequest) error {
@@ -1879,6 +1908,11 @@ func (h *TaskHandler) HandleMySQLParameters(w http.ResponseWriter, r *http.Reque
 			return
 		}
 	}
+	serverID, changesServerID, validationErr := mysqlParameterServerIDChange(changes)
+	if validationErr != nil {
+		writeError(w, http.StatusBadRequest, validationErr)
+		return
+	}
 	requiresRestart := false
 	for _, change := range changes {
 		if !mysqlParameterIsDynamic(change.Name) {
@@ -1921,6 +1955,25 @@ func (h *TaskHandler) HandleMySQLParameters(w http.ResponseWriter, r *http.Reque
 	if len(plans) == 0 {
 		writeError(w, http.StatusBadRequest, errors.New("at least one target instance is required"))
 		return
+	}
+	if changesServerID {
+		if len(targets) != 1 || len(plans) != 1 {
+			writeError(w, http.StatusBadRequest, errors.New("server_id 必须按单个实例修改，不能向整个集群写入同一个值"))
+			return
+		}
+		targetKey := strings.TrimSpace(targets[0].Machine) + ":" + strconv.Itoa(targets[0].Port)
+		restartKey := ""
+		if len(req.RestartTargets) == 1 {
+			restartKey = strings.TrimSpace(req.RestartTargets[0].Machine) + ":" + strconv.Itoa(req.RestartTargets[0].Port)
+		}
+		if len(req.RestartTargets) != 1 || restartKey != targetKey {
+			writeError(w, http.StatusConflict, errors.New("修改 server_id 必须只重启当前实例并完成生效校验"))
+			return
+		}
+		if err := h.service.ValidateMySQLServerIDChange(r.Context(), targets[0].Machine, targets[0].Port, uint32(serverID)); err != nil {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
 	}
 
 	var parent app.TaskDetail
@@ -2059,12 +2112,16 @@ func (h *TaskHandler) createMySQLParameterTask(ctx context.Context, target mysql
 	if err != nil {
 		return app.TaskDetail{}, err
 	}
-	go func(taskID string) {
+	serverID, changesServerID, _ := mysqlParameterServerIDChange(changes)
+	go func(taskID, machineID string, port, updatedServerID int, syncServerID bool) {
 		finished, waitErr := h.service.WaitForTask(context.Background(), taskID, 5*time.Minute)
 		if waitErr == nil && (finished.Task.Status == taskdomain.StatusSuccess || finished.Task.Status == taskdomain.StatusFailed) {
 			_ = h.service.RedactExecTaskCommand(context.Background(), taskID)
 		}
-	}(detail.Task.ID)
+		if waitErr == nil && finished.Task.Status == taskdomain.StatusSuccess && syncServerID {
+			_ = h.service.UpdateMySQLInstanceServerID(context.Background(), machineID, port, updatedServerID)
+		}
+	}(detail.Task.ID, machine.ID, target.Port, serverID, changesServerID)
 	return detail, nil
 }
 
@@ -2126,6 +2183,14 @@ func mysqlParameterCommand(client string, req mysqlParameterTaskRequest) (string
 	name := strings.ToLower(strings.TrimSpace(req.Name))
 	if !mysqlParameterPattern.MatchString(name) {
 		return "", "", "", "", errors.New("invalid MySQL parameter name")
+	}
+	if name == "server_id" {
+		if req.Action == "delete" {
+			return "", "", "", "", errors.New("server_id 不能删除，只能设置为唯一的正整数")
+		}
+		if _, err := parseMySQLServerID(req.Value); err != nil {
+			return "", "", "", "", err
+		}
 	}
 	configName, configValue, err := mysqlParameterForVersion(name, req.Value, req.Version)
 	if err != nil {
@@ -2318,6 +2383,14 @@ END {
 
 func mysqlParameterBatchCommand(client string, target mysqlParameterTargetRequest, changes []mysqlParameterChangeRequest, restart bool) (string, error) {
 	parts := make([]string, 0, len(changes)+1)
+	serverID, changesServerID, err := mysqlParameterServerIDChange(changes)
+	if err != nil {
+		return "", err
+	}
+	if changesServerID {
+		query := "SELECT COALESCE(MAX(CASE WHEN MEMBER_ID=@@server_uuid AND MEMBER_STATE IN ('ONLINE','RECOVERING') THEN MEMBER_STATE END),'') FROM performance_schema.replication_group_members"
+		parts = append(parts, "if ! mgr_state=$("+client+" --execute="+shellQuote(query)+"); then echo 'GMHA_SERVER_ID_PREFLIGHT_FAILED: unable to verify MGR membership' >&2; exit 1; fi; [ -z \"$mgr_state\" ] || { echo 'GMHA_SERVER_ID_BLOCKED: active MGR member must use the architecture adjustment workflow' >&2; exit 79; }")
+	}
 	for _, change := range changes {
 		applyMode := "config"
 		if mysqlParameterIsDynamic(change.Name) {
@@ -2341,6 +2414,9 @@ func mysqlParameterBatchCommand(client string, target mysqlParameterTargetReques
 			return "", errors.New("invalid systemd unit")
 		}
 		parts = append(parts, fmt.Sprintf("systemctl restart %s && systemctl is-active %s && %s --execute=%s", shellQuote(unit), shellQuote(unit), client, shellQuote("SELECT CONCAT('GMHA_RESTARTED_VERSION\\t', @@version)")))
+		if changesServerID {
+			parts = append(parts, fmt.Sprintf("effective_server_id=$(%s --execute=%s) && [ \"$effective_server_id\" = %s ] || { echo \"GMHA_SERVER_ID_MISMATCH: expected %d, got ${effective_server_id:-unavailable}\" >&2; exit 1; }; printf 'GMHA_SERVER_ID_VERIFIED\\t%%s\\n' \"$effective_server_id\"", client, shellQuote("SELECT @@server_id"), shellQuote(strconv.Itoa(serverID)), serverID))
+		}
 	}
 	if len(parts) == 0 {
 		return "", errors.New("parameter task has no changes or restart action")
@@ -2365,6 +2441,27 @@ var dynamicMySQLParameterNames = map[string]struct{}{
 func mysqlParameterIsDynamic(name string) bool {
 	_, ok := dynamicMySQLParameterNames[strings.ToLower(strings.TrimSpace(name))]
 	return ok
+}
+
+func parseMySQLServerID(value string) (int, error) {
+	parsed, err := strconv.ParseUint(strings.TrimSpace(value), 10, 32)
+	if err != nil || parsed == 0 {
+		return 0, errors.New("server_id 必须是 1 到 4294967295 之间的整数")
+	}
+	return int(parsed), nil
+}
+
+func mysqlParameterServerIDChange(changes []mysqlParameterChangeRequest) (int, bool, error) {
+	for _, change := range changes {
+		if strings.EqualFold(strings.TrimSpace(change.Name), "server_id") {
+			if strings.TrimSpace(change.Action) == "delete" {
+				return 0, true, errors.New("server_id 不能删除，只能设置为唯一的正整数")
+			}
+			serverID, err := parseMySQLServerID(change.Value)
+			return serverID, true, err
+		}
+	}
+	return 0, false, nil
 }
 
 func (h *TaskHandler) HandleCreateMySQLUninstallTask(w http.ResponseWriter, r *http.Request) {
@@ -2490,6 +2587,21 @@ func (h *TaskHandler) HandleMySQLPackages(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, http.StatusOK, items)
+}
+
+// HandleLinuxCompatibility returns the authoritative pre-install Linux support
+// tier for one managed machine.
+func (h *TaskHandler) HandleLinuxCompatibility(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	report, err := h.service.GetLinuxCompatibility(r.Context(), r.URL.Query().Get("machine"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, report)
 }
 
 // HandleMySQLPackageDownload 处理 MySQL 安装包下载请求，从本地 software 目录提供文件。

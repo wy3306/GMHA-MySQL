@@ -55,6 +55,7 @@ func (s *HAService) startArchitectureAdjustment(ctx, executionCtx context.Contex
 	if !hasReplicationUser {
 		req.ReplicationUser, req.ReplicationPassword = s.architectureManagementAccount(ctx)
 	}
+	req = normalizeMGRRouterRequest(clusterID, req)
 	plan, err := s.PlanArchitectureAdjustment(ctx, clusterID, req)
 	if err != nil {
 		return hadomain.ArchitectureRun{}, err
@@ -262,8 +263,11 @@ func (s *HAService) executeArchitectureAdjustment(ctx context.Context, runs arch
 		s.succeedArchitectureRun(ctx, runs, &run)
 		return
 	}
-	if strings.TrimSpace(req.RootPassword) != "" && len(req.RootPasswords) == 0 {
+	if strings.TrimSpace(req.RootPassword) != "" || len(req.RootPasswords) > 0 {
 		managementUser, managementPassword := s.architectureManagementAccount(ctx)
+		if req.FreshInstall && strings.TrimSpace(req.ReplicationUser) != "" && req.ReplicationPassword != "" {
+			managementUser, managementPassword = req.ReplicationUser, req.ReplicationPassword
+		}
 		if err := s.runArchitectureStep(ctx, runs, &run, "repair_management_privileges", func() ([]string, error) {
 			return s.repairArchitectureManagementPrivileges(ctx, req, machines, managementUser, managementPassword)
 		}); err != nil {
@@ -272,6 +276,23 @@ func (s *HAService) executeArchitectureAdjustment(ctx context.Context, runs arch
 		// Root is a one-time bootstrap credential. Every architecture operation
 		// after this point must prove that the Agent-managed MHA account works.
 		req.RootPassword = ""
+	}
+	if req.Architecture == hadomain.ArchitectureMGRRouter {
+		if err := s.executeMGRRouterArchitecture(ctx, runs, &run, req, machines); err != nil {
+			return
+		}
+		select {
+		case lockErr := <-lockErrors:
+			s.failArchitectureRun(context.Background(), runs, &run, "renew_lock", lockErr)
+			return
+		default:
+		}
+		if err := releaseLock(); err != nil {
+			s.failArchitectureRun(ctx, runs, &run, "release_lock", err)
+			return
+		}
+		s.succeedArchitectureRun(ctx, runs, &run)
+		return
 	}
 	if err := s.runArchitectureStep(ctx, runs, &run, "preflight", func() ([]string, error) {
 		return s.runOnArchitectureNodes(ctx, req.Nodes, machines, func(node hadomain.ArchitectureNodeRequest, _ machinedomain.Machine) string {
@@ -1470,7 +1491,7 @@ func (s *HAService) runOneArchitectureCommand(ctx context.Context, machine machi
 
 func (s *HAService) runOneArchitectureProbe(ctx context.Context, machine machinedomain.Machine, command string) (string, string, error) {
 	detail, err := s.tasks.CreateExecTaskWithOptions(ctx, machine.IP, command, ExecTaskOptions{
-		Operation: "mysql_architecture_step", DisplayName: "MySQL 架构调整子任务", StepName: "执行数据库架构调整命令",
+		Internal: true, Operation: "mysql_architecture_step", DisplayName: "MySQL 架构调整子任务", StepName: "执行数据库架构调整命令",
 	})
 	if err != nil {
 		return "", "", err
@@ -1480,10 +1501,7 @@ func (s *HAService) runOneArchitectureProbe(ctx context.Context, machine machine
 		return detail.Task.ID, "", err
 	}
 	defer func() { _ = s.tasks.RedactExecTaskCommand(context.Background(), detail.Task.ID) }()
-	output := ""
-	if len(completed.Steps) > 0 {
-		output = completed.Steps[len(completed.Steps)-1].Message
-	}
+	output := architectureProbeOutput(completed)
 	if completed.Task.Status != taskdomain.StatusSuccess {
 		message := strings.TrimSpace(output)
 		if message == "" {
@@ -1492,6 +1510,33 @@ func (s *HAService) runOneArchitectureProbe(ctx context.Context, machine machine
 		return detail.Task.ID, output, fmt.Errorf("agent task %s failed: %s", detail.Task.ID, message)
 	}
 	return detail.Task.ID, output, nil
+}
+
+func architectureProbeOutput(detail TaskDetail) string {
+	logs := make([]string, 0)
+	errors := make([]string, 0)
+	for _, event := range detail.Events {
+		content := strings.TrimSpace(event.Content)
+		if content == "" {
+			continue
+		}
+		switch event.EventType {
+		case taskdomain.EventLog:
+			logs = append(logs, content)
+		case taskdomain.EventError:
+			errors = append(errors, content)
+		}
+	}
+	if len(logs) > 0 {
+		return strings.Join(logs, "\n")
+	}
+	if len(errors) > 0 {
+		return errors[len(errors)-1]
+	}
+	if len(detail.Steps) > 0 {
+		return detail.Steps[len(detail.Steps)-1].Message
+	}
+	return ""
 }
 
 func (s *HAService) runOnArchitectureNodes(ctx context.Context, nodes []hadomain.ArchitectureNodeRequest, machines map[string]machinedomain.Machine, command func(hadomain.ArchitectureNodeRequest, machinedomain.Machine) string) ([]string, error) {
@@ -1512,15 +1557,8 @@ func (s *HAService) repairArchitectureManagementPrivileges(ctx context.Context, 
 		return nil, errors.New("MHA management account is not configured")
 	}
 	account := sqlLiteral(username) + "@'%'"
-	modernPrivileges := strings.Join([]string{
-		"SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "CREATE USER", "ALTER", "DROP", "SHOW VIEW", "TRIGGER", "EVENT",
-		"PROCESS", "RELOAD", "LOCK TABLES", "REPLICATION CLIENT", "REPLICATION SLAVE", "CONNECTION_ADMIN",
-		"SYSTEM_VARIABLES_ADMIN", "REPLICATION_SLAVE_ADMIN", "BACKUP_ADMIN", "CLONE_ADMIN",
-	}, ", ")
-	legacyPrivileges := strings.Join([]string{
-		"SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "CREATE USER", "ALTER", "DROP", "SHOW VIEW", "TRIGGER", "EVENT",
-		"PROCESS", "RELOAD", "LOCK TABLES", "REPLICATION CLIENT", "REPLICATION SLAVE", "SUPER",
-	}, ", ")
+	modernPrivileges := architectureManagementPrivileges(true)
+	legacyPrivileges := architectureManagementPrivileges(false)
 	instances, err := s.instances.List(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list MySQL instances for MHA privilege repair: %w", err)
@@ -1530,6 +1568,10 @@ func (s *HAService) repairArchitectureManagementPrivileges(ctx context.Context, 
 		byMachine[instance.MachineID] = append(byMachine[instance.MachineID], instance)
 	}
 	return s.runOnArchitectureNodes(ctx, req.Nodes, machines, func(node hadomain.ArchitectureNodeRequest, _ machinedomain.Machine) string {
+		rootPassword := architectureRootPassword(req, node.MachineID)
+		if strings.TrimSpace(rootPassword) == "" {
+			return "echo 'root password is missing for management privilege repair' >&2; exit 77"
+		}
 		instance, found := architectureInstanceForNode(node, byMachine[node.MachineID])
 		privileges := modernPrivileges
 		instanceVersion := instance.Version
@@ -1538,13 +1580,35 @@ func (s *HAService) repairArchitectureManagementPrivileges(ctx context.Context, 
 		}
 		if found && !mysqlapp.SupportsDynamicPrivilegeForVersion(instanceVersion, "CONNECTION_ADMIN") {
 			privileges = legacyPrivileges
+		} else if found && !mysqlapp.SupportsDynamicPrivilegeForVersion(instanceVersion, "REPLICATION_APPLIER") {
+			privileges = strings.ReplaceAll(privileges, ", REPLICATION_APPLIER", "")
 		}
 		sql := fmt.Sprintf("CREATE USER IF NOT EXISTS %s IDENTIFIED BY %s; GRANT %s ON *.* TO %s;", account, sqlLiteral(password), privileges, account)
-		if found && strings.TrimSpace(instance.SocketPath) != "" {
-			return mysqlArchitectureRootSocketClient(req.RootPassword, instance.SocketPath) + " --batch --raw --execute=" + shellQuote(sql)
+		if req.Architecture == hadomain.ArchitectureMGRRouter {
+			sql = fmt.Sprintf(
+				"CREATE USER IF NOT EXISTS %s IDENTIFIED BY %s; GRANT ALL PRIVILEGES ON *.* TO %s WITH GRANT OPTION; GRANT %s ON *.* TO %s WITH GRANT OPTION;",
+				account, sqlLiteral(password), account, privileges, account,
+			)
 		}
-		return mysqlArchitectureCommand(req.RootPassword, node.Port, sql)
+		if found && strings.TrimSpace(instance.SocketPath) != "" {
+			return mysqlArchitectureRootSocketClient(rootPassword, instance.SocketPath) + " --batch --raw --execute=" + shellQuote(sql)
+		}
+		return mysqlArchitectureCommand(rootPassword, node.Port, sql)
 	})
+}
+
+func architectureManagementPrivileges(modern bool) string {
+	privileges := []string{
+		"SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "CREATE USER", "ALTER", "DROP", "SHOW VIEW", "TRIGGER", "EVENT",
+		"PROCESS", "RELOAD", "LOCK TABLES", "REPLICATION CLIENT", "REPLICATION SLAVE",
+	}
+	if !modern {
+		return strings.Join(append(privileges, "SUPER"), ", ")
+	}
+	return strings.Join(append(privileges,
+		"CONNECTION_ADMIN", "SYSTEM_VARIABLES_ADMIN", "REPLICATION_SLAVE_ADMIN", "REPLICATION_APPLIER", "BACKUP_ADMIN", "CLONE_ADMIN",
+		"GROUP_REPLICATION_ADMIN", "PERSIST_RO_VARIABLES_ADMIN",
+	), ", ")
 }
 
 func (s *HAService) configureStandaloneArchitecture(ctx context.Context, req hadomain.ArchitectureAdjustmentRequest, machines map[string]machinedomain.Machine) ([]string, error) {

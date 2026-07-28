@@ -78,6 +78,7 @@ func (u *CreateCollectStaticInfoUsecase) Execute(ctx context.Context, req Create
 	stepID := fmt.Sprintf("task-step-%d", now.UnixNano())
 	task := taskdomain.Task{
 		ID:          taskID,
+		Visibility:  taskdomain.VisibilityInternal,
 		Type:        taskdomain.TypeCollectStaticInfo,
 		MachineID:   machine.ID,
 		AgentID:     agent.ID,

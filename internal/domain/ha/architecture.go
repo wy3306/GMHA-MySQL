@@ -7,6 +7,9 @@ const (
 	ArchitectureMasterSlave = "master_slave"
 	ArchitectureDualMaster  = "dual_master"
 	ArchitectureMultiMaster = "multi_master"
+	// ArchitectureMGRRouter is a single-primary MySQL Group Replication
+	// deployment whose stable client endpoints are provided by MySQL Router.
+	ArchitectureMGRRouter = "mgr_router"
 )
 
 const (
@@ -45,14 +48,25 @@ type ArchitectureAdjustmentRequest struct {
 	// RootPasswords is used only while executing a combined install/bootstrap
 	// flow. It is keyed by machine ID and is never serialized or persisted.
 	RootPasswords map[string]string `json:"-"`
+	// FreshInstall marks the private combined-install path. It permits clearing
+	// only empty secondary GTID histories before the first MGR bootstrap.
+	FreshInstall bool `json:"-"`
 	// MaintenanceDetachedMachineIDs keeps selected fenced nodes out of the
 	// post-promotion replication topology. It is intentionally execution-only:
 	// a higher-level maintenance workflow must reattach and verify those nodes
 	// before it can finish.
-	MaintenanceDetachedMachineIDs []string                  `json:"-"`
-	ReplicationUser               string                    `json:"replication_user,omitempty"`
-	ReplicationPassword           string                    `json:"replication_password,omitempty"`
-	Nodes                         []ArchitectureNodeRequest `json:"nodes"`
+	MaintenanceDetachedMachineIDs []string `json:"-"`
+	ReplicationUser               string   `json:"replication_user,omitempty"`
+	ReplicationPassword           string   `json:"replication_password,omitempty"`
+	// MGRGroupName is the Group Replication UUID. When omitted for a new group,
+	// the Manager derives a deterministic UUID from the cluster ID.
+	MGRGroupName string `json:"mgr_group_name,omitempty"`
+	// MGRPort is the XCom/Group Replication port on every member.
+	MGRPort int `json:"mgr_port,omitempty"`
+	// RouterPort is MySQL Router's classic read-write endpoint. The read-only
+	// endpoint is RouterPort+1; bootstrap also reserves the next two X ports.
+	RouterPort int                       `json:"router_port,omitempty"`
+	Nodes      []ArchitectureNodeRequest `json:"nodes"`
 }
 
 // ArchitecturePlanStep 是 Manager 必须按顺序执行的安全步骤。

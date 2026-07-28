@@ -397,6 +397,9 @@ func overviewArchitecture(roles map[string]int, total int) string {
 	if total == 0 {
 		return "尚未部署实例"
 	}
+	if roles["MGR_PRIMARY"] == 1 && roles["MGR_SECONDARY"] > 0 {
+		return fmt.Sprintf("MGR 单主 · %d 个成员 · MySQL Router", total)
+	}
 	primary := roles["M"] + roles["M/S"]
 	replica := roles["S"] + roles["M/S"] + roles["READONLY"]
 	switch {
