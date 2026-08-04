@@ -142,7 +142,7 @@ func isResourceMaintenanceMutation(path string) bool {
 		return true
 	case path == "/api/v1/clusters" || strings.HasSuffix(path, "/members") || strings.HasSuffix(path, "/machines"):
 		return true
-	case path == "/api/v1/manager/config" || path == "/api/v1/manager/database/test":
+	case path == "/api/v1/manager/config" || path == "/api/v1/manager/database/test" || path == "/api/v1/manager/database/wal":
 		return true
 	case path == "/api/v1/manager/ha/config" ||
 		path == "/api/v1/manager/ha/interfaces" ||

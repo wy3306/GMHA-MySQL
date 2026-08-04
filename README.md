@@ -1,9 +1,34 @@
-# GMHA 架构说明文档
+# GMHA
+
+GMHA（Go MySQL High Availability）是一套 Go 原生的 MySQL 高可用管理平台，覆盖机器纳管、Agent 部署、实例生命周期、性能诊断、备份恢复、告警、自动化任务以及主从/MGR 高可用运维。
+
+## 项目入口
+
+- [产品介绍网站](http://gmha.weiyaonas.club/)：功能概览、系统架构、产品截图与最新稳定版下载。
+- [在线演示网站](http://demo.weiyaonas.club/)：只读体验完整 GMHA 控制台，不会执行真实运维操作。
+- [GitHub Releases](https://github.com/wy3306/GMHA-MySQL/releases)：历史版本、Linux 安装包、独立升级制品与 SHA-256 校验文件。
 
 实例管理控制台 14 项操作的完整 HTTP 契约、异步结果读取方式与安全约束见 [实例管理 API 手册](docs/instance-management-api.md)。
 备份目标发现、策略管理、运行查询、批量备份以及物理恢复/时间点恢复/数据闪回的 HTTP 契约见 [备份恢复 API 手册](docs/backup-recovery-api.md)。
 
 ## 版本更新记录
+
+### V0.1.1（2026-08-04）
+
+更新内容：
+
+- Manager 控制台新增 SQLite WAL 空间维护页，展示主数据库、WAL、SHM 实际占用，并提供带确认的一键安全清理。
+- 新增 `GET/POST /api/v1/manager/database/wal`，清理使用当前数据库连接执行 `wal_checkpoint(TRUNCATE)`，不会在 Manager 运行时直接删除 WAL/SHM 文件。
+- Manager 本地状态目录支持通过 `GMHA_STATE_DIR` 隔离，包设置、升级任务、AI 密钥和运行时状态统一使用该目录。
+- 官网增加最新稳定版直达下载、只读演示入口和六大核心能力实机截图；README 增加产品介绍网站与演示网站入口。
+- 扩充 HTTP Router 全模块冒烟测试，并完成 SQLite WAL、MGR/Router 故障切换与恢复流程的发布验收。
+
+Bug 修复：
+
+- 修复 SQLite WAL 缺少安全维护入口，磁盘空间异常增长后只能停机或手工处理的问题。
+- 修复活跃读取事务阻塞 checkpoint 时清理结果不明确的问题；现在会保留 WAL 并提示结束长事务后重试。
+- 修复非 SQLite 元数据库的 WAL 状态接口可能错误解析并返回 MySQL/PostgreSQL DSN 路径、造成敏感连接信息泄露的问题。
+- 修复测试或并行 Manager 实例共用 `~/.gmha` 状态文件、可能污染真实运行配置的问题。
 
 ### V0.1.0（2026-07-28）
 
@@ -99,10 +124,10 @@ Release 程序包提供独立的 `gmha-web` 启动器。执行 `./start-web.sh` 
 本地构建 Linux x86_64 程序包：
 
 ```bash
-./scripts/build-release.sh V0.1.0
+./scripts/build-release.sh V0.1.1
 ```
 
-构建结果位于 `dist/gmha-V0.1.0-linux-amd64.tar.gz`，并同时生成 SHA-256 校验文件。
+构建结果位于 `dist/gmha-V0.1.1-linux-amd64.tar.gz`，并同时生成 SHA-256 校验文件。
 
 ## 数据库配置
 

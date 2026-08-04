@@ -20,6 +20,15 @@ func newTestManagerRuntimeService(t *testing.T, cfg ManagerRuntimeConfig) *Manag
 	}
 }
 
+func TestNewManagerRuntimeServiceUsesConfiguredStateDirectory(t *testing.T) {
+	stateDir := t.TempDir()
+	service := NewManagerRuntimeService(Config{StateDir: stateDir})
+	want := filepath.Join(stateDir, "manager-runtime.json")
+	if service.statePath != want {
+		t.Fatalf("statePath=%q want=%q", service.statePath, want)
+	}
+}
+
 func TestManagerRuntimeDiscoversHealthyServerWithoutStateFile(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v1/healthz" {

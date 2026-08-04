@@ -221,6 +221,8 @@ export const apiEndpoints = [
   endpoint('Manager 与升级', 'GET', '/manager/config', '读取 Manager 配置', { response: { listen_http: ':8080', listen_grpc: ':9100', database_driver: 'sqlite', db_path: './data/manager.db' } }),
   endpoint('Manager 与升级', 'PUT', '/manager/config', '保存 Manager 配置', { body: { listen_http: ':8080', listen_grpc: ':9100', manager_http_addr: 'http://10.0.0.10:8080', manager_grpc_addr: '10.0.0.10:9100', database_driver: 'mysql', database_host: '10.0.0.20', database_port: 3306, database_name: 'gmha', database_username: 'gmha', database_password: '请替换', test_token: 'database-test-token', agent_binary_path: './bin/agentd' }, response: { listen_http: ':8080', listen_grpc: ':9100', database_driver: 'mysql', database_host: '10.0.0.20', database_password_set: true }, note: '数据库发生变化时必须携带十分钟内检测成功返回的 test_token；密码和 DSN 不会回显。' }),
   endpoint('Manager 与升级', 'POST', '/manager/database/test', '测试 Manager 数据库连接', { body: { database_driver: 'mysql', database_host: '10.0.0.20', database_port: 3306, database_name: 'gmha', database_username: 'gmha', database_password: '请替换' }, response: { ok: true, message: '数据库连接成功，可以保存配置', test_token: 'database-test-token', driver: 'mysql', address: '10.0.0.20:3306/gmha' } }),
+  endpoint('Manager 与升级', 'GET', '/manager/database/wal', '读取 Manager SQLite WAL 占用', { response: { supported: true, driver: 'sqlite', journal_mode: 'wal', database_path: '/opt/gmha/data/manager.db', database_bytes: 6157848576, wal_bytes: 14910312, shm_bytes: 32768, updated_at: '2026-08-04T08:00:00Z' }, note: '返回当前运行实例的主库、WAL 和 SHM 物理文件大小。MySQL、PostgreSQL、内存 SQLite 或非 WAL 模式会返回 supported=false 和原因。' }),
+  endpoint('Manager 与升级', 'POST', '/manager/database/wal', '一键清理 Manager SQLite WAL', { body: { confirm: true }, response: { completed: true, busy: 0, log_frames: 0, checkpointed_frames: 0, released_bytes: 111847761800, before: { wal_bytes: 111862672112 }, after: { wal_bytes: 14910312 }, message: 'SQLite WAL checkpoint 已完成，日志文件已尝试截断' }, note: '接口不会直接删除 WAL 文件，而是在当前数据库连接上执行 wal_checkpoint(TRUNCATE)。confirm 必须为 true；若活跃读取事务阻塞 checkpoint，completed=false，应结束长事务后重试。' }),
   endpoint('Manager 与升级', 'POST', '/manager/start', '启动 Manager Runtime', { body: { config: { listen_http: ':8080', listen_grpc: ':9100' } }, response: { running: true, pid: 1234, config: {} } }),
   endpoint('Manager 与升级', 'POST', '/manager/restart', '重启 Manager Runtime', { body: { config: { listen_http: ':8080', listen_grpc: ':9100' } }, response: { running: true, pid: 1235, config: {} } }),
   endpoint('Manager 与升级', 'POST', '/manager/stop', '关闭当前 Manager Runtime', { response: { running: false }, note: '响应返回后当前进程延迟退出，控制台连接会中断；可由 systemd、启动器或其他 Manager 节点恢复。' }),
@@ -472,11 +474,11 @@ export const manualModules = [
     number: '17',
     title: 'Manager 控制台',
     scope: '平台运维',
-    summary: '管理 Manager 进程、账号式数据库配置、多节点高可用拓扑、VIP 漂移、内核重编译和版本升级。',
-    steps: ['单节点阶段选择数据库类型并填写地址、库名、账号和密码，检测成功后保存', '切换到 MySQL 或 PostgreSQL 共享数据库后启用 VIP', '从已纳管机器安装第二个 Manager 节点', '在拓扑中确认主备在线，并在维护窗口演练 VIP 漂移、节点重启和关闭', '通过制品升级版本，或输入 REBUILD 执行本机源码重编译'],
+    summary: '管理 Manager 进程、数据库配置与 SQLite WAL 空间、多节点高可用拓扑、VIP 漂移、内核重编译和版本升级。',
+    steps: ['单节点阶段选择数据库类型并填写地址、库名、账号和密码，检测成功后保存', 'SQLite 模式下查看主库、WAL 与 SHM 占用，WAL 异常增长时使用一键安全清理', '切换到 MySQL 或 PostgreSQL 共享数据库后启用 VIP', '从已纳管机器安装第二个 Manager 节点', '在拓扑中确认主备在线，并在维护窗口演练 VIP 漂移、节点重启和关闭', '通过制品升级版本，或输入 REBUILD 执行本机源码重编译'],
     principle: '多节点 Manager 共享同一元数据库，VIP 始终指向唯一 ACTIVE 节点；节点心跳、角色和运维任务共同构成控制平面拓扑。',
-    implementation: 'ManagerRuntimeService 负责本机进程和安全数据库切换，ManagerHAService 持久化节点与 VIP 拓扑并通过在线 Agent 安装和控制远端 systemd，UpgradeService 提供带备份和健康后检的升级与重编译。',
-    caution: 'SQLite 不能用于多节点；平台已有业务数据后禁止直接换库。VIP 漂移和关闭节点前应确认目标节点在线，数据库密码、DSN 和引导令牌不会在状态接口回显。'
+    implementation: 'ManagerRuntimeService 负责本机进程和安全数据库切换；DatabaseMaintenanceService 使用当前连接执行 wal_checkpoint(TRUNCATE)，返回清理前后实际文件大小；ManagerHAService 持久化节点与 VIP 拓扑并通过在线 Agent 安装和控制远端 systemd，UpgradeService 提供带备份和健康后检的升级与重编译。',
+    caution: '不要在 Manager 运行时手工删除 manager.db-wal 或 manager.db-shm；长读事务阻塞 checkpoint 时应先结束事务再重试。SQLite 不能用于多节点；VIP 漂移和关闭节点前应确认目标节点在线。'
   },
   {
     id: 'manager-ha',

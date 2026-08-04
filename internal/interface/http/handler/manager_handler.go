@@ -2,16 +2,20 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"gmha/internal/app"
 )
 
 // ManagerHandler 暴露 Manager 运行时控制台 API，复用 CLI 使用的 ManagerRuntimeService。
-type ManagerHandler struct{ runtime *app.ManagerRuntimeService }
+type ManagerHandler struct {
+	runtime     *app.ManagerRuntimeService
+	maintenance *app.DatabaseMaintenanceService
+}
 
-func NewManagerHandler(runtime *app.ManagerRuntimeService) *ManagerHandler {
-	return &ManagerHandler{runtime: runtime}
+func NewManagerHandler(runtime *app.ManagerRuntimeService, maintenance *app.DatabaseMaintenanceService) *ManagerHandler {
+	return &ManagerHandler{runtime: runtime, maintenance: maintenance}
 }
 
 func (h *ManagerHandler) HandleStatus(w http.ResponseWriter, r *http.Request) {
@@ -44,6 +48,48 @@ func (h *ManagerHandler) HandleDatabaseTest(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+func (h *ManagerHandler) HandleDatabaseWAL(w http.ResponseWriter, r *http.Request) {
+	if h.maintenance == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("数据库维护服务未初始化"))
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		status, err := h.maintenance.WALStatus(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, status)
+	case http.MethodPost:
+		var req struct {
+			Confirm bool `json:"confirm"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if !req.Confirm {
+			writeError(w, http.StatusBadRequest, errors.New("请确认执行 WAL 清理"))
+			return
+		}
+		result, err := h.maintenance.CleanupWAL(r.Context())
+		if err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, app.ErrWALCleanupUnsupported) {
+				status = http.StatusBadRequest
+			} else if errors.Is(err, app.ErrWALCleanupInProgress) {
+				status = http.StatusConflict
+			}
+			writeError(w, status, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
 }
 
 func (h *ManagerHandler) HandleConfig(w http.ResponseWriter, r *http.Request) {

@@ -20,3 +20,12 @@ test('Manager VIP has one workspace with scanned interface selection', () => {
   assert.match(source, /item\.recommended \? ' · 推荐'/)
   assert.doesNotMatch(source, /VIP 漂移至此/)
 })
+
+test('Manager database page exposes guarded one-click WAL maintenance', () => {
+  assert.match(source, /manager\/database\/wal/)
+  assert.match(source, /JSON\.stringify\(\{ confirm: true \}\)/)
+  assert.match(source, /一键清理 WAL/)
+  assert.match(source, /result\.completed/)
+  assert.match(source, /walStatus\.supported/)
+  assert.match(styles, /\.manager-wal-panel/)
+})

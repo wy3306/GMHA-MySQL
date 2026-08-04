@@ -11,25 +11,25 @@
     <meta property="og:type" content="website" />
     <meta property="og:locale" content="zh_CN" />
     <meta property="og:site_name" content="GMHA" />
-    <meta property="og:title" content="GMHA — Go 原生的 MySQL 高可用管理平台" />
+    <meta property="og:title" content="GMHA — MySQL 高可用管理平台" />
     <meta
       property="og:description"
       content="把纳管、监控、诊断、恢复与高可用，收拢到一个清晰的控制面。"
     />
     <meta property="og:url" content="http://gmha.weiyaonas.club/" />
-    <meta property="og:image" content="http://gmha.weiyaonas.club/og.png" />
+    <meta property="og:image" content="http://gmha.weiyaonas.club/og-v010.png" />
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="GMHA — Go 原生的 MySQL 高可用管理平台" />
+    <meta name="twitter:title" content="GMHA — MySQL 高可用管理平台" />
     <meta
       name="twitter:description"
       content="把纳管、监控、诊断、恢复与高可用，收拢到一个清晰的控制面。"
     />
-    <meta name="twitter:image" content="http://gmha.weiyaonas.club/og.png" />
+    <meta name="twitter:image" content="http://gmha.weiyaonas.club/og-v010.png" />
     <link rel="canonical" href="http://gmha.weiyaonas.club/" />
     <link rel="icon" href="/gmha-mark.svg" type="image/svg+xml" />
     <link rel="manifest" href="/site.webmanifest" />
-    <link rel="stylesheet" href="/styles.css" />
-    <title>GMHA — Go 原生的 MySQL 高可用管理平台</title>
+    <link rel="stylesheet" href="/styles.css?v=011" />
+    <title>GMHA — MySQL 高可用管理平台</title>
   </head>
   <body>
     <a class="skip-link" href="#main">跳到主要内容</a>
@@ -52,13 +52,20 @@
           <span class="sr-only">打开导航</span>
         </button>
         <nav class="site-nav" id="site-nav" aria-label="主导航" data-nav>
-          <a href="#capabilities">核心能力</a>
+          <a href="#product">功能展示</a>
           <a href="#architecture">系统架构</a>
-          <a href="#scenarios">适用场景</a>
-          <a href="https://github.com/wy3306/GMHA-MySQL" target="_blank" rel="noreferrer">
-            GitHub
-          </a>
-          <a class="nav-cta" href="#start">开始了解</a>
+          <a
+            href="https://github.com/wy3306/GMHA-MySQL"
+            target="_blank"
+            rel="noreferrer"
+          >GitHub</a>
+          <a class="nav-download" href="#download">下载 V0.1.1</a>
+          <a
+            class="nav-cta"
+            href="http://demo.weiyaonas.club"
+            target="_blank"
+            rel="noreferrer"
+          >在线体验</a>
         </nav>
       </div>
     </header>
@@ -74,26 +81,23 @@
               <span class="status-dot"></span>
               Go-native · MySQL High Availability
             </div>
-            <h1 class="reveal">
-              把 MySQL 高可用，
-              <span>收拢到一个控制面。</span>
-            </h1>
+            <h1 class="reveal"><span class="hero-title-main">MySQL&nbsp;高可用</span></h1>
             <p class="hero-lead reveal">
               GMHA 连接管理节点与数据库主机，让机器纳管、实例生命周期、性能诊断、备份恢复和故障转移在同一套工作流里自然发生。
             </p>
             <div class="hero-actions reveal">
-              <a class="button button-primary" href="#capabilities">
-                探索核心能力
-                <span aria-hidden="true">↗</span>
-              </a>
               <a
-                class="button button-secondary"
-                href="https://github.com/wy3306/GMHA-MySQL"
+                class="button button-primary"
+                href="http://demo.weiyaonas.club"
                 target="_blank"
                 rel="noreferrer"
               >
-                <span class="github-mark" aria-hidden="true">⌘</span>
-                查看 GitHub
+                在线体验 V0.1.1
+                <span aria-hidden="true">↗</span>
+              </a>
+              <a class="button button-secondary" href="#download">
+                <span class="download-mark" aria-hidden="true">↓</span>
+                下载安装包
               </a>
             </div>
             <div class="hero-proof reveal" aria-label="技术概览">
@@ -213,16 +217,68 @@
         </div>
       </section>
 
+      <section class="download-section" id="download">
+        <div class="shell">
+          <div class="download-panel reveal">
+            <div class="download-copy">
+              <div class="release-badge"><span></span> 最新稳定版 · V0.1.1</div>
+              <h2>下载即可部署</h2>
+              <p>
+                安装包由本站直接提供，包含 GMHA Manager 与 Agent。下载后可在 Linux
+                x86_64 环境中部署，无需跳转 GitHub。
+              </p>
+              <div class="download-actions">
+                <a
+                  class="button download-button"
+                  href="/downloads/gmha-V0.1.1-linux-amd64.tar.gz"
+                  download
+                >
+                  <span aria-hidden="true">↓</span>
+                  下载 GMHA V0.1.1
+                </a>
+                <a
+                  class="button button-secondary"
+                  href="http://demo.weiyaonas.club"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  先在线体验
+                  <span aria-hidden="true">↗</span>
+                </a>
+              </div>
+            </div>
+            <div class="release-card" aria-label="GMHA V0.1.1 安装包信息">
+              <div class="release-card-head">
+                <span class="package-icon">⌄</span>
+                <div>
+                  <strong>gmha-V0.1.1-linux-amd64.tar.gz</strong>
+                  <small>Linux · x86_64 · 27.9 MiB</small>
+                </div>
+              </div>
+              <dl>
+                <div><dt>版本</dt><dd>V0.1.1</dd></div>
+                <div><dt>发布日期</dt><dd>2026-08-04</dd></div>
+                <div><dt>格式</dt><dd>tar.gz</dd></div>
+              </dl>
+              <div class="checksum">
+                <span>SHA-256</span>
+                <code>8cd577da1a42b257d031bc92064982dfda773e747d85c93213745fec958c15ec</code>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
       <section class="section product-tour" id="product">
         <div class="shell">
           <div class="section-heading reveal">
             <div>
               <span class="kicker">01 · Product experience</span>
-              <h2>复杂系统，<br />也应该一眼看懂。</h2>
+              <h2>六大核心能力，<br />真实界面直观呈现。</h2>
             </div>
             <p>
-              GMHA 用一致的控制台承载运行状态、多集群自动化与 AI
-              辅助运维。信息密度足够高，但每一步都有清晰的上下文。
+              以下画面均来自在线演示环境，使用 1920×1080
+              原始分辨率采集。点击标签即可查看完整功能界面。
             </p>
           </div>
 
@@ -232,23 +288,47 @@
               type="button"
               role="tab"
               aria-selected="true"
-              data-screenshot="/screenshots/overview.png"
-              data-title="运行概览"
-              data-description="Manager、资源、Agent 与任务状态集中呈现，异常入口始终可见。"
+              data-screenshot="/screenshots/v010/flamegraph-1920.png"
+              data-title="Linux 火焰图"
+              data-description="按采样窗口记录 CPU 调用栈，支持持久化回看、搜索、缩放、导出和周期自动采集。"
             >
               <span>01</span>
-              <strong>运行概览</strong>
+              <strong>火焰图</strong>
             </button>
             <button
               class="product-tab"
               type="button"
               role="tab"
               aria-selected="false"
-              data-screenshot="/screenshots/automation.png"
-              data-title="集群自动化"
-              data-description="批量巡检、升级、参数变更、备份和脚本任务在同一个工作流中配置。"
+              data-screenshot="/screenshots/v010/database-inspection-1920.png"
+              data-title="数据库巡检"
+              data-description="标准与深度巡检覆盖可用性、负载、SQL 质量、GTID、Binlog、持久性和表结构。"
             >
               <span>02</span>
+              <strong>数据库巡检</strong>
+            </button>
+            <button
+              class="product-tab"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              data-screenshot="/screenshots/v010/memory-analysis-1920.png"
+              data-title="内存分析"
+              data-description="关联机器内存、MySQL 进程 RSS 与数据库内部模块，定位压力来源与持续增长。"
+            >
+              <span>03</span>
+              <strong>内存分析</strong>
+            </button>
+            <button
+              class="product-tab"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              data-screenshot="/screenshots/v010/automation-1920.png"
+              data-title="集群自动化"
+              data-description="跨集群批量执行采集、巡检、滚动升级、参数调整、备份和受控脚本任务。"
+            >
+              <span>04</span>
               <strong>集群自动化</strong>
             </button>
             <button
@@ -256,12 +336,24 @@
               type="button"
               role="tab"
               aria-selected="false"
-              data-screenshot="/screenshots/ai-operations.png"
+              data-screenshot="/screenshots/v010/ai-operations-1920.png"
               data-title="AI 运维中心"
-              data-description="AI 提出计划，安全闸门与人工审批决定执行，建议不会直接越权。"
+              data-description="AI 负责分析与规划，四级安全闸门、人工审批和任务审计控制真实执行。"
             >
-              <span>03</span>
+              <span>05</span>
               <strong>AI 运维中心</strong>
+            </button>
+            <button
+              class="product-tab"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              data-screenshot="/screenshots/v010/alerts-1920.png"
+              data-title="告警中心"
+              data-description="统一管理指标、规则、事件、降噪、通知队列和第三方推送，完整追踪告警链路。"
+            >
+              <span>06</span>
+              <strong>告警中心</strong>
             </button>
           </div>
 
@@ -273,10 +365,10 @@
             </div>
             <div class="screenshot-stage">
               <img
-                src="/screenshots/overview.png"
-                alt="GMHA 运行概览控制台"
-                width="1280"
-                height="720"
+                src="/screenshots/v010/flamegraph-1920.png"
+                alt="GMHA Linux 火焰图控制台"
+                width="1920"
+                height="1080"
                 loading="lazy"
                 data-product-image
               />
@@ -284,10 +376,10 @@
             <div class="product-caption" aria-live="polite">
               <div>
                 <span>当前界面</span>
-                <strong data-product-title>运行概览</strong>
+                <strong data-product-title>Linux 火焰图</strong>
               </div>
               <p data-product-description>
-                Manager、资源、Agent 与任务状态集中呈现，异常入口始终可见。
+                按采样窗口记录 CPU 调用栈，支持持久化回看、搜索、缩放、导出和周期自动采集。
               </p>
             </div>
           </div>
@@ -515,17 +607,20 @@
             <div class="start-copy">
               <span class="kicker">OPEN SOURCE · BUILT WITH GO</span>
               <h2>让 MySQL 高可用，<br />从可控开始。</h2>
-              <p>查看项目源码、架构说明与部署方式，开始了解 GMHA。</p>
+              <p>直接下载 V0.1.1 安装包，或先进入只读演示环境体验完整控制台。</p>
             </div>
-            <a
-              class="button button-light"
-              href="https://github.com/wy3306/GMHA-MySQL"
-              target="_blank"
-              rel="noreferrer"
-            >
-              前往 GitHub
-              <span aria-hidden="true">↗</span>
-            </a>
+            <div class="start-actions">
+              <a class="button button-light" href="/downloads/gmha-V0.1.1-linux-amd64.tar.gz" download>
+                下载 V0.1.1
+                <span aria-hidden="true">↓</span>
+              </a>
+              <a
+                class="button button-secondary"
+                href="http://demo.weiyaonas.club"
+                target="_blank"
+                rel="noreferrer"
+              >在线体验 <span aria-hidden="true">↗</span></a>
+            </div>
           </div>
         </div>
       </section>
@@ -541,6 +636,8 @@
         <div class="footer-links">
           <a href="#capabilities">核心能力</a>
           <a href="#architecture">架构</a>
+          <a href="#download">下载 V0.1.1</a>
+          <a href="http://demo.weiyaonas.club" target="_blank" rel="noreferrer">在线体验</a>
           <a href="https://github.com/wy3306/GMHA-MySQL" target="_blank" rel="noreferrer"
             >GitHub</a
           >
@@ -548,6 +645,6 @@
       </div>
     </footer>
 
-    <script src="/script.js" defer></script>
+    <script src="/script.js?v=011" defer></script>
   </body>
 </html>

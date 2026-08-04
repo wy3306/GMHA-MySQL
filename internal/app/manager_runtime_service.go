@@ -88,10 +88,9 @@ type DatabaseTestResult struct {
 	Address   string `json:"address"`
 }
 
-// NewManagerRuntimeService 创建 Manager 运行时服务实例，状态文件保存在 ~/.gmha/ 目录下。
+// NewManagerRuntimeService 创建 Manager 运行时服务实例，状态文件保存在配置的本地状态目录中。
 func NewManagerRuntimeService(cfg Config) *ManagerRuntimeService {
-	home, _ := os.UserHomeDir()
-	base := filepath.Join(home, ".gmha")
+	base := managerStateDirectory(cfg)
 	return &ManagerRuntimeService{
 		statePath:     filepath.Join(base, "manager-runtime.json"),
 		healthClient:  &http.Client{Timeout: 1200 * time.Millisecond},

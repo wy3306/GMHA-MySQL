@@ -32,6 +32,7 @@ type Config struct {
 	DBPath           string // 兼容旧版 SQLite 文件路径
 	DatabaseDriver   string // sqlite（默认）、mysql、postgres
 	DatabaseDSN      string // 外部数据库连接串；SQLite 为空时使用 DBPath
+	StateDir         string // Manager 本地状态目录；为空时使用 ~/.gmha
 	ManagerPublicKey string
 	AgentBinaryPath  string
 	ManagerHTTPAddr  string
@@ -55,6 +56,7 @@ type App struct {
 	PackageService        *PackageService
 	BackupService         *BackupService
 	AlertService          *AlertService
+	DatabaseMaintenance   *DatabaseMaintenanceService
 	ManagerRuntime        *ManagerRuntimeService
 	ManagerHA             *ManagerHAService
 	UpgradeService        *UpgradeService
@@ -243,8 +245,8 @@ func New(cfg Config) (*App, error) {
 	createCollectTask := taskusecase.NewCreateCollectMachineInfoUsecase(machineRepo, agentRepo)
 	createStaticTask := taskusecase.NewCreateCollectStaticInfoUsecase(machineRepo, agentRepo)
 	packageSelector := mysqlapp.NewPackageSelector(filepath.Join("software", "mysql"))
-	home, _ := os.UserHomeDir()
-	packageService, err := NewPackageService(filepath.Join(home, ".gmha", "package-store.json"), packageSelector)
+	stateDir := managerStateDirectory(cfg)
+	packageService, err := NewPackageService(filepath.Join(stateDir, "package-store.json"), packageSelector)
 	if err != nil {
 		_ = db.Close()
 		return nil, err
@@ -296,6 +298,7 @@ func New(cfg Config) (*App, error) {
 	flameGraphService.Start()
 
 	managerRuntime := NewManagerRuntimeService(cfg)
+	databaseMaintenance := NewDatabaseMaintenanceService(db, dialect, cfg)
 	managerRuntime.SetPlatformUsageChecker(func(ctx context.Context) (bool, error) {
 		var total int
 		err := db.QueryRowContext(ctx, `
@@ -306,9 +309,9 @@ func New(cfg Config) (*App, error) {
 		`).Scan(&total)
 		return total > 0, err
 	})
-	upgradeService := NewUpgradeService(filepath.Join(home, ".gmha", "upgrade-jobs.json"), packageService, agentService, managerRuntime)
+	upgradeService := NewUpgradeService(filepath.Join(stateDir, "upgrade-jobs.json"), packageService, agentService, managerRuntime)
 	managerHAService := NewManagerHAService(managerHARepo, machineRepo, taskService, managerRuntime, machineService)
-	aiService, err := NewAIService(aiRepo, alertService, machineService, taskService, filepath.Join(home, ".gmha", "ai-secret.key"))
+	aiService, err := NewAIService(aiRepo, alertService, machineService, taskService, filepath.Join(stateDir, "ai-secret.key"))
 	if err != nil {
 		_ = db.Close()
 		return nil, err
@@ -331,6 +334,7 @@ func New(cfg Config) (*App, error) {
 		PackageService:        packageService,
 		BackupService:         backupService,
 		AlertService:          alertService,
+		DatabaseMaintenance:   databaseMaintenance,
 		ManagerRuntime:        managerRuntime,
 		ManagerHA:             managerHAService,
 		UpgradeService:        upgradeService,
@@ -338,6 +342,17 @@ func New(cfg Config) (*App, error) {
 		FlameGraphService:     flameGraphService,
 		AIService:             aiService,
 	}, nil
+}
+
+func managerStateDirectory(cfg Config) string {
+	if value := strings.TrimSpace(cfg.StateDir); value != "" {
+		if absolute, err := filepath.Abs(value); err == nil {
+			return absolute
+		}
+		return filepath.Clean(value)
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".gmha")
 }
 
 func openDatabase(cfg Config) (*sql.DB, sqliteinfra.Dialect, error) {

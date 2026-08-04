@@ -12,6 +12,15 @@ const managerRequest = async (path, options = {}) => {
   return payload
 }
 
+const formatStorageBytes = raw => {
+  const value = Number(raw || 0)
+  if (!Number.isFinite(value) || value <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1)
+  const scaled = value / (1024 ** index)
+  return `${scaled.toFixed(index === 0 ? 0 : scaled >= 100 ? 0 : scaled >= 10 ? 1 : 2)} ${units[index]}`
+}
+
 const emptyHA = () => ({
   config: { enabled: false, vip: '', prefix: 24, interface: '', install_dir: '/opt/gmha', service_name: 'gmha-manager' },
   nodes: [], active_node_id: '', current_node_id: '', shared_database: false, ready: false, warnings: []
@@ -33,6 +42,8 @@ export default {
     const databaseTesting = ref(false)
     const databaseVerified = ref(false)
     const databaseChanged = ref(false)
+    const walStatus = ref({ supported: false, driver: '', journal_mode: '', database_bytes: 0, wal_bytes: 0, shm_bytes: 0 })
+    const walLoading = ref(false)
     const busy = ref('')
     const notice = ref('')
     const error = ref('')
@@ -55,6 +66,7 @@ export default {
       view.value = next
       emit('view-change', next)
       if (next === 'ha') setTimeout(() => loadVIPInterfaces(false), 0)
+      if (next === 'database') setTimeout(() => loadWALStatus(false), 0)
     }
 
     async function loadVIPInterfaces(refresh = false) {
@@ -131,6 +143,7 @@ export default {
           haForm.value = { ...emptyHA().config, ...(topology?.config || {}) }
           haFormLoaded.value = true
         }
+        if (view.value === 'database' && !walLoading.value) void loadWALStatus(true)
       } catch (err) {
         unreachable.value = true
         if (!silent) error.value = err.message
@@ -149,6 +162,37 @@ export default {
         resetDatabaseVerification()
         error.value = err.message
       } finally { databaseTesting.value = false }
+    }
+
+    async function loadWALStatus(silent = false) {
+      walLoading.value = true
+      try {
+        walStatus.value = await managerRequest('/manager/database/wal')
+      } catch (err) {
+        if (!silent) error.value = `WAL 状态读取失败：${err.message}`
+      } finally {
+        walLoading.value = false
+      }
+    }
+
+    async function cleanWAL() {
+      const size = formatStorageBytes(walStatus.value.wal_bytes)
+      if (!confirm(`确认立即清理当前 SQLite WAL（${size}）？\n\n系统会先执行安全 checkpoint，再截断 WAL；期间数据库 I/O 可能短暂升高。`)) return
+      busy.value = 'clean-wal'; error.value = ''; notice.value = ''
+      try {
+        const result = await managerRequest('/manager/database/wal', { method: 'POST', body: JSON.stringify({ confirm: true }) })
+        walStatus.value = result.after || walStatus.value
+        if (!result.completed) {
+          error.value = result.message || 'WAL 清理未完成，请稍后重试。'
+          return
+        }
+        notice.value = `WAL 清理完成：清理前 ${formatStorageBytes(result.before?.wal_bytes)}，当前 ${formatStorageBytes(result.after?.wal_bytes)}，释放 ${formatStorageBytes(result.released_bytes)}。`
+      } catch (err) {
+        error.value = `WAL 清理失败：${err.message}`
+      } finally {
+        busy.value = ''
+        await loadWALStatus(true)
+      }
     }
 
     async function saveRuntime() {
@@ -259,9 +303,10 @@ export default {
 
     return {
       view, status, form, ha, haForm, nodeForm, rebuildForm, databaseTesting, databaseVerified, databaseChanged,
+      walStatus, walLoading,
       busy, notice, error, unreachable, nodes, activeNode, onlineCount, canSaveDatabase, vipTargetID, vipTargetNode,
       vipInterfaces, vipInterfacesLoading, vipSelectedInterface,
-      setView, chooseDatabase, resetDatabaseVerification, load, testDatabase, saveRuntime, runtimeAction,
+      setView, chooseDatabase, resetDatabaseVerification, load, testDatabase, loadWALStatus, cleanWAL, formatStorageBytes, saveRuntime, runtimeAction,
       saveHA, addNode, nodeAction, switchVIP, rebuild, loadVIPInterfaces, vipTargetChanged, vipInterfaceChanged, machineLabel, nodeStateLabel
     }
   },
@@ -308,17 +353,28 @@ export default {
           <button type="button" :class="{active:form.database_driver==='postgres'}" @click="chooseDatabase('postgres')"><i>P</i><span><b>PostgreSQL</b><small>共享存储 · 可用</small></span><em v-if="form.database_driver==='postgres'">当前</em></button>
           <footer><b>安全切换规则</b><small>连接检测成功后才能保存；平台投入使用后禁止直接更换元数据库。</small></footer>
         </aside>
-        <form class="panel manager-database-editor" @submit.prevent="saveRuntime">
-          <header><div><span>METADATA DATABASE / {{ (form.database_driver || 'sqlite').toUpperCase() }}</span><h3>{{ form.database_driver==='sqlite' ? 'SQLite 文件数据库' : form.database_driver==='mysql' ? 'MySQL 连接配置' : 'PostgreSQL 连接配置' }}</h3><p>填写常规连接信息即可，系统负责生成并保管连接串。</p></div><em :class="{verified:databaseVerified}">{{ databaseVerified ? '连接已验证' : databaseChanged ? '需要检测' : '配置未变更' }}</em></header>
-          <div class="manager-database-editor-body">
-            <div v-if="form.database_driver==='sqlite'" class="manager-form-fields one"><label>数据库文件路径<input v-model.trim="form.db_path" @input="resetDatabaseVerification" required placeholder="./data/manager.db"><small>适合单节点初始化；启用 Manager 高可用前需要切换为共享数据库。</small></label></div>
-            <div v-else class="manager-form-fields">
-              <label>数据库地址<input v-model.trim="form.database_host" @input="resetDatabaseVerification" required placeholder="10.0.0.20"></label><label>端口<input v-model.number="form.database_port" @input="resetDatabaseVerification" type="number" min="1" max="65535" required></label><label>数据库名称<input v-model.trim="form.database_name" @input="resetDatabaseVerification" required placeholder="gmha"></label><label>数据库账号<input v-model.trim="form.database_username" @input="resetDatabaseVerification" required placeholder="gmha"></label><label>数据库密码<input v-model="form.database_password" @input="resetDatabaseVerification" type="password" :placeholder="form.database_password_set ? '已配置；留空表示保持原密码' : '请输入数据库密码'" autocomplete="new-password"></label><label v-if="form.database_driver==='postgres'">SSL 模式<select v-model="form.database_ssl_mode" @change="resetDatabaseVerification"><option value="disable">disable</option><option value="require">require</option><option value="verify-ca">verify-ca</option><option value="verify-full">verify-full</option></select></label>
+        <div class="manager-database-content">
+          <form class="panel manager-database-editor" @submit.prevent="saveRuntime">
+            <header><div><span>METADATA DATABASE / {{ (form.database_driver || 'sqlite').toUpperCase() }}</span><h3>{{ form.database_driver==='sqlite' ? 'SQLite 文件数据库' : form.database_driver==='mysql' ? 'MySQL 连接配置' : 'PostgreSQL 连接配置' }}</h3><p>填写常规连接信息即可，系统负责生成并保管连接串。</p></div><em :class="{verified:databaseVerified}">{{ databaseVerified ? '连接已验证' : databaseChanged ? '需要检测' : '配置未变更' }}</em></header>
+            <div class="manager-database-editor-body">
+              <div v-if="form.database_driver==='sqlite'" class="manager-form-fields one"><label>数据库文件路径<input v-model.trim="form.db_path" @input="resetDatabaseVerification" required placeholder="./data/manager.db"><small>适合单节点初始化；启用 Manager 高可用前需要切换为共享数据库。</small></label></div>
+              <div v-else class="manager-form-fields">
+                <label>数据库地址<input v-model.trim="form.database_host" @input="resetDatabaseVerification" required placeholder="10.0.0.20"></label><label>端口<input v-model.number="form.database_port" @input="resetDatabaseVerification" type="number" min="1" max="65535" required></label><label>数据库名称<input v-model.trim="form.database_name" @input="resetDatabaseVerification" required placeholder="gmha"></label><label>数据库账号<input v-model.trim="form.database_username" @input="resetDatabaseVerification" required placeholder="gmha"></label><label>数据库密码<input v-model="form.database_password" @input="resetDatabaseVerification" type="password" :placeholder="form.database_password_set ? '已配置；留空表示保持原密码' : '请输入数据库密码'" autocomplete="new-password"></label><label v-if="form.database_driver==='postgres'">SSL 模式<select v-model="form.database_ssl_mode" @change="resetDatabaseVerification"><option value="disable">disable</option><option value="require">require</option><option value="verify-ca">verify-ca</option><option value="verify-full">verify-full</option></select></label>
+              </div>
+              <details class="manager-advanced-config"><summary>服务监听与路径高级配置</summary><div class="manager-form-fields"><label>HTTP 监听<input v-model.trim="form.listen_http"></label><label>gRPC 监听<input v-model.trim="form.listen_grpc"></label><label>Manager HTTP 地址<input v-model.trim="form.manager_http_addr"></label><label>Manager gRPC 地址<input v-model.trim="form.manager_grpc_addr"></label><label>Agent 二进制路径<input v-model.trim="form.agent_binary_path"></label><label>SSH 公钥路径<input v-model.trim="form.manager_public_key"></label></div></details>
             </div>
-            <details class="manager-advanced-config"><summary>服务监听与路径高级配置</summary><div class="manager-form-fields"><label>HTTP 监听<input v-model.trim="form.listen_http"></label><label>gRPC 监听<input v-model.trim="form.listen_grpc"></label><label>Manager HTTP 地址<input v-model.trim="form.manager_http_addr"></label><label>Manager gRPC 地址<input v-model.trim="form.manager_grpc_addr"></label><label>Agent 二进制路径<input v-model.trim="form.agent_binary_path"></label><label>SSH 公钥路径<input v-model.trim="form.manager_public_key"></label></div></details>
-          </div>
-          <footer><span>{{ databaseChanged ? '参数已变化，请先检测连接。' : '当前配置可以直接保存。' }}</span><div><button type="button" class="secondary" :disabled="databaseTesting || !!busy" @click="testDatabase">{{ databaseTesting ? '检测中…' : '检测连接' }}</button><button class="primary" :disabled="!!busy || !canSaveDatabase">{{ busy==='save-runtime' ? '保存中…' : '保存配置' }}</button></div></footer>
-        </form>
+            <footer><span>{{ databaseChanged ? '参数已变化，请先检测连接。' : '当前配置可以直接保存。' }}</span><div><button type="button" class="secondary" :disabled="databaseTesting || !!busy" @click="testDatabase">{{ databaseTesting ? '检测中…' : '检测连接' }}</button><button class="primary" :disabled="!!busy || !canSaveDatabase">{{ busy==='save-runtime' ? '保存中…' : '保存配置' }}</button></div></footer>
+          </form>
+          <section class="panel manager-wal-panel">
+            <header><div><span>SQLITE WAL MAINTENANCE</span><h3>WAL 空间清理</h3><p>对当前运行中的元数据库执行安全 checkpoint，并尝试截断 WAL 文件。</p></div><strong :class="walStatus.supported ? 'ready' : 'unavailable'">{{ walLoading ? '读取中' : walStatus.supported ? (walStatus.journal_mode || 'wal').toUpperCase() : '不可用' }}</strong></header>
+            <div class="manager-wal-stats">
+              <article><small>主数据库</small><b>{{ formatStorageBytes(walStatus.database_bytes) }}</b><span :title="walStatus.database_path">{{ walStatus.database_path || '当前数据库未提供本地路径' }}</span></article>
+              <article><small>WAL 日志</small><b :class="{warning:walStatus.wal_bytes > 1024*1024*1024}">{{ formatStorageBytes(walStatus.wal_bytes) }}</b><span>{{ walStatus.wal_bytes > 1024*1024*1024 ? '建议立即检查并清理' : '当前占用处于可控范围' }}</span></article>
+              <article><small>共享内存索引</small><b>{{ formatStorageBytes(walStatus.shm_bytes) }}</b><span>随 WAL 索引规模变化</span></article>
+            </div>
+            <footer><span>{{ walStatus.supported ? '清理不会直接删除 WAL；SQLite 会先合并已提交页面。活跃长事务可能使本次清理无法完成。' : (walStatus.reason || '仅当前运行中的 SQLite WAL 模式支持此操作。') }}</span><div><button type="button" class="secondary" :disabled="walLoading || !!busy" @click="loadWALStatus(false)">刷新占用</button><button type="button" class="danger-button" :disabled="walLoading || !!busy || !walStatus.supported" @click="cleanWAL">{{ busy==='clean-wal' ? '正在清理 WAL…' : '一键清理 WAL' }}</button></div></footer>
+          </section>
+        </div>
       </section>
 
       <template v-else-if="view==='ha'">

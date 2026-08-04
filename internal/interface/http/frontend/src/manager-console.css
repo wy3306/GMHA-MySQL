@@ -67,6 +67,7 @@
 .manager-readiness-panel li small{color:#8090a5;font-size:10px}
 .manager-readiness-panel>footer{justify-content:flex-start!important}
 .manager-database-page{display:grid;grid-template-columns:255px minmax(0,1fr);align-items:start;gap:18px}
+.manager-database-content{display:grid;min-width:0;gap:18px}
 .manager-database-nav{display:flex;min-height:540px;padding:8px;flex-direction:column}
 .manager-database-nav>header{display:grid;padding:14px 13px 16px;gap:4px}
 .manager-database-nav>header>b{color:#1f2d42;font-size:16px}
@@ -94,6 +95,17 @@
 .manager-database-editor>footer{justify-content:space-between!important}
 .manager-database-editor>footer>span{color:#7b8ba0;font-size:11px}
 .manager-database-editor>footer>div{display:flex;gap:9px}
+.manager-wal-panel>header>strong{padding:5px 9px;border-radius:999px;background:#eaf7f1;color:#15805d;font-size:10px}
+.manager-wal-panel>header>strong.unavailable{background:#f0f2f5;color:#738197}
+.manager-wal-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;padding:18px 20px}
+.manager-wal-stats article{min-width:0;padding:13px 14px;border:1px solid #e2e9f1;border-radius:8px;background:#f8fafc}
+.manager-wal-stats small,.manager-wal-stats span{display:block;color:#8493a6;font-size:10px}
+.manager-wal-stats b{display:block;margin:6px 0 4px;color:#263b53;font-size:18px}
+.manager-wal-stats b.warning{color:#bd3547}
+.manager-wal-stats span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.manager-wal-panel>footer{justify-content:space-between!important}
+.manager-wal-panel>footer>span{max-width:620px;color:#718096;font-size:11px;line-height:1.55}
+.manager-wal-panel>footer>div{display:flex;flex:none;gap:9px}
 .manager-topology-canvas{min-height:420px;padding:24px 28px;background-color:#f8fafc;background-image:radial-gradient(#d9e3ef 1px,transparent 1px);background-size:19px 19px}
 .manager-client-node,.manager-vip-node,.manager-shared-db{display:flex;width:max-content;min-width:210px;margin:auto;padding:10px 13px;align-items:center;gap:10px;border:1px solid #d3dfec;border-radius:8px;background:#fff;box-shadow:0 5px 14px rgba(41,70,100,.07)}
 .manager-client-node>i,.manager-vip-node>i,.manager-shared-db>i{display:grid;width:38px;height:38px;border-radius:7px;background:#edf3fb;color:#496884;place-items:center;font-size:10px;font-style:normal;font-weight:900}
@@ -170,6 +182,8 @@
   .manager-vip-form-grid{grid-template-columns:1fr 1fr}
   .manager-vip-interface-field{grid-column:1/-1}
   .manager-rebuild-panel>form{grid-template-columns:1fr 1fr}
+  .manager-wal-panel>footer{align-items:stretch;flex-direction:column}
+  .manager-wal-panel>footer>div{justify-content:flex-end}
   .manager-rebuild-panel>form button{grid-column:1/-1}
 }
 @media(max-width:850px){
@@ -185,6 +199,7 @@
 @media(max-width:650px){
   .manager-tabs{grid-template-columns:1fr}
   .manager-kpis,.manager-runtime-panel>dl,.manager-form-fields,.manager-database-editor .manager-form-fields,.manager-vip-form-grid,.manager-rebuild-panel>form{grid-template-columns:1fr}
+  .manager-wal-stats{grid-template-columns:1fr}
   .manager-vip-interface-field{grid-column:auto}
   .manager-vip-workspace form>footer{align-items:stretch;flex-direction:column}
   .manager-vip-workspace form>footer>div{justify-content:flex-end}
