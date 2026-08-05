@@ -147,9 +147,27 @@ func (s *HAService) RunMGRManagementAction(ctx context.Context, clusterID string
 		if err != nil {
 			return err
 		}
-		refreshed, _, err := s.collectMGRManagementStatus(operationCtx, clusterID)
+		refreshed, refreshedTargets, err := s.collectMGRManagementStatus(operationCtx, clusterID)
 		if err != nil {
 			return err
+		}
+		if req.Action == "reboot_complete_outage" {
+			seed, ok := mgrOnlineSeed(refreshedTargets)
+			if !ok {
+				return errors.New("MGR complete-outage recovery returned without an ONLINE member")
+			}
+			verifyID, _, verifyErr := s.runMGRTask(operationCtx, seed.machine, "mgr_verify_outage_recovery", "验证 MGR 全组恢复与数据一致性",
+				mgrRecoveredGroupVerifyCommand(username, password, seed.instance.Port, refreshed.GroupName, refreshed.MemberCount), 4*time.Minute)
+			if verifyID != "" {
+				result.TaskIDs = append(result.TaskIDs, verifyID)
+			}
+			if verifyErr != nil {
+				return verifyErr
+			}
+			refreshed, _, err = s.collectMGRManagementStatus(operationCtx, clusterID)
+			if err != nil {
+				return err
+			}
 		}
 		refreshed.TaskIDs = append(refreshed.TaskIDs, result.TaskIDs...)
 		result = MGRManagementActionResult{
@@ -216,6 +234,7 @@ func (s *HAService) collectMGRManagementStatus(ctx context.Context, clusterID st
 	if len(status.Members) == 0 {
 		return status, targets, nil
 	}
+	consistentGroup, queuesEmpty := true, true
 	for index := range targets {
 		member := targets[index].member
 		if member.GroupName != "" {
@@ -223,7 +242,12 @@ func (s *HAService) collectMGRManagementStatus(ctx context.Context, clusterID st
 			status.Architecture = "mgr_router"
 			if status.GroupName == "" {
 				status.GroupName = member.GroupName
+			} else if status.GroupName != member.GroupName {
+				consistentGroup = false
 			}
+		}
+		if member.ApplyQueue != 0 || member.RemoteApplyQueue != 0 {
+			queuesEmpty = false
 		}
 		if strings.EqualFold(member.State, "ONLINE") {
 			status.OnlineMemberCount++
@@ -234,7 +258,7 @@ func (s *HAService) collectMGRManagementStatus(ctx context.Context, clusterID st
 	}
 	status.MemberCount = len(status.Members)
 	status.Quorum = status.Available && status.OnlineMemberCount >= status.MemberCount/2+1
-	status.Healthy = status.Quorum && status.OnlineMemberCount == status.MemberCount && status.PrimaryMachineID != ""
+	status.Healthy = status.Quorum && status.OnlineMemberCount == status.MemberCount && status.PrimaryMachineID != "" && consistentGroup && queuesEmpty
 	return status, targets, nil
 }
 
@@ -383,11 +407,30 @@ func prepareMGRAction(clusterID string, req MGRManagementActionRequest, status M
 			}
 		}
 		clusterJSON, _ := json.Marshal(safeMGRClusterName(clusterID))
-		primaryJSON, _ := json.Marshal(fmt.Sprintf("%s:%d", target.machine.IP, target.instance.Port))
-		return target, `var c=dba.rebootClusterFromCompleteOutage(` + string(clusterJSON) + `,{primary:` + string(primaryJSON) + `}); print("` + mgrJSONMarker + `"+JSON.stringify({status:c.status({extended:1})}));`, nil
+		// Deliberately do not pass the AdminAPI "primary" override. MySQL Shell
+		// compares every member's GTID history and selects the most up-to-date
+		// member; forcing the UI-selected connection seed could discard writes.
+		return target, `var c=dba.rebootClusterFromCompleteOutage(` + string(clusterJSON) + `); print("` + mgrJSONMarker + `"+JSON.stringify({status:c.status({extended:1})}));`, nil
 	default:
 		return mgrClusterTarget{}, "", fmt.Errorf("不支持的 MGR 管理操作 %q", req.Action)
 	}
+}
+
+func mgrRecoveredGroupVerifyCommand(username, password string, port int, groupName string, expectedMembers int) string {
+	if expectedMembers < 1 {
+		expectedMembers = 1
+	}
+	sql := fmt.Sprintf(`SELECT IF(
+		@@group_replication_group_name=%s AND COUNT(*)=%d AND
+		SUM(m.MEMBER_STATE='ONLINE')=%d AND SUM(m.MEMBER_ROLE='PRIMARY')=1 AND
+		COALESCE(SUM(s.COUNT_TRANSACTIONS_IN_QUEUE),0)=0 AND
+		COALESCE(SUM(s.COUNT_TRANSACTIONS_REMOTE_IN_APPLIER_QUEUE),0)=0,
+		'MGR_RECOVERY_CONSISTENT','MGR_RECOVERY_INCOMPLETE')
+		FROM performance_schema.replication_group_members m
+		LEFT JOIN performance_schema.replication_group_member_stats s ON s.MEMBER_ID=m.MEMBER_ID`, sqlLiteral(groupName), expectedMembers, expectedMembers)
+	client := mysqlMGRClient(username, password, port) + " --batch --raw --skip-column-names"
+	return "for i in $(seq 1 120); do " + client + " --execute=" + shellQuote(sql) +
+		" 2>/dev/null | grep -Fxq MGR_RECOVERY_CONSISTENT && exit 0; sleep 1; done; echo 'MGR recovery consistency verification timed out' >&2; exit 1"
 }
 
 func mgrOnlineSeed(targets []mgrClusterTarget) (mgrClusterTarget, bool) {

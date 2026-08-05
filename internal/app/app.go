@@ -63,6 +63,7 @@ type App struct {
 	SQLDiagnosticService  *SQLDiagnosticService
 	FlameGraphService     *FlameGraphService
 	AIService             *AIService
+	AccountService        *AccountService
 }
 
 // New 创建并初始化应用核心实例。
@@ -92,6 +93,7 @@ func New(cfg Config) (*App, error) {
 	flameGraphRepo := sqliteinfra.NewFlameGraphRepository(store)
 	managerHARepo := sqliteinfra.NewManagerHARepository(store)
 	aiRepo := sqliteinfra.NewAIRepository(store)
+	accountRepo := sqliteinfra.NewAccountRepository(store)
 	if err := machineRepo.Migrate(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -144,6 +146,10 @@ func New(cfg Config) (*App, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := haRepo.BackfillTopologyIntents(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if err := alertRepo.Migrate(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -164,6 +170,15 @@ func New(cfg Config) (*App, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := accountRepo.Migrate(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	accountService, err := NewAccountService(accountRepo)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 
 	sshClient := sshinfra.NewClient(cfg.ManagerPublicKey)
 	trustService, err := sshinfra.NewTrustService(cfg.ManagerPublicKey, sshClient)
@@ -181,11 +196,13 @@ func New(cfg Config) (*App, error) {
 		Trust:       trustService,
 	})
 	heartbeatService := NewHeartbeatService(hbdomain.Repository(heartbeatRepo), HeartbeatConfig{}, agentRepo, machineRepo, mysqlInstanceRepo)
+	heartbeatService.SetAlertTopologyReader(haRepo)
 	if err := heartbeatService.LoadLatest(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	alertService := NewAlertService(alertRepo)
+	alertService.ConfigureAccountRecipients(accountService)
 	if err := alertService.EnsureDefaults(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -318,6 +335,7 @@ func New(cfg Config) (*App, error) {
 	}
 	aiService.ConfigurePlatformContext(haService, backupService)
 	aiService.ConfigureClusterOperations(clusterUpgradeService)
+	haService.StartTopologyRecovery()
 	return &App{
 		db:                    db,
 		MachineService:        machineService,
@@ -341,6 +359,7 @@ func New(cfg Config) (*App, error) {
 		SQLDiagnosticService:  sqlDiagnosticService,
 		FlameGraphService:     flameGraphService,
 		AIService:             aiService,
+		AccountService:        accountService,
 	}, nil
 }
 
@@ -412,6 +431,9 @@ func configureSQLite(db *sql.DB) {
 }
 
 func (a *App) Close() error {
+	if a.HAService != nil {
+		a.HAService.StopTopologyRecovery()
+	}
 	if a.BackupService != nil {
 		a.BackupService.Close()
 	}

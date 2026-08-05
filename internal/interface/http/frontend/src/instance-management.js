@@ -8,6 +8,7 @@ import DatabaseInspection from './database-inspection.js'
 import ArchiveManagement from './archive-management.js'
 import ClusterRollingUpgrade from './cluster-rolling-upgrade.js'
 import BinlogAnalysis from './binlog-analysis.js'
+import { createMySQLParameterCatalog, mysqlParameterCategory, mysqlParameterIsDynamic } from './mysql-parameter-catalog.js'
 
 const request = async (path, options = {}) => {
   const response = await fetch(`/api/v1${path}`, { headers: { 'Content-Type': 'application/json' }, ...options })
@@ -18,6 +19,17 @@ const request = async (path, options = {}) => {
 
 const value = (item, upper, lower) => item?.[upper] ?? item?.[lower]
 const lower = value => String(value || '').toLowerCase()
+export const instanceHealthCode = item => {
+  const heartbeat = lower(value(item, 'HeartbeatStatus', 'heartbeat_status'))
+  const status = lower(value(item, 'Status', 'status'))
+  const agentState = lower(value(item, 'AgentState', 'agent_state'))
+  if (['stopped', 'shutdown'].includes(status)) return 'stopped'
+  if (['offline', 'suspect'].includes(agentState)) return 'error'
+  if (/(fail|error|offline|critical)/.test(`${heartbeat} ${status}`)) return 'error'
+  if (['ok', 'success', 'healthy', 'online', 'running'].includes(heartbeat)) return 'healthy'
+  if (['online', 'degraded'].includes(agentState) && ['ok', 'success', 'healthy', 'online', 'running'].includes(status)) return 'healthy'
+  return 'unknown'
+}
 const normalizeArchitecture = architecture => {
   const arch = lower(architecture)
   if (['amd64', 'x64', 'x86-64', 'x86_64'].includes(arch)) return 'x86_64'
@@ -112,21 +124,6 @@ const directoryFields = [
   ['error_log','错误日志','数据目录/mysqld.log'], ['pid_file','PID 文件','数据目录/mysqld.pid'], ['character_sets_dir','字符集目录','安装目录/share/charsets'], ['plugin_dir','插件目录','安装目录/lib/plugin']
 ]
 const installStages = ['环境与兼容性预检', '创建目录和运行用户', '分发并解压安装包', '渲染 my.cnf 与 systemd', '初始化数据库与账号', '启动服务并验证心跳']
-const dynamicMySQLParameters = new Set([
-  'autocommit','binlog_expire_logs_seconds','binlog_format','connect_timeout','event_scheduler','general_log','general_log_file','group_concat_max_len','innodb_buffer_pool_size','innodb_flush_log_at_trx_commit','innodb_io_capacity','innodb_io_capacity_max','innodb_lock_wait_timeout','innodb_max_dirty_pages_pct','innodb_old_blocks_time','innodb_online_alter_log_max_size','innodb_print_all_deadlocks','innodb_purge_threads','innodb_read_io_threads','innodb_stats_on_metadata','innodb_write_io_threads','interactive_timeout','join_buffer_size','lock_wait_timeout','log_output','long_query_time','max_allowed_packet','max_connect_errors','max_connections','max_execution_time','max_heap_table_size','max_prepared_stmt_count','net_read_timeout','net_write_timeout','optimizer_switch','read_buffer_size','read_only','read_rnd_buffer_size','slow_query_log','sort_buffer_size','sql_mode','super_read_only','sync_binlog','table_definition_cache','table_open_cache','thread_cache_size','tmp_table_size','transaction_isolation','wait_timeout'
-])
-const parameterCategory = name => {
-  if (/^innodb_/.test(name)) return 'InnoDB'
-  if (/^(server_id$|binlog_|log_|gtid_|relay_)/.test(name)) return '日志与复制'
-  if (/^(max_|thread_|table_|open_files|back_log|connect_|wait_|interactive_)/.test(name)) return '连接与缓存'
-  if (/^(character_|collation_|sql_mode|time_zone|lc_)/.test(name)) return '字符集与 SQL'
-  if (/^(performance_schema|optimizer_|join_|sort_|read_|tmp_)/.test(name)) return '性能与优化器'
-  return '其他'
-}
-const baseMySQLParameterCatalogNames = [...new Set([
-  ...mysqlRuntimeParameterGroups.flatMap(group => group.fields.map(field => field.key)).filter(name => !/^(limit_|sysctl_)/.test(name)),
-  ...dynamicMySQLParameters
-])].sort()
 const summary = (input, limit = 180) => {
   const text = String(input || '').replace(/((?:root_)?password["']?\s*[:=]\s*)[^\s,;}]+/gi, '$1******').replace(/(-p)([^\s]+)/g, '$1******').replace(/\s+/g, ' ').trim()
   if (!text) return ''
@@ -198,14 +195,6 @@ export default {
       } finally { instancesRefreshing.value = false }
     }
     const instanceKey = item => `${value(item, 'MachineID', 'machine_id') || value(item, 'MachineIP', 'machine_ip')}:${value(item, 'Port', 'port')}`
-    const instanceHealthCode = item => {
-      const heartbeat = lower(value(item, 'HeartbeatStatus', 'heartbeat_status'))
-      const status = lower(value(item, 'Status', 'status'))
-      if (['stopped', 'shutdown'].includes(status)) return 'stopped'
-      if (/(fail|error|offline|critical)/.test(`${heartbeat} ${status}`)) return 'error'
-      if (['ok', 'success', 'healthy', 'online', 'running'].includes(heartbeat) || ['ok', 'success', 'healthy', 'online', 'running'].includes(status)) return 'healthy'
-      return 'unknown'
-    }
     const instanceHealthLabel = item => ({ healthy: '运行正常', stopped: '已安全关闭', error: '状态异常', unknown: '等待上报' })[instanceHealthCode(item)]
     const failures = computed(() => clusterInstances.value.filter(item => instanceHealthCode(item) === 'error'))
     const filteredInstances = computed(() => {
@@ -229,14 +218,8 @@ export default {
     watch(instancePageCount, total => { if (instancePage.value > total) instancePage.value = total })
     const toggleInstanceDetails = item => { expandedInstance.value = expandedInstance.value === instanceKey(item) ? '' : instanceKey(item) }
     const parameterCatalogDefinitions = () => {
-      const names = new Set(baseMySQLParameterCatalogNames)
-      for (const pkg of props.packages || []) {
-        for (const group of pkg.runtime_parameter_groups || []) {
-          for (const field of group.fields || []) if (field.key) names.add(String(field.key).toLowerCase())
-        }
-      }
-      return [...names].sort().map(name => ({
-        name, value: '', editValue: '', dynamic: dynamicMySQLParameters.has(name), category: parameterCategory(name), collected: false, compatible: null
+      return createMySQLParameterCatalog({ groups: mysqlRuntimeParameterGroups, packages: props.packages }).map(item => ({
+        ...item, value: '', editValue: '', collected: false, compatible: null
       }))
     }
     const resetParameterCatalog = () => {
@@ -567,7 +550,7 @@ export default {
           if (!line.startsWith('GMHA_MYSQL_PARAMETER\t')) continue
           const [, name, currentValue = '', applyMode = ''] = line.split('\t')
           const normalizedName = String(name || '').toLowerCase()
-          rows.push({ name: normalizedName, value: currentValue, editValue: currentValue, dynamic: applyMode ? applyMode === 'dynamic' : dynamicMySQLParameters.has(normalizedName), category: parameterCategory(normalizedName) })
+          rows.push({ name: normalizedName, value: currentValue, editValue: currentValue, dynamic: applyMode ? applyMode === 'dynamic' : mysqlParameterIsDynamic(normalizedName), category: mysqlParameterCategory(normalizedName) })
         }
       }
       const collectedByName = new Map(rows.map(item => [item.name, item]))
@@ -880,14 +863,14 @@ export default {
               <td><b>{{ value(item,'Version','version') || '版本待上报' }}</b><small>{{ value(item,'Architecture','architecture') || '架构待上报' }} · {{ roleFor(item) }}</small></td>
               <td><b>{{ value(item,'Profile','profile') || 'default' }}</b><small>用户 {{ value(item,'MySQLUser','mysql_user') || 'mysql' }}</small></td>
               <td><span :class="['instance-health-badge',instanceHealthCode(item)]"><i></i>{{ instanceHealthLabel(item) }}</span><small :title="value(item,'HeartbeatDetail','heartbeat_detail')">{{ summary(value(item,'HeartbeatDetail','heartbeat_detail') || value(item,'Status','status') || '尚无心跳详情', 36) }}</small></td>
-              <td><b>{{ value(item,'HeartbeatCheckedAt','heartbeat_checked_at') || '—' }}</b><small>登记 {{ value(item,'UpdatedAt','updated_at') ? new Date(value(item,'UpdatedAt','updated_at')).toLocaleString('zh-CN',{hour12:false}) : '—' }}</small></td>
+              <td><b>{{ value(item,'HeartbeatCheckedAt','heartbeat_checked_at') || '—' }}</b><small>Agent {{ value(item,'AgentState','agent_state') || '等待上报' }} · 登记 {{ value(item,'UpdatedAt','updated_at') ? new Date(value(item,'UpdatedAt','updated_at')).toLocaleString('zh-CN',{hour12:false}) : '—' }}</small></td>
               <td class="instance-row-actions" @click.stop><button class="text-button" @click="toggleInstanceDetails(item)">{{ expandedInstance===instanceKey(item) ? '收起' : '详情' }}</button><button class="text-button lifecycle-restart" @click="openLifecycle(item,'restart')">重启</button><button class="danger-link lifecycle-shutdown" @click="openLifecycle(item,'shutdown')">关机</button><button class="danger-link" @click="uninstall(item)">卸载</button><button class="text-button muted" @click="forget(item)">遗忘</button></td>
             </tr>
             <tr v-if="expandedInstance===instanceKey(item)" class="instance-detail-row"><td colspan="7"><div class="instance-detail-shell">
               <section><header><b>实例标识</b><span>{{ instanceHealthLabel(item) }}</span></header><dl><div><dt>集群</dt><dd>{{ value(item,'Cluster','cluster') || clusterName }}</dd></div><div><dt>机器名称</dt><dd>{{ value(item,'MachineName','machine_name') || '—' }}</dd></div><div><dt>机器 ID</dt><dd>{{ value(item,'MachineID','machine_id') || '—' }}</dd></div><div><dt>访问地址</dt><dd>{{ value(item,'MachineIP','machine_ip') || '—' }}:{{ value(item,'Port','port') || '—' }}</dd></div><div><dt>server_id</dt><dd>{{ value(item,'ServerID','server_id') || '—' }}</dd></div><div><dt>MySQL 用户</dt><dd>{{ value(item,'MySQLUser','mysql_user') || 'mysql' }}</dd></div></dl></section>
               <section><header><b>软件与运行</b><span>{{ roleFor(item) }}</span></header><dl><div><dt>版本</dt><dd>{{ value(item,'Version','version') || '—' }}</dd></div><div class="wide"><dt>安装包</dt><dd>{{ value(item,'PackageName','package_name') || '—' }}</dd></div><div><dt>CPU 架构</dt><dd>{{ value(item,'Architecture','architecture') || '—' }}</dd></div><div><dt>参数 Profile</dt><dd>{{ value(item,'Profile','profile') || 'default' }}</dd></div><div class="wide"><dt>systemd 服务</dt><dd>{{ value(item,'SystemdUnit','systemd_unit') || '—' }}</dd></div></dl></section>
               <section class="instance-path-section"><header><b>目录与配置文件</b><span>部署路径</span></header><dl><div><dt>实例目录</dt><dd>{{ value(item,'InstanceDir','instance_dir') || '—' }}</dd></div><div><dt>安装目录</dt><dd>{{ value(item,'BaseDir','base_dir') || '—' }}</dd></div><div><dt>数据目录</dt><dd>{{ value(item,'DataDir','data_dir') || '—' }}</dd></div><div><dt>binlog</dt><dd>{{ value(item,'BinlogDir','binlog_dir') || '—' }}</dd></div><div><dt>redo</dt><dd>{{ value(item,'RedoDir','redo_dir') || '—' }}</dd></div><div><dt>undo</dt><dd>{{ value(item,'UndoDir','undo_dir') || '—' }}</dd></div><div><dt>tmp</dt><dd>{{ value(item,'TmpDir','tmp_dir') || '—' }}</dd></div><div><dt>my.cnf</dt><dd>{{ value(item,'MyCnfPath','my_cnf_path') || '—' }}</dd></div><div><dt>Socket</dt><dd>{{ value(item,'SocketPath','socket_path') || '—' }}</dd></div></dl></section>
-              <section><header><b>状态与追踪</b><span>Manager 记录</span></header><dl><div><dt>登记状态</dt><dd>{{ value(item,'Status','status') || '—' }}</dd></div><div><dt>心跳状态</dt><dd>{{ value(item,'HeartbeatStatus','heartbeat_status') || '—' }}</dd></div><div class="wide"><dt>心跳详情</dt><dd>{{ value(item,'HeartbeatDetail','heartbeat_detail') || '—' }}</dd></div><div><dt>心跳时间</dt><dd>{{ value(item,'HeartbeatCheckedAt','heartbeat_checked_at') || '—' }}</dd></div><div class="wide"><dt>最近任务</dt><dd>{{ value(item,'LastTaskID','last_task_id') || '—' }}</dd></div></dl></section>
+              <section><header><b>状态与追踪</b><span>Manager 记录</span></header><dl><div><dt>登记状态</dt><dd>{{ value(item,'Status','status') || '—' }}</dd></div><div><dt>Agent 状态</dt><dd>{{ value(item,'AgentState','agent_state') || '—' }}</dd></div><div><dt>心跳状态</dt><dd>{{ value(item,'HeartbeatStatus','heartbeat_status') || '—' }}</dd></div><div class="wide"><dt>心跳详情</dt><dd>{{ value(item,'HeartbeatDetail','heartbeat_detail') || '—' }}</dd></div><div><dt>心跳时间</dt><dd>{{ value(item,'HeartbeatCheckedAt','heartbeat_checked_at') || '—' }}</dd></div><div class="wide"><dt>最近任务</dt><dd>{{ value(item,'LastTaskID','last_task_id') || '—' }}</dd></div></dl></section>
             </div></td></tr>
           </template>
           <tr v-if="!pagedInstances.length"><td colspan="7" class="empty">{{ clusterInstances.length ? '没有匹配筛选条件的实例。' : '当前集群暂无 MySQL 实例；页面会持续自动检查安装结果。' }}</td></tr>

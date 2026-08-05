@@ -103,17 +103,51 @@ type Event struct {
 }
 
 type Channel struct {
-	ID              string            `json:"id"`
-	Name            string            `json:"name"`
-	Type            string            `json:"type"`
-	Enabled         bool              `json:"enabled"`
-	MinimumSeverity Severity          `json:"minimum_severity"`
-	Config          map[string]string `json:"config"`
-	LastStatus      string            `json:"last_status,omitempty"`
-	LastError       string            `json:"last_error,omitempty"`
-	LastDeliveredAt *time.Time        `json:"last_delivered_at,omitempty"`
-	CreatedAt       time.Time         `json:"created_at"`
-	UpdatedAt       time.Time         `json:"updated_at"`
+	ID              string               `json:"id"`
+	Name            string               `json:"name"`
+	Type            string               `json:"type"`
+	Enabled         bool                 `json:"enabled"`
+	MinimumSeverity Severity             `json:"minimum_severity"`
+	RecipientRoles  []string             `json:"recipient_roles,omitempty"`
+	RecipientIDs    []string             `json:"recipient_ids,omitempty"`
+	ContentFilter   ChannelContentFilter `json:"content_filter"`
+	Config          map[string]string    `json:"config"`
+	LastStatus      string               `json:"last_status,omitempty"`
+	LastError       string               `json:"last_error,omitempty"`
+	LastDeliveredAt *time.Time           `json:"last_delivered_at,omitempty"`
+	CreatedAt       time.Time            `json:"created_at"`
+	UpdatedAt       time.Time            `json:"updated_at"`
+}
+
+// NotificationRole describes an operational responsibility that can be
+// assigned to one or more notification recipients.
+type NotificationRole struct {
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`
+	Description string    `json:"description,omitempty"`
+	Enabled     bool      `json:"enabled"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// NotificationRecipient owns a directly addressable email identity. Channels
+// bind to recipients, while roles remain reusable personnel metadata.
+type NotificationRecipient struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Email     string    `json:"email"`
+	RoleIDs   []string  `json:"role_ids,omitempty"`
+	Enabled   bool      `json:"enabled"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// ChannelContentFilter controls which alert lifecycle events and operational
+// categories are routed to one notification channel. Empty lists preserve the
+// legacy behavior and match every value.
+type ChannelContentFilter struct {
+	Categories  []string `json:"categories,omitempty"`
+	EventStates []string `json:"event_states,omitempty"`
 }
 
 type Delivery struct {
@@ -215,7 +249,14 @@ type Repository interface {
 	SaveEvaluationState(context.Context, EvaluationState) error
 	ListChannels(context.Context) ([]Channel, error)
 	SaveChannel(context.Context, Channel) error
+	UpdateChannelDeliveryStatus(context.Context, string, string, string, *time.Time, time.Time) error
 	DeleteChannel(context.Context, string) error
+	ListNotificationRoles(context.Context) ([]NotificationRole, error)
+	SaveNotificationRole(context.Context, NotificationRole) error
+	DeleteNotificationRole(context.Context, string) error
+	ListNotificationRecipients(context.Context) ([]NotificationRecipient, error)
+	SaveNotificationRecipient(context.Context, NotificationRecipient) error
+	DeleteNotificationRecipient(context.Context, string) error
 	ListDeliveries(context.Context, int) ([]Delivery, error)
 	SaveDelivery(context.Context, Delivery) error
 	LoadMetricConfig(context.Context, string) (dynamicdomain.DynamicCollectConfig, bool, error)

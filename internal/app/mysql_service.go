@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	hbdomain "gmha/internal/domain/heartbeat"
 	machinedomain "gmha/internal/domain/machine"
 	taskdomain "gmha/internal/domain/task"
 	mysqlapp "gmha/internal/mysql"
@@ -39,6 +40,7 @@ type MySQLInstanceView struct {
 	MachineName        string `json:"machine_name"`
 	MachineIP          string `json:"machine_ip"`
 	Cluster            string `json:"cluster"`
+	AgentState         string `json:"agent_state"`
 	HeartbeatStatus    string `json:"heartbeat_status"`
 	HeartbeatDetail    string `json:"heartbeat_detail"`
 	HeartbeatCheckedAt string `json:"heartbeat_checked_at"`
@@ -161,6 +163,23 @@ func (s *MySQLService) ListInstanceViews(ctx context.Context) ([]MySQLInstanceVi
 			}
 		}
 		if hb, ok := heartbeatByMachineID[item.MachineID]; ok {
+			view.AgentState = string(hb.CurrentState)
+			if !hb.LastHeartbeatAt.IsZero() {
+				view.HeartbeatCheckedAt = hb.LastHeartbeatAt.Local().Format("2006-01-02 15:04:05")
+			}
+			if hb.CurrentState == hbdomain.StateOffline || hb.CurrentState == hbdomain.StateSuspect {
+				// A powered-off machine cannot have a currently healthy MySQL
+				// instance. Do not expose the stale OK check saved in the last
+				// heartbeat as a live status.
+				view.Status = mysqlapp.StatusHeartbeatFailed
+				view.HeartbeatStatus = string(hbdomain.CheckFail)
+				view.HeartbeatDetail = strings.TrimSpace(hb.LastErrorSummary)
+				if view.HeartbeatDetail == "" {
+					view.HeartbeatDetail = "agent heartbeat unavailable"
+				}
+				out = append(out, view)
+				continue
+			}
 			for _, check := range hb.Checks {
 				if check.Name != fmt.Sprintf("mysql.heartbeat.%d", item.Port) {
 					continue

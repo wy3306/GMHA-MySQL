@@ -30,6 +30,19 @@ type ArchitectureNodeRequest struct {
 	ElectionPriority int    `json:"election_priority,omitempty"`
 }
 
+// TopologyIntent is the durable, credential-free desired topology. Runtime
+// probes may disappear while every database host is powered off; this record
+// keeps the management view stable and gives the recovery coordinator an
+// authoritative graph to validate before starting replication again.
+type TopologyIntent struct {
+	ClusterID        string                    `json:"cluster_id"`
+	Architecture     string                    `json:"architecture"`
+	PrimaryMachineID string                    `json:"primary_machine_id,omitempty"`
+	MGRGroupName     string                    `json:"mgr_group_name,omitempty"`
+	Nodes            []ArchitectureNodeRequest `json:"nodes"`
+	UpdatedAt        time.Time                 `json:"updated_at"`
+}
+
 // ArchitectureAdjustmentRequest 是架构调整预检与执行共用的请求。
 type ArchitectureAdjustmentRequest struct {
 	Architecture                string `json:"architecture"`

@@ -1851,6 +1851,13 @@ func waitArchitectureForce(ctx context.Context, runs architectureRunRepository, 
 
 func (s *HAService) succeedArchitectureRun(ctx context.Context, runs architectureRunRepository, run *hadomain.ArchitectureRun) {
 	now := time.Now().UTC()
+	if err := s.SaveTopologyIntent(ctx, topologyIntentFromArchitectureRun(*run)); err != nil {
+		run.Status, run.CurrentStep, run.Error = hadomain.ArchitectureRunFailed, "persist_topology_intent", "persist recovered topology: "+err.Error()
+		run.UpdatedAt, run.FinishedAt = now, &now
+		s.syncArchitectureTrackingTask(ctx, *run)
+		_ = runs.SaveArchitectureRun(ctx, *run)
+		return
+	}
 	run.Status, run.CurrentStep, run.Error = hadomain.ArchitectureRunSucceeded, "release_lock", ""
 	run.UpdatedAt, run.FinishedAt = now, &now
 	s.syncArchitectureTrackingTask(ctx, *run)

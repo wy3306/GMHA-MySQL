@@ -53,6 +53,23 @@ func (h *AgentHandler) HandleAgents(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		if r.URL.Query().Get("stats") == "true" {
+			stats := map[string]int{"total": len(items), "online": 0, "abnormal": 0, "pending": 0}
+			for _, item := range items {
+				heartbeat := strings.ToLower(item.HeartbeatState)
+				install := strings.ToLower(item.InstallState)
+				switch {
+				case heartbeat == "online" || heartbeat == "degraded":
+					stats["online"]++
+				case heartbeat == "offline" || heartbeat == "suspect" || install == "error" || install == "offline" || strings.TrimSpace(item.LastError) != "":
+					stats["abnormal"]++
+				default:
+					stats["pending"]++
+				}
+			}
+			writeJSON(w, http.StatusOK, stats)
+			return
+		}
 		keyword := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("keyword")))
 		status := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("status")))
 		version := strings.TrimSpace(r.URL.Query().Get("version"))

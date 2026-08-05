@@ -58,6 +58,69 @@ func newTaskControlTestService(t *testing.T) (*TaskService, taskdomain.Repositor
 	return NewTaskService(repo, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil), repo
 }
 
+func TestDeleteAllTaskRecordsIgnoresFiltersAndKeepsActiveTasks(t *testing.T) {
+	service, repo := newTaskControlTestService(t)
+	now := time.Now().UTC()
+	items := []taskdomain.Task{
+		{ID: "task-success", Type: taskdomain.TypeExec, MachineID: "db-1", Status: taskdomain.StatusSuccess, CreatedAt: now},
+		{ID: "task-failed", Type: taskdomain.TypeMySQLInstall, MachineID: "db-2", Status: taskdomain.StatusFailed, CreatedAt: now.Add(time.Second)},
+		{ID: "task-running", Type: taskdomain.TypeExec, MachineID: "db-3", Status: taskdomain.StatusRunning, CreatedAt: now.Add(2 * time.Second)},
+	}
+	for _, item := range items {
+		if err := repo.CreateTask(context.Background(), item, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := service.DeleteTasks(context.Background(), DeleteTasksRequest{
+		All: true,
+		Query: TaskListQuery{
+			Keyword:  "does-not-match",
+			Statuses: []taskdomain.Status{taskdomain.StatusSuccess},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Requested != 3 || result.Deleted != 2 || result.Failed != 1 {
+		t.Fatalf("unexpected delete-all result: %+v", result)
+	}
+	for _, id := range []string{"task-success", "task-failed"} {
+		if _, ok, err := repo.GetTask(context.Background(), id); err != nil || ok {
+			t.Fatalf("terminal task %s survived: ok=%t err=%v", id, ok, err)
+		}
+	}
+	if task, ok, err := repo.GetTask(context.Background(), "task-running"); err != nil || !ok || task.Status != taskdomain.StatusRunning {
+		t.Fatalf("active task was not preserved: task=%+v ok=%t err=%v", task, ok, err)
+	}
+}
+
+func TestDeleteTerminalBusinessTaskRemovesStaleRunningChild(t *testing.T) {
+	service, repo := newTaskControlTestService(t)
+	now := time.Now().UTC()
+	finishedAt := now.Add(-time.Hour)
+	parent := taskdomain.Task{
+		ID: "architecture-failed", Type: taskdomain.TypeArchitecture, MachineID: "cluster-a",
+		Status: taskdomain.StatusFailed, CreatedAt: now.Add(-2 * time.Hour), FinishedAt: &finishedAt,
+	}
+	child := taskdomain.Task{
+		ID: "stale-running-child", ParentTaskID: parent.ID, Visibility: taskdomain.VisibilityInternal,
+		Type: taskdomain.TypeExec, MachineID: "db-1", Status: taskdomain.StatusRunning, CreatedAt: now.Add(-90 * time.Minute),
+	}
+	for _, item := range []taskdomain.Task{parent, child} {
+		if err := repo.CreateTask(context.Background(), item, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := service.DeleteTask(context.Background(), parent.ID); err != nil {
+		t.Fatalf("terminal business task should ignore a stale running child: %v", err)
+	}
+	for _, id := range []string{parent.ID, child.ID} {
+		if _, ok, err := repo.GetTask(context.Background(), id); err != nil || ok {
+			t.Fatalf("task tree item %s survived cleanup: ok=%t err=%v", id, ok, err)
+		}
+	}
+}
+
 func TestTaskControlSkipTransitionsTaskAndSteps(t *testing.T) {
 	service, repo := newTaskControlTestService(t)
 	now := time.Now().UTC()

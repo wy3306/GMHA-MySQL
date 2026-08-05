@@ -440,7 +440,8 @@ func collectNTPOffset(ctx context.Context, spec dyndomain.CollectTaskSpec) (any,
 	if len(fields) > 1 && strings.Contains(fields[1], "slow") {
 		offset = -offset
 	}
-	return map[string]any{"offset_ms": round2(offset * 1000), "source": "chronyc"}, dyndomain.ValueTypeMap, nil
+	offsetMS := round2(offset * 1000)
+	return map[string]any{"offset_ms": offsetMS, "offset_abs_ms": math.Abs(offsetMS), "source": "chronyc"}, dyndomain.ValueTypeMap, nil
 }
 
 func collectSSHProbe(ctx context.Context, spec dyndomain.CollectTaskSpec) (any, string, error) {

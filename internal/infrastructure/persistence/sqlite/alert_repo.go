@@ -51,7 +51,18 @@ func (r *AlertRepository) Migrate() error {
 		create table if not exists alert_channel (
 			id text primary key, name text not null, type text not null, enabled integer not null default 1,
 			minimum_severity text not null default 'warning', config_json text not null default '{}',
+			recipient_roles_json text not null default '["oncall"]', content_filter_json text not null default '{}',
+			recipient_ids_json text not null default '[]',
 			last_status text not null default '', last_error text not null default '', last_delivered_at text,
+			created_at text not null, updated_at text not null
+		);
+		create table if not exists alert_notification_role (
+			id text primary key, name text not null unique, description text not null default '',
+			enabled integer not null default 1, created_at text not null, updated_at text not null
+		);
+		create table if not exists alert_notification_recipient (
+			id text primary key, name text not null, email text not null unique,
+			role_ids_json text not null default '[]', enabled integer not null default 1,
 			created_at text not null, updated_at text not null
 		);
 		create table if not exists alert_delivery (
@@ -73,6 +84,19 @@ func (r *AlertRepository) Migrate() error {
 	}
 	_, _ = r.db.Exec(`alter table alert_rule add column thresholds_json text not null default '[]'`)
 	_, _ = r.db.Exec(`alter table alert_evaluation_state add column last_sample_at text not null default ''`)
+	_, _ = r.db.Exec(`alter table alert_channel add column recipient_roles_json text not null default '["oncall"]'`)
+	_, _ = r.db.Exec(`alter table alert_channel add column content_filter_json text not null default '{}'`)
+	_, _ = r.db.Exec(`alter table alert_channel add column recipient_ids_json text not null default '[]'`)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for _, role := range []struct{ id, name, description string }{
+		{"role-oncall", "值班人员", "当前轮值并负责第一响应的人员"},
+		{"role-dba", "DBA", "负责数据库运行、性能与高可用"},
+		{"role-ops", "运维", "负责主机、网络与基础设施"},
+		{"role-developer", "研发", "负责应用与业务故障协同"},
+		{"role-manager", "管理者", "接收重要事件与升级通知"},
+	} {
+		_, _ = r.db.Exec(`insert into alert_notification_role(id,name,description,enabled,created_at,updated_at) values(?,?,?,1,?,?) on conflict do nothing`, role.id, role.name, role.description, now, now)
+	}
 	return nil
 }
 
@@ -375,7 +399,7 @@ func manualMySQLRestartTask(taskType, operation, command string, commands []stru
 }
 
 func (r *AlertRepository) ListChannels(ctx context.Context) ([]alertdomain.Channel, error) {
-	rows, err := r.db.QueryContext(ctx, `select id,name,type,enabled,minimum_severity,config_json,last_status,last_error,last_delivered_at,created_at,updated_at from alert_channel order by name`)
+	rows, err := r.db.QueryContext(ctx, `select id,name,type,enabled,minimum_severity,recipient_roles_json,recipient_ids_json,content_filter_json,config_json,last_status,last_error,last_delivered_at,created_at,updated_at from alert_channel order by name`)
 	if err != nil {
 		return nil, err
 	}
@@ -383,11 +407,14 @@ func (r *AlertRepository) ListChannels(ctx context.Context) ([]alertdomain.Chann
 	var out []alertdomain.Channel
 	for rows.Next() {
 		var x alertdomain.Channel
-		var sev, cfg, last, created, updated string
-		if err := rows.Scan(&x.ID, &x.Name, &x.Type, &x.Enabled, &sev, &cfg, &x.LastStatus, &x.LastError, &last, &created, &updated); err != nil {
+		var sev, roles, recipients, contentFilter, cfg, last, created, updated string
+		if err := rows.Scan(&x.ID, &x.Name, &x.Type, &x.Enabled, &sev, &roles, &recipients, &contentFilter, &cfg, &x.LastStatus, &x.LastError, &last, &created, &updated); err != nil {
 			return nil, err
 		}
 		x.MinimumSeverity = alertdomain.Severity(sev)
+		_ = json.Unmarshal([]byte(roles), &x.RecipientRoles)
+		_ = json.Unmarshal([]byte(recipients), &x.RecipientIDs)
+		_ = json.Unmarshal([]byte(contentFilter), &x.ContentFilter)
 		_ = json.Unmarshal([]byte(cfg), &x.Config)
 		x.LastDeliveredAt = parseAlertTimePtr(last)
 		x.CreatedAt = parseAlertTime(created)
@@ -398,8 +425,75 @@ func (r *AlertRepository) ListChannels(ctx context.Context) ([]alertdomain.Chann
 }
 func (r *AlertRepository) SaveChannel(ctx context.Context, x alertdomain.Channel) error {
 	cfg, _ := json.Marshal(x.Config)
-	_, err := r.db.ExecContext(ctx, `insert into alert_channel(id,name,type,enabled,minimum_severity,config_json,last_status,last_error,last_delivered_at,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?,?) on conflict(id) do update set name=excluded.name,type=excluded.type,enabled=excluded.enabled,minimum_severity=excluded.minimum_severity,config_json=excluded.config_json,last_status=excluded.last_status,last_error=excluded.last_error,last_delivered_at=excluded.last_delivered_at,updated_at=excluded.updated_at`, x.ID, x.Name, x.Type, x.Enabled, string(x.MinimumSeverity), string(cfg), x.LastStatus, x.LastError, formatAlertTime(x.LastDeliveredAt), x.CreatedAt.Format(time.RFC3339Nano), x.UpdatedAt.Format(time.RFC3339Nano))
+	roles, _ := json.Marshal(x.RecipientRoles)
+	recipients, _ := json.Marshal(x.RecipientIDs)
+	contentFilter, _ := json.Marshal(x.ContentFilter)
+	_, err := r.db.ExecContext(ctx, `insert into alert_channel(id,name,type,enabled,minimum_severity,recipient_roles_json,recipient_ids_json,content_filter_json,config_json,last_status,last_error,last_delivered_at,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?) on conflict(id) do update set name=excluded.name,type=excluded.type,enabled=excluded.enabled,minimum_severity=excluded.minimum_severity,recipient_roles_json=excluded.recipient_roles_json,recipient_ids_json=excluded.recipient_ids_json,content_filter_json=excluded.content_filter_json,config_json=excluded.config_json,last_status=excluded.last_status,last_error=excluded.last_error,last_delivered_at=excluded.last_delivered_at,updated_at=excluded.updated_at`, x.ID, x.Name, x.Type, x.Enabled, string(x.MinimumSeverity), string(roles), string(recipients), string(contentFilter), string(cfg), x.LastStatus, x.LastError, formatAlertTime(x.LastDeliveredAt), x.CreatedAt.Format(time.RFC3339Nano), x.UpdatedAt.Format(time.RFC3339Nano))
 	return err
+}
+
+func (r *AlertRepository) ListNotificationRoles(ctx context.Context) ([]alertdomain.NotificationRole, error) {
+	rows, err := r.db.QueryContext(ctx, `select id,name,description,enabled,created_at,updated_at from alert_notification_role order by name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]alertdomain.NotificationRole, 0)
+	for rows.Next() {
+		var x alertdomain.NotificationRole
+		var created, updated string
+		if err := rows.Scan(&x.ID, &x.Name, &x.Description, &x.Enabled, &created, &updated); err != nil {
+			return nil, err
+		}
+		x.CreatedAt, x.UpdatedAt = parseAlertTime(created), parseAlertTime(updated)
+		out = append(out, x)
+	}
+	return out, rows.Err()
+}
+
+func (r *AlertRepository) SaveNotificationRole(ctx context.Context, x alertdomain.NotificationRole) error {
+	_, err := r.db.ExecContext(ctx, `insert into alert_notification_role(id,name,description,enabled,created_at,updated_at) values(?,?,?,?,?,?) on conflict(id) do update set name=excluded.name,description=excluded.description,enabled=excluded.enabled,updated_at=excluded.updated_at`, x.ID, x.Name, x.Description, x.Enabled, x.CreatedAt.Format(time.RFC3339Nano), x.UpdatedAt.Format(time.RFC3339Nano))
+	return err
+}
+
+func (r *AlertRepository) DeleteNotificationRole(ctx context.Context, id string) error {
+	result, err := r.db.ExecContext(ctx, `delete from alert_notification_role where id=?`, id)
+	return alertMutationResult(result, err)
+}
+
+func (r *AlertRepository) ListNotificationRecipients(ctx context.Context) ([]alertdomain.NotificationRecipient, error) {
+	rows, err := r.db.QueryContext(ctx, `select id,name,email,role_ids_json,enabled,created_at,updated_at from alert_notification_recipient order by name,email`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]alertdomain.NotificationRecipient, 0)
+	for rows.Next() {
+		var x alertdomain.NotificationRecipient
+		var roleIDs, created, updated string
+		if err := rows.Scan(&x.ID, &x.Name, &x.Email, &roleIDs, &x.Enabled, &created, &updated); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal([]byte(roleIDs), &x.RoleIDs)
+		x.CreatedAt, x.UpdatedAt = parseAlertTime(created), parseAlertTime(updated)
+		out = append(out, x)
+	}
+	return out, rows.Err()
+}
+
+func (r *AlertRepository) SaveNotificationRecipient(ctx context.Context, x alertdomain.NotificationRecipient) error {
+	roleIDs, _ := json.Marshal(x.RoleIDs)
+	_, err := r.db.ExecContext(ctx, `insert into alert_notification_recipient(id,name,email,role_ids_json,enabled,created_at,updated_at) values(?,?,?,?,?,?,?) on conflict(id) do update set name=excluded.name,email=excluded.email,role_ids_json=excluded.role_ids_json,enabled=excluded.enabled,updated_at=excluded.updated_at`, x.ID, x.Name, x.Email, string(roleIDs), x.Enabled, x.CreatedAt.Format(time.RFC3339Nano), x.UpdatedAt.Format(time.RFC3339Nano))
+	return err
+}
+
+func (r *AlertRepository) DeleteNotificationRecipient(ctx context.Context, id string) error {
+	result, err := r.db.ExecContext(ctx, `delete from alert_notification_recipient where id=?`, id)
+	return alertMutationResult(result, err)
+}
+func (r *AlertRepository) UpdateChannelDeliveryStatus(ctx context.Context, id, status, lastError string, lastDeliveredAt *time.Time, updatedAt time.Time) error {
+	result, err := r.db.ExecContext(ctx, `update alert_channel set last_status=?,last_error=?,last_delivered_at=?,updated_at=? where id=?`, status, lastError, formatAlertTime(lastDeliveredAt), updatedAt.UTC().Format(time.RFC3339Nano), id)
+	return alertMutationResult(result, err)
 }
 func (r *AlertRepository) DeleteChannel(ctx context.Context, id string) error {
 	result, err := r.db.ExecContext(ctx, `delete from alert_channel where id=?`, id)

@@ -22,6 +22,9 @@ http://服务器IP:8079
 - `gmha-web`：轻量 Web 启动器，默认监听 `0.0.0.0:8079`
 - `gmha`：Manager、业务 API 和内嵌 Web 控制台
 - `bin/agentd`：由 Manager 部署到受管服务器的 Agent
+- `software/gmha-manager/`：当前发行版的 Manager x86_64 安装包
+- `software/gmha-agent/`：当前发行版的 Agent x86_64 与 ARM64 安装包
+- `software/.gmha-package-index.json`：内置制品的版本、架构和 SHA-256 索引
 - `data/`：默认 SQLite 数据目录
 - `logs/`：Manager 日志目录
 - `start-web.sh`：一键启动脚本
@@ -43,19 +46,27 @@ GMHA_MANAGER_PUBKEY=/opt/gmha/manager_ed25519.pub ./start-web.sh
 
 数据库默认保存到程序包内的 `data/manager.db`，Manager 日志保存到 `logs/manager.log`。
 
+公开只读演示环境可设置 `GMHA_DEMO_AUTO_LOGIN_ADMIN=true`，浏览器首次读取会话时会
+自动获得 admin 会话。该开关默认关闭，不应用于生产环境；演示环境还必须在反向代理层
+拒绝非 GET API 请求，避免免密账号执行变更操作。
+
 ## 版本升级
 
-Manager 和 Agent 的当前版本均为 `V0.1.1`。执行 `scripts/build-release.sh V0.1.1`
-会在 `dist/` 额外生成可直接上传到 Web 控制台的三个升级制品：
+Manager 和 Agent 的当前版本均为 `V0.2.1`。完整发行包默认把当前版本的 Manager
+x86_64、Agent x86_64 和 Agent ARM64 制品放入本地安装包仓库；首次启动后可直接在
+“安装包管理”和“版本升级”中看到，最高版本会被自动选中，无需再次上传。
 
-- `gmha-manager-V0.1.1-linux-amd64.bin`：上传到 `GMHA Manager` 分类。
-- `gmha-agent-V0.1.1-linux-amd64.bin`：x86_64 目标机，上传到 `GMHA Agent` 分类。
-- `gmha-agent-V0.1.1-linux-arm64.bin`：aarch64 目标机，上传到 `GMHA Agent` 分类。
+执行 `scripts/build-release.sh V0.2.1` 还会在 `dist/` 额外生成三个独立制品，供旧版
+Manager 单独上传或跨环境分发：
+
+- `gmha-manager-V0.2.1-linux-amd64.bin`：上传到 `GMHA Manager` 分类。
+- `gmha-agent-V0.2.1-linux-amd64.bin`：x86_64 目标机，上传到 `GMHA Agent` 分类。
+- `gmha-agent-V0.2.1-linux-arm64.bin`：aarch64 目标机，上传到 `GMHA Agent` 分类。
 
 完整发行版支持范围与老版本限制见 `docs/linux-compatibility.md`。Agent 安装会在
 上传前核对目标发行版、systemd 和 ELF 架构；MySQL 安装会再次核对 glibc 与制品。
 
-上传后进入“平台运维 → 版本升级”。Manager 升级会校验候选版本、备份当前程序、
+进入“平台运维 → 版本升级”后，Manager 升级会校验候选版本、备份当前程序、
 原子替换并重启；Agent 升级会检查在线状态与架构，逐台备份替换，并以新鲜心跳上报的
 版本作为升级后检查结果。升级记录与各阶段结果保存在 `~/.gmha/upgrade-jobs.json`。
 
@@ -140,8 +151,8 @@ Go、Node.js 或 FlameGraph Perl 脚本。PID/进程模式在没有 `perf` 时�
 
 ```sh
 ./scripts/build-flamegraph-offline-bundle.sh \
-  V0.1.1 amd64 ./perf-packages \
-  ./dist/gmha-flamegraph-V0.1.1-linux-amd64-offline.tar.gz
+  V0.2.1 amd64 ./perf-packages \
+  ./dist/gmha-flamegraph-V0.2.1-linux-amd64-offline.tar.gz
 ```
 
 将包内 `bin/agentd` 通过“平台运维 → 版本升级”分发；目标机解压后执行 `sudo ./install.sh`

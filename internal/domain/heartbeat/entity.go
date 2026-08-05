@@ -114,6 +114,7 @@ type MetricSnapshot struct {
 	AgentID     string
 	MachineID   string
 	ClusterID   string
+	Abnormal    bool
 	Metrics     []dynamicdomain.MetricResult
 	CollectedAt time.Time
 }
@@ -122,21 +123,22 @@ type MetricSnapshot struct {
 // collector payloads are retained as JSON while numeric leaf metrics also use
 // NumericValue for indexed time-series queries.
 type MetricSample struct {
-	ID           int64             `json:"id"`
-	AgentID      string            `json:"agent_id"`
-	MachineID    string            `json:"machine_id"`
-	ClusterID    string            `json:"cluster_id"`
-	Scope        string            `json:"scope"`
-	Category     string            `json:"category"`
-	MetricName   string            `json:"metric"`
-	Instance     string            `json:"instance,omitempty"`
-	Labels       map[string]string `json:"labels,omitempty"`
-	ValueType    string            `json:"value_type"`
-	NumericValue *float64          `json:"numeric_value,omitempty"`
-	Value        any               `json:"value,omitempty"`
-	Success      bool              `json:"success"`
-	Error        string            `json:"error,omitempty"`
-	CollectedAt  time.Time         `json:"collected_at"`
+	ID                int64             `json:"id"`
+	AgentID           string            `json:"agent_id"`
+	MachineID         string            `json:"machine_id"`
+	ClusterID         string            `json:"cluster_id"`
+	Scope             string            `json:"scope"`
+	Category          string            `json:"category"`
+	MetricName        string            `json:"metric"`
+	Instance          string            `json:"instance,omitempty"`
+	Labels            map[string]string `json:"labels,omitempty"`
+	ValueType         string            `json:"value_type"`
+	NumericValue      *float64          `json:"numeric_value,omitempty"`
+	Value             any               `json:"value,omitempty"`
+	Success           bool              `json:"success"`
+	HeartbeatAbnormal bool              `json:"heartbeat_abnormal,omitempty"`
+	Error             string            `json:"error,omitempty"`
+	CollectedAt       time.Time         `json:"collected_at"`
 }
 
 type MetricSampleQuery struct {
@@ -171,6 +173,12 @@ type MetricSampleWriter interface {
 
 type MetricSampleReader interface {
 	ListMetricSamples(ctx context.Context, query MetricSampleQuery) ([]MetricSample, error)
+}
+
+// MetricHistoryCleaner removes expired normal heartbeat history. Abnormal
+// snapshots and failed metric samples remain available for incident review.
+type MetricHistoryCleaner interface {
+	CleanupMetricHistory(ctx context.Context, before time.Time) (int64, error)
 }
 
 // Repository 定义了心跳领域的仓储接口，用于持久化心跳状态和事件。

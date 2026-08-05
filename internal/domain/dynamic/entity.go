@@ -294,7 +294,9 @@ func BuildDefaultMySQLDynamicCollectConfig() DynamicCollectConfig {
 	add("mysql_undo_disk_usage", "storage", 30, "Undo盘使用率", nil)
 	add("mysql_memory_modules", "memory", 60, "数据库内存模块明细", nil)
 
-	add("mysql_tablespace_fragment_total_bytes", "storage", 300, "所有表空间总碎片大小", map[string]string{"query": "select coalesce(sum(data_free),0) from information_schema.tables where table_schema not in ('mysql','information_schema','performance_schema','sys')"})
+	add("mysql_tablespace_fragment_total_bytes", "storage", 300, "所有表空间总碎片大小", map[string]string{"query": "select coalesce(sum(data_free),0) from information_schema.tables where engine='InnoDB' and table_schema not in ('mysql','information_schema','performance_schema','sys')"})
+	add("mysql_fragmented_table_count", "storage", 300, "高碎片 InnoDB 表数量", map[string]string{"query": "select count(*) from information_schema.tables where engine='InnoDB' and table_schema not in ('mysql','information_schema','performance_schema','sys') and data_free>=268435456 and data_length+index_length+data_free>=1073741824 and data_free/greatest(data_length+index_length+data_free,1)>=0.30"})
+	add("mysql_max_table_fragment_percent", "storage", 300, "单表最大碎片率", map[string]string{"query": "select coalesce(max(100*data_free/greatest(data_length+index_length+data_free,1)),0) from information_schema.tables where engine='InnoDB' and table_schema not in ('mysql','information_schema','performance_schema','sys') and data_free>=268435456 and data_length+index_length+data_free>=1073741824"})
 	add("mysql_index_data_total_bytes", "storage", 300, "所有索引数据量大小", map[string]string{"query": "select coalesce(sum(index_length),0) from information_schema.tables where table_schema not in ('mysql','information_schema','performance_schema','sys')"})
 	add("mysql_table_data_total_bytes", "storage", 300, "所有数据量大小", map[string]string{"query": "select coalesce(sum(data_length),0) from information_schema.tables where table_schema not in ('mysql','information_schema','performance_schema','sys')"})
 	variable("mysql_slow_query_threshold", "variables", 300, "慢查询阈值", "long_query_time")

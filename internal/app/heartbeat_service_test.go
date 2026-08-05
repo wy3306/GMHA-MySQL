@@ -2,10 +2,12 @@ package app
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
 	dynamicdomain "gmha/internal/domain/dynamic"
+	hadomain "gmha/internal/domain/ha"
 	hbdomain "gmha/internal/domain/heartbeat"
 	machinedomain "gmha/internal/domain/machine"
 	mysqlapp "gmha/internal/mysql"
@@ -36,10 +38,17 @@ func TestMachineStatusFromHeartbeatUsesConnectivityState(t *testing.T) {
 }
 
 type registeredMySQLStub struct {
-	ports map[int]bool
+	ports    map[int]bool
+	statuses map[int]string
 }
 
-func (s *registeredMySQLStub) UpdateStatus(context.Context, string, int, string) error { return nil }
+func (s *registeredMySQLStub) UpdateStatus(_ context.Context, _ string, port int, status string) error {
+	if s.statuses == nil {
+		s.statuses = make(map[int]string)
+	}
+	s.statuses[port] = status
+	return nil
+}
 
 func (s *registeredMySQLStub) Get(_ context.Context, machineID string, port int) (mysqlapp.Instance, bool, error) {
 	if machineID == "machine-1" && s.ports[port] {
@@ -59,6 +68,107 @@ func TestFilterUnregisteredMySQLMetrics(t *testing.T) {
 	filtered := service.filterUnregisteredMySQLMetrics(context.Background(), payload)
 	if len(filtered.Metrics) != 2 || filtered.Metrics[0].Name != "cpu_usage_percent" || filtered.Metrics[1].Labels["mysql_port"] != "3307" {
 		t.Fatalf("unexpected filtered metrics: %+v", filtered.Metrics)
+	}
+}
+
+type alertMachineStub struct {
+	machines map[string]machinedomain.Machine
+}
+
+func (s *alertMachineStub) UpdateStatus(context.Context, string, machinedomain.Status, string) error {
+	return nil
+}
+
+func (s *alertMachineStub) GetByID(_ context.Context, machineID string) (machinedomain.Machine, bool, error) {
+	machine, ok := s.machines[machineID]
+	return machine, ok, nil
+}
+
+type alertTopologyStub struct {
+	intent hadomain.TopologyIntent
+}
+
+func (s alertTopologyStub) GetTopologyIntent(_ context.Context, clusterID string) (hadomain.TopologyIntent, bool, error) {
+	return s.intent, clusterID == s.intent.ClusterID, nil
+}
+
+func TestEnrichAlertTopologyAddsInstanceAndReplicationContext(t *testing.T) {
+	machines := &alertMachineStub{machines: map[string]machinedomain.Machine{
+		"primary": {ID: "primary", Name: "db-primary", IP: "10.8.0.10", Cluster: "prod"},
+		"replica": {ID: "replica", Name: "db-replica", IP: "10.8.0.11", Cluster: "prod"},
+	}}
+	service := &HeartbeatService{machines: machines, alertTopology: alertTopologyStub{intent: hadomain.TopologyIntent{
+		ClusterID: "prod", Architecture: hadomain.ArchitectureMasterSlave, PrimaryMachineID: "primary",
+		Nodes: []hadomain.ArchitectureNodeRequest{
+			{MachineID: "primary", Port: 3306, Role: "M"},
+			{MachineID: "replica", Port: 3307, Role: "S", SourceMachineID: "primary"},
+		},
+	}}}
+	payload := hbdomain.HeartbeatPayload{
+		MachineID: "replica", MachineName: "db-replica", MachineIP: "10.8.0.11", ClusterID: "prod",
+		Metrics: []dynamicdomain.MetricResult{
+			{Name: "mysql_role", Value: "replica", Labels: map[string]string{"mysql_port": "3307"}},
+			{Name: "mysql_replication_lag", Value: 42, Labels: map[string]string{"mysql_port": "3307"}},
+		},
+	}
+
+	enriched := service.enrichAlertTopology(context.Background(), payload)
+	labels := enriched.Metrics[1].Labels
+	want := map[string]string{
+		"instance_name": "db-replica:3307", "instance_endpoint": "10.8.0.11:3307",
+		"cluster_name": "prod", "instance_role": "从库", "topology_architecture_label": "主从复制",
+		"source_instance_name": "db-primary:3306", "source_instance_endpoint": "10.8.0.10:3306",
+		"instance_relation": "从库，复制自 db-primary:3306", "observed_instance_role": "replica",
+	}
+	for key, value := range want {
+		if labels[key] != value {
+			t.Fatalf("label %s = %q, want %q; labels=%+v", key, labels[key], value, labels)
+		}
+	}
+}
+
+func TestAlertRuntimeReplicationSourceSupportsMySQLEightAndLegacyFields(t *testing.T) {
+	for name, value := range map[string]any{
+		"mysql8": map[string]any{"replica_status": map[string]any{"Source_Host": "10.8.0.10", "Source_Port": 3306}},
+		"legacy": map[string]any{"replica_status": map[string]string{"Master_Host": "db-primary", "Master_Port": "3307"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if source := alertRuntimeReplicationSource(value); source == "" || !strings.Contains(source, ":33") {
+				t.Fatalf("unexpected replication source %q", source)
+			}
+		})
+	}
+}
+
+func TestSyncMySQLStateTreatsOfflineAgentChecksAsUnavailable(t *testing.T) {
+	mysql := &registeredMySQLStub{}
+	service := &HeartbeatService{mysql: mysql}
+	service.syncMySQLState(context.Background(), hbdomain.LatestStatus{
+		MachineID:    "machine-1",
+		CurrentState: hbdomain.StateOffline,
+		Checks: []hbdomain.HealthCheck{{
+			Name: "mysql.heartbeat.3306", Status: hbdomain.CheckOK,
+		}},
+	})
+
+	if got := mysql.statuses[3306]; got != mysqlapp.StatusHeartbeatFailed {
+		t.Fatalf("offline Agent status = %q, want %q", got, mysqlapp.StatusHeartbeatFailed)
+	}
+}
+
+func TestSyncMySQLStateKeepsFreshHealthyCheckRunning(t *testing.T) {
+	mysql := &registeredMySQLStub{}
+	service := &HeartbeatService{mysql: mysql}
+	service.syncMySQLState(context.Background(), hbdomain.LatestStatus{
+		MachineID:    "machine-1",
+		CurrentState: hbdomain.StateOnline,
+		Checks: []hbdomain.HealthCheck{{
+			Name: "mysql.heartbeat.3306", Status: hbdomain.CheckOK,
+		}},
+	})
+
+	if got := mysql.statuses[3306]; got != mysqlapp.StatusRunning {
+		t.Fatalf("online Agent status = %q, want %q", got, mysqlapp.StatusRunning)
 	}
 }
 
@@ -91,5 +201,34 @@ func TestDashboardMetricSnapshotFiltersAndThrottles(t *testing.T) {
 	}
 	if third := service.dashboardMetricSnapshot("agent-1", items, now.Add(15*time.Second)); len(third) != 4 {
 		t.Fatalf("snapshot should resume after 15 seconds, got %+v", third)
+	}
+}
+
+func TestHeartbeatHistoryCleanupRunsEveryTwoHours(t *testing.T) {
+	service := &HeartbeatService{}
+	if got := service.HistoryCleanupInterval(); got != 2*time.Hour {
+		t.Fatalf("cleanup interval = %s, want 2h", got)
+	}
+}
+
+func TestHeartbeatAbnormalityIncludesHealthChecksAndMetricFailures(t *testing.T) {
+	healthy := hbdomain.LatestStatus{
+		CurrentState:  hbdomain.StateOnline,
+		OverallHealth: hbdomain.HealthHealthy,
+		Checks:        []hbdomain.HealthCheck{{Name: "self", Status: hbdomain.CheckOK}},
+		Metrics:       []dynamicdomain.MetricResult{{Name: "cpu", Success: true}},
+	}
+	if heartbeatIsAbnormal(healthy) {
+		t.Fatal("healthy heartbeat was marked abnormal")
+	}
+	warned := healthy
+	warned.Checks = []hbdomain.HealthCheck{{Name: "mysql", Status: hbdomain.CheckWarn}}
+	if !heartbeatIsAbnormal(warned) {
+		t.Fatal("warning health check must preserve the heartbeat")
+	}
+	failedMetric := healthy
+	failedMetric.Metrics = []dynamicdomain.MetricResult{{Name: "cpu", Success: false}}
+	if !heartbeatIsAbnormal(failedMetric) {
+		t.Fatal("failed metric must preserve the heartbeat")
 	}
 }

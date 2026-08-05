@@ -134,14 +134,14 @@ func topologyConfigureMyCNFCommand(spec taskdomain.MySQLTopologySpec) string {
 	if capabilities.LegacyReplicationNames {
 		lines = append(lines,
 			"log_slave_updates=ON",
-			"skip_slave_start=ON",
+			"skip_slave_start=OFF",
 			fmt.Sprintf("slave_parallel_type=%s", spec.ParallelType),
 			fmt.Sprintf("slave_parallel_workers=%d", spec.ParallelWorkers),
 		)
 	} else {
 		lines = append(lines,
 			"log_replica_updates=ON",
-			"skip_replica_start=ON",
+			"skip_replica_start=OFF",
 			fmt.Sprintf("replica_parallel_type=%s", spec.ParallelType),
 			fmt.Sprintf("replica_parallel_workers=%d", spec.ParallelWorkers),
 		)

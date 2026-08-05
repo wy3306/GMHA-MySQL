@@ -21,6 +21,14 @@ const deletedResponse = { deleted: true }
 
 export const apiEndpoints = [
   endpoint('系统', 'GET', '/healthz', '服务健康检查', { response: { status: 'ok' }, note: '负载均衡器与监控系统可使用此端点探活。' }),
+  endpoint('身份与账号', 'POST', '/auth/login', '登录平台', { body: { username: 'admin', password: 'admin' }, response: { user: { id: 'user-admin', username: 'admin', name: '平台管理员', role: 'admin', permissions: ['*'], enabled: true }, expires_at: '2026-08-05T12:00:00Z' }, note: '成功后通过 HttpOnly、SameSite=Strict Cookie 建立固定 2 小时会话。默认密码可由 GMHA_ADMIN_PASSWORD 覆盖。' }),
+  endpoint('身份与账号', 'GET', '/auth/session', '读取当前登录会话', { response: { user: { id: 'user-admin', username: 'admin', role: 'admin', permissions: ['*'] } } }),
+  endpoint('身份与账号', 'POST', '/auth/logout', '退出平台', { body: {}, response: { logged_out: true } }),
+  endpoint('身份与账号', 'GET', '/accounts', '查询全部平台账号', { response: { items: [], total: 0 }, note: '只有默认 admin 或拥有 admin 角色的账号可以调用。' }),
+  endpoint('身份与账号', 'POST', '/accounts', '创建平台账号', { status: 201, body: { username: 'zhangsan', name: '张三', email: 'zhangsan@example.com', phone: '13800000000', password: 'change-me-123', role: 'dba', permissions: ['overview.view', 'clusters.manage', 'database.manage', 'alerts.manage'], enabled: true }, response: { id: 'user-example', username: 'zhangsan', role: 'dba', enabled: true } }),
+  endpoint('身份与账号', 'GET', '/accounts/catalog', '查询角色与权限目录', { response: { roles: [], permissions: [], session_duration_seconds: 7200 } }),
+  endpoint('身份与账号', 'PUT', '/accounts/{account_id}', '调整账号资料、角色、权限或密码', { body: { name: '张三', email: 'zhangsan@example.com', phone: '13800000000', password: '', role: 'operator', permissions: ['overview.view', 'resources.manage', 'clusters.manage', 'database.manage', 'alerts.manage', 'tasks.manage'], enabled: true }, response: { id: 'user-example', username: 'zhangsan', role: 'operator', enabled: true }, note: '账号名不可修改；空密码表示保留原密码。默认 admin 不能被停用或降权，且只有其自身可以调整。' }),
+  endpoint('身份与账号', 'DELETE', '/accounts/{account_id}', '删除平台账号', { response: { deleted: true }, note: '默认 admin 和当前登录账号不能删除；删除会同步清除该账号全部会话。' }),
 
   endpoint('机器与凭证', 'GET', '/machines?page=1&page_size=20&keyword=&cluster=all', '分页查询机器', { query: ['page', 'page_size', 'keyword', 'cluster'], response: pageResponse }),
   endpoint('机器与凭证', 'POST', '/machines', '纳管机器', { body: { name: 'db-01', ip: '10.0.0.11', ssh_port: 22, ssh_user: 'root', credential_id: 'cred-01', preserve_agent: false, preserve_mysql: true }, response: { machine: { id: 'machine-01', name: 'db-01', ip: '10.0.0.11' }, task_id: 'task-01HX...' }, note: '执行 SSH 预检并安装/接管 Agent；敏感凭证不会在返回中回显。' }),
@@ -62,7 +70,7 @@ export const apiEndpoints = [
   endpoint('Agent', 'GET', '/agents/recovery-tasks', '查询恢复任务', { response: [{ id: 'recovery-01', machine_ip: '10.0.0.11', status: 'waiting_heartbeat' }] }),
   endpoint('Agent', 'POST', '/agents/recover', '手动恢复 Agent', { body: { machine_id: 'machine-01' }, response: { id: 'recovery-01', machine_ip: '10.0.0.11', status: 'pending' } }),
 
-  endpoint('MySQL 实例', 'GET', '/mysql/instances', '查询 MySQL 实例', { response: [{ machine_id: 'machine-01', machine_name: 'db-01', machine_ip: '10.0.0.11', port: 3306, version: '8.0.46', status: 'running', cluster: 'prod', heartbeat_status: 'ok' }] }),
+  endpoint('MySQL 实例', 'GET', '/mysql/instances', '查询 MySQL 实例', { response: [{ machine_id: 'machine-01', machine_name: 'db-01', machine_ip: '10.0.0.11', port: 3306, version: '8.0.46', status: 'running', cluster: 'prod', agent_state: 'ONLINE', heartbeat_status: 'OK' }], note: 'Agent 为 OFFLINE / SUSPECT 时，接口会覆盖机器关机前残留的成功快照，实例不会继续显示为运行正常。' }),
   endpoint('MySQL 实例', 'DELETE', '/mysql/instances', '移除实例登记', { body: { machine: 'machine-01', port: 3306 }, response: { machine: 'machine-01', port: 3306 }, note: '只移除 GMHA 登记，不卸载远端 MySQL。' }),
   endpoint('MySQL 实例', 'GET', '/mysql/histograms?machine_id=machine-01&port=3306&schema=app&table=orders', '查看直方图', { query: ['machine_id', 'port', 'schema', 'table'], response: { server_version: '8.0.46', schemas: ['app'], tables: [{ name: 'orders', estimated_rows: 120000 }], columns: [{ name: 'status', eligible: true, has_histogram: true }], histograms: [{ schema: 'app', table: 'orders', column: 'status', buckets: 8 }] } }),
   endpoint('MySQL 实例', 'POST', '/mysql/histograms', '创建或更新直方图', { body: { machine_id: 'machine-01', port: 3306, schema: 'app', table: 'orders', columns: ['status'], buckets: 16 }, response: { action: 'update', schema: 'app', table: 'orders', columns: ['status'], buckets: 16 }, note: '仅支持 MySQL 8.0+；columns 为数组，桶数范围 1–1024。' }),
@@ -207,6 +215,7 @@ export const apiEndpoints = [
   endpoint('告警', 'POST', '/alerts/events/automation', '更新告警自动化状态', { body: { id: 'event-01', state: 'running', expected_state: 'pending' }, response: { updated: true } }),
   endpoint('告警', 'PUT', '/alerts/events/automation', '以幂等方式更新告警自动化状态', { body: { id: 'event-01', state: 'running', expected_state: 'pending' }, response: { updated: true } }),
   endpoint('告警', 'GET', '/alerts/channels', '查询通知渠道', { response: [{ id: 'channel-01', name: 'DBA Webhook', type: 'webhook', config: { url: '******' } }], note: '密码、令牌、密钥和 URL 会被掩码。' }),
+  endpoint('告警', 'GET', '/alerts/recipient-directory', '查询可选推送人员与平台角色', { response: { users: [{ id: 'user-01', username: 'zhangsan', name: '张三', role: 'dba', has_email: true }], roles: [{ id: 'dba', name: 'DBA', member_count: 2, emailable_member_count: 2 }] }, note: '只返回平台账号身份与邮箱可用状态，不返回邮箱地址；邮件渠道保存用户编号或角色，发送时由 Manager 解析最新账号邮箱。' }),
   endpoint('告警', 'POST', '/alerts/channels', '创建通知渠道', { body: { name: 'DBA Webhook', type: 'webhook', config: { url: 'https://example.invalid/webhook' }, enabled: true }, response: { id: 'channel-01', config: { url: '******' } } }),
   endpoint('告警', 'PUT', '/alerts/channels', '更新通知渠道', { body: { id: 'channel-01', name: 'DBA Webhook', type: 'webhook', config: { url: '******' }, enabled: true }, response: { id: 'channel-01', config: { url: '******' } } }),
   endpoint('告警', 'DELETE', '/alerts/channels?id={channel_id}', '删除通知渠道', { response: deletedResponse }),
@@ -430,11 +439,11 @@ export const manualModules = [
     number: '14',
     title: '告警中心',
     scope: '可观测性',
-    summary: '管理规则、过滤器、事件和通知渠道，并向 Prometheus/Zabbix 暴露状态。',
-    steps: ['从指标目录选择可用指标', '配置阈值、持续时间与严重级别', '绑定并测试通知渠道', '对事件确认、静默或关闭', '观察投递记录和队列运行状态'],
+    summary: '按主机、Agent、可用性、连接、复制、事务锁、SQL、存储、碎片和日志安全管理规则，并向 Prometheus/Zabbix 暴露状态。',
+    steps: ['先核对十类内置规则覆盖卡片', '从指标目录选择可用指标', '按负载调整分级阈值与连续次数', '绑定并测试通知渠道', '对事件确认、静默或关闭', '观察投递记录和队列运行状态'],
     principle: '每次心跳触发规则计算；持续时间和状态机抑制瞬时抖动，通知通过持久化 outbox 重试投递。',
     implementation: 'AlertService 维护规则、事件、通知队列和投递记录；敏感渠道配置在读取时统一掩码。',
-    caution: '静默只影响通知，不修复故障；过滤范围过宽可能隐藏真实风险。'
+    caution: '碎片告警中的 DATA_FREE 是候选容量估算，不能直接等同于文件系统可回收空间；静默只影响通知，过滤范围过宽可能隐藏真实风险。'
   },
   {
     id: 'ai-automation',
@@ -481,6 +490,17 @@ export const manualModules = [
     caution: '不要在 Manager 运行时手工删除 manager.db-wal 或 manager.db-shm；长读事务阻塞 checkpoint 时应先结束事务再重试。SQLite 不能用于多节点；VIP 漂移和关闭节点前应确认目标节点在线。'
   },
   {
+    id: 'accounts',
+    number: '18',
+    title: '平台账号与权限',
+    scope: '账号管理',
+    summary: '通过账号密码登录平台，为每个账号维护姓名、邮箱、电话、角色、功能权限和启停状态。',
+    steps: ['使用 admin 或 admin 角色账号进入账号管理', '创建账号并填写身份资料与至少 8 位密码', '选择角色模板后逐项核对功能权限', '保存并让用户在 2 小时会话内登录使用', '人员离岗时停用或删除账号并确认会话失效'],
+    principle: '菜单可见性与后端接口使用同一权限目录；前端隐藏只是体验，真正授权在 Manager 请求中间件完成。',
+    implementation: 'AccountService 使用 bcrypt 保存密码摘要、随机会话令牌的 SHA-256 摘要和固定 2 小时过期时间；HttpOnly Cookie 不向页面脚本暴露令牌。',
+    caution: '首次默认 admin 密码为 admin，生产部署应通过环境变量覆盖或登录后立即修改；不要共享管理员账号。'
+  },
+  {
     id: 'manager-ha',
     number: '19',
     title: 'Manager 高可用',
@@ -502,6 +522,8 @@ const commonErrors = [
   ['400', '请求格式、必填字段、状态或风险确认不满足要求', '{"error":"具体校验原因"}'],
   ['404', '对象、任务、制品或接口路径不存在', '{"error":"not found"}'],
   ['405', '该路径不支持当前 HTTP 方法', '通常无响应体'],
+  ['401', '未登录、会话不存在或 2 小时会话已过期', '{"error":"请先登录"}'],
+  ['403', '当前账号缺少目标功能权限', '{"error":"当前账号没有该功能权限"}'],
   ['409', '告警等资源发生并发状态冲突', '{"error":"conflict detail"}'],
   ['422', '指标存在但当前版本或采集条件不可用', '{"error":"...","metric":"..."}'],
   ['500', 'Manager 内部或持久化读取失败', '{"error":"具体错误"}']
@@ -514,7 +536,7 @@ const asJSON = value => {
 }
 
 const curlFor = (item, baseURL) => {
-  const path = item.path.replaceAll('{machine_id}', 'machine-01').replaceAll('{credential_id}', 'cred-01').replaceAll('{cluster_name}', 'prod').replaceAll('{task_id}', 'task-01HX').replaceAll('{profile_id}', 'profile-01').replaceAll('{schedule_id}', 'schedule-01').replaceAll('{policy_id}', 'policy-01').replaceAll('{run_id}', 'run-01').replaceAll('{rule_id}', 'rule-01').replaceAll('{filter_id}', 'filter-01').replaceAll('{channel_id}', 'channel-01').replaceAll('{job_id}', 'upgrade-01').replaceAll('{category}', 'mysql').replaceAll('{file_name}', 'package.tar.xz')
+  const path = item.path.replaceAll('{machine_id}', 'machine-01').replaceAll('{credential_id}', 'cred-01').replaceAll('{cluster_name}', 'prod').replaceAll('{task_id}', 'task-01HX').replaceAll('{profile_id}', 'profile-01').replaceAll('{schedule_id}', 'schedule-01').replaceAll('{policy_id}', 'policy-01').replaceAll('{run_id}', 'run-01').replaceAll('{rule_id}', 'rule-01').replaceAll('{filter_id}', 'filter-01').replaceAll('{channel_id}', 'channel-01').replaceAll('{job_id}', 'upgrade-01').replaceAll('{account_id}', 'user-example').replaceAll('{category}', 'mysql').replaceAll('{file_name}', 'package.tar.xz')
   const parts = [`curl -i -X ${item.method} '${baseURL}${path}'`]
   if (item.contentType === 'application/json' && item.body !== undefined) {
     parts.push(`  -H 'Content-Type: application/json'`)
@@ -530,7 +552,7 @@ const curlFor = (item, baseURL) => {
 }
 
 const jsFor = item => {
-  const path = item.path.replaceAll('{machine_id}', 'machine-01').replaceAll('{credential_id}', 'cred-01').replaceAll('{cluster_name}', 'prod').replaceAll('{task_id}', 'task-01HX').replaceAll('{profile_id}', 'profile-01').replaceAll('{schedule_id}', 'schedule-01').replaceAll('{policy_id}', 'policy-01').replaceAll('{run_id}', 'run-01').replaceAll('{rule_id}', 'rule-01').replaceAll('{filter_id}', 'filter-01').replaceAll('{channel_id}', 'channel-01').replaceAll('{job_id}', 'upgrade-01').replaceAll('{category}', 'mysql').replaceAll('{file_name}', 'package.tar.xz')
+  const path = item.path.replaceAll('{machine_id}', 'machine-01').replaceAll('{credential_id}', 'cred-01').replaceAll('{cluster_name}', 'prod').replaceAll('{task_id}', 'task-01HX').replaceAll('{profile_id}', 'profile-01').replaceAll('{schedule_id}', 'schedule-01').replaceAll('{policy_id}', 'policy-01').replaceAll('{run_id}', 'run-01').replaceAll('{rule_id}', 'rule-01').replaceAll('{filter_id}', 'filter-01').replaceAll('{channel_id}', 'channel-01').replaceAll('{job_id}', 'upgrade-01').replaceAll('{account_id}', 'user-example').replaceAll('{category}', 'mysql').replaceAll('{file_name}', 'package.tar.xz')
   const options = [`method: '${item.method}'`]
   if (item.body !== undefined && item.contentType === 'application/json') {
     options.push(`headers: { 'Content-Type': 'application/json' }`)

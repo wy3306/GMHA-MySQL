@@ -29,6 +29,7 @@ func TestPerformanceCatalogIncludesEveryConfiguredMetricAndMachineSeries(t *test
 		"host_filesystem_used_percent", "host_inode_used_percent",
 		"host_network_receive_bytes_sec", "host_network_transmit_bytes_sec",
 		"host_memory_available_bytes", "host_mysql_process_rss_bytes",
+		"ntp_offset_abs_ms",
 		"mysql_memory_tracked_bytes", "mysql_memory_module_bytes",
 	} {
 		if item, ok := seen[name]; !ok || !item.Available {

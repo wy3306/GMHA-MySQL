@@ -45,9 +45,28 @@ func newRouterSmokeApp(t *testing.T) *app.App {
 	return core
 }
 
+func routerAdminCookie(t *testing.T, router http.Handler) *http.Cookie {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewBufferString(`{"username":"admin","password":"admin"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("admin login returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+	for _, cookie := range recorder.Result().Cookies() {
+		if cookie.Name == "gmha_session" {
+			return cookie
+		}
+	}
+	t.Fatal("admin login did not set session cookie")
+	return nil
+}
+
 func TestRouterReadOnlyModuleSmoke(t *testing.T) {
 	core := newRouterSmokeApp(t)
 	router := NewRouter(core)
+	cookie := routerAdminCookie(t, router)
 	strictOK := []string{
 		"/api/v1/healthz",
 		"/api/v1/machines?page=1&page_size=20&cluster=all",
@@ -91,7 +110,9 @@ func TestRouterReadOnlyModuleSmoke(t *testing.T) {
 	for _, path := range strictOK {
 		t.Run(path, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
-			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+			request := httptest.NewRequest(http.MethodGet, path, nil)
+			request.AddCookie(cookie)
+			router.ServeHTTP(recorder, request)
 			if recorder.Code != http.StatusOK {
 				t.Fatalf("GET %s returned %d: %s", path, recorder.Code, recorder.Body.String())
 			}
@@ -102,6 +123,7 @@ func TestRouterReadOnlyModuleSmoke(t *testing.T) {
 func TestRouterMissingResourceReadsNeverReturnServerErrors(t *testing.T) {
 	core := newRouterSmokeApp(t)
 	router := NewRouter(core)
+	cookie := routerAdminCookie(t, router)
 	paths := []string{
 		"/api/v1/machines/missing",
 		"/api/v1/machines/missing/delete-precheck",
@@ -121,7 +143,9 @@ func TestRouterMissingResourceReadsNeverReturnServerErrors(t *testing.T) {
 	for _, path := range paths {
 		t.Run(path, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
-			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+			request := httptest.NewRequest(http.MethodGet, path, nil)
+			request.AddCookie(cookie)
+			router.ServeHTTP(recorder, request)
 			if recorder.Code >= http.StatusInternalServerError {
 				t.Fatalf("GET %s returned %d: %s", path, recorder.Code, recorder.Body.String())
 			}
@@ -132,6 +156,7 @@ func TestRouterMissingResourceReadsNeverReturnServerErrors(t *testing.T) {
 func TestRouterInvalidMutationsFailWithoutServerErrors(t *testing.T) {
 	core := newRouterSmokeApp(t)
 	router := NewRouter(core)
+	cookie := routerAdminCookie(t, router)
 	tests := []smokeMutation{
 		{http.MethodPost, "/api/v1/machines"},
 		{http.MethodPost, "/api/v1/machines/precheck"},
@@ -187,6 +212,7 @@ func TestRouterInvalidMutationsFailWithoutServerErrors(t *testing.T) {
 		{http.MethodPost, "/api/v1/alerts/filters"},
 		{http.MethodPost, "/api/v1/alerts/events/action"},
 		{http.MethodPost, "/api/v1/alerts/channels"},
+		{http.MethodPatch, "/api/v1/alerts/channels"},
 		{http.MethodPost, "/api/v1/alerts/channels/test"},
 		{http.MethodPut, "/api/v1/manager/config"},
 		{http.MethodPost, "/api/v1/manager/database/test"},
@@ -206,6 +232,7 @@ func TestRouterInvalidMutationsFailWithoutServerErrors(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			request := httptest.NewRequest(tt.method, tt.path, bytes.NewBufferString(`{}`))
 			request.Header.Set("Content-Type", "application/json")
+			request.AddCookie(cookie)
 			recorder := httptest.NewRecorder()
 			router.ServeHTTP(recorder, request)
 			if recorder.Code >= http.StatusInternalServerError {

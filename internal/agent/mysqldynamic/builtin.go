@@ -69,6 +69,8 @@ func (c *BuiltinCollector) collect(ctx context.Context, env *CollectEnv, spec dy
 		return collectVariableBool(ctx, env, "read_only")
 	case "mysql_super_read_only":
 		return collectVariableBool(ctx, env, "super_read_only")
+	case "mysql_slow_query_log_enabled":
+		return collectVariableBool(ctx, env, "slow_query_log")
 	case "mysql_threads_running":
 		return collectStatus(ctx, env, "Threads_running")
 	case "mysql_tps":
@@ -741,7 +743,21 @@ func collectReplicaField(ctx context.Context, env *CollectEnv, spec dyndomain.Co
 	if slaveField == "" {
 		slaveField = spec.Params["slave_field"]
 	}
-	return parseNumberOrString(firstNonEmpty(status[replicaField], status[slaveField])), nil
+	value := firstNonEmpty(status[replicaField], status[slaveField])
+	if strings.HasSuffix(replicaField, "_Running") || strings.HasSuffix(slaveField, "_Running") {
+		return normalizeReplicaThreadRunning(status, value), nil
+	}
+	return parseNumberOrString(value), nil
+}
+
+func normalizeReplicaThreadRunning(status map[string]string, value string) bool {
+	// Primary/standalone instances do not expose a replica status row and
+	// must not fire replica-thread alerts. Replicas normalize Yes/No to a
+	// numeric boolean so alert rules are actually evaluable.
+	if len(status) == 0 {
+		return true
+	}
+	return strings.EqualFold(value, "yes") || strings.EqualFold(value, "on") || value == "1"
 }
 
 func collectRole(ctx context.Context, env *CollectEnv) (string, error) {

@@ -78,13 +78,37 @@ func TestAlertRepositoryPersistsRuleEventChannelAndMetricConfig(t *testing.T) {
 	if err != nil || summary.Total != 1 || summary.Counts["firing"] != 1 || summary.Counts["warning"] != 1 || summary.ActiveAcknowledged != 1 || summary.ActiveSilenced != 1 {
 		t.Fatalf("summary: %+v %v", summary, err)
 	}
-	channel := alertdomain.Channel{ID: "channel-1", Name: "webhook", Type: "webhook", Enabled: true, MinimumSeverity: alertdomain.SeverityWarning, Config: map[string]string{"url": "https://example.test"}, CreatedAt: now, UpdatedAt: now}
+	roles, err := repo.ListNotificationRoles(ctx)
+	if err != nil || len(roles) < 5 {
+		t.Fatalf("seeded notification roles: %+v %v", roles, err)
+	}
+	recipient := alertdomain.NotificationRecipient{ID: "recipient-1", Name: "张三", Email: "zhangsan@example.com", RoleIDs: []string{roles[0].ID}, Enabled: true, CreatedAt: now, UpdatedAt: now}
+	if err := repo.SaveNotificationRecipient(ctx, recipient); err != nil {
+		t.Fatal(err)
+	}
+	recipients, err := repo.ListNotificationRecipients(ctx)
+	if err != nil || len(recipients) != 1 || recipients[0].Email != recipient.Email || len(recipients[0].RoleIDs) != 1 {
+		t.Fatalf("notification recipients: %+v %v", recipients, err)
+	}
+	channel := alertdomain.Channel{ID: "channel-1", Name: "webhook", Type: "webhook", Enabled: true, MinimumSeverity: alertdomain.SeverityWarning, RecipientRoles: []string{"dba", "oncall"}, RecipientIDs: []string{recipient.ID}, ContentFilter: alertdomain.ChannelContentFilter{Categories: []string{"replication", "storage"}, EventStates: []string{"firing"}}, Config: map[string]string{"url": "https://example.test"}, CreatedAt: now, UpdatedAt: now}
 	if err := repo.SaveChannel(ctx, channel); err != nil {
 		t.Fatal(err)
 	}
 	channels, err := repo.ListChannels(ctx)
-	if err != nil || len(channels) != 1 || channels[0].Config["url"] == "" {
+	if err != nil || len(channels) != 1 || channels[0].Config["url"] == "" || len(channels[0].RecipientRoles) != 2 || len(channels[0].RecipientIDs) != 1 || len(channels[0].ContentFilter.Categories) != 2 || len(channels[0].ContentFilter.EventStates) != 1 {
 		t.Fatalf("channels: %+v %v", channels, err)
+	}
+	channel.Enabled = false
+	if err := repo.SaveChannel(ctx, channel); err != nil {
+		t.Fatal(err)
+	}
+	deliveredAt := now.Add(time.Minute)
+	if err := repo.UpdateChannelDeliveryStatus(ctx, channel.ID, "success", "", &deliveredAt, deliveredAt); err != nil {
+		t.Fatal(err)
+	}
+	channels, err = repo.ListChannels(ctx)
+	if err != nil || len(channels) != 1 || channels[0].Enabled || channels[0].LastStatus != "success" {
+		t.Fatalf("delivery status update must not re-enable a disabled channel: %+v %v", channels, err)
 	}
 	delivery := alertdomain.Delivery{ID: "delivery-1", EventID: event.ID, RuleName: rule.Name, Severity: rule.Severity, MachineID: "m1", ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: channel.Type, Status: "success", DeliveredAt: now}
 	if err := repo.SaveDelivery(ctx, delivery); err != nil {

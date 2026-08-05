@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	hadomain "gmha/internal/domain/ha"
@@ -38,14 +39,25 @@ type HARepository interface {
 
 // HAService 是高可用服务，负责故障转移规划和执行、VIP 管理、候选评分。
 type HAService struct {
-	repo            HARepository
-	machines        machinedomain.Repository
-	instances       MySQLInstanceRepository
-	presets         MySQLAccountPresetRepository
-	vip             *VIPService
-	tasks           *TaskService
-	packages        *PackageService
-	managerHTTPAddr string
+	repo                   HARepository
+	machines               machinedomain.Repository
+	instances              MySQLInstanceRepository
+	presets                MySQLAccountPresetRepository
+	vip                    *VIPService
+	tasks                  *TaskService
+	packages               *PackageService
+	managerHTTPAddr        string
+	topologyRecoveryStop   chan struct{}
+	topologyRecoveryDone   chan struct{}
+	topologyRecoveryCancel context.CancelFunc
+	topologyRecoveryMu     sync.Mutex
+	topologyRecoveryLast   map[string]time.Time
+}
+
+type topologyIntentRepository interface {
+	SaveTopologyIntent(context.Context, hadomain.TopologyIntent) error
+	GetTopologyIntent(context.Context, string) (hadomain.TopologyIntent, bool, error)
+	ListTopologyIntents(context.Context) ([]hadomain.TopologyIntent, error)
 }
 
 func NewHAService(repo HARepository, machines machinedomain.Repository, instances MySQLInstanceRepository, presets ...MySQLAccountPresetRepository) *HAService {
@@ -206,6 +218,41 @@ func (s *HAService) ConfigureArchitectureExecutor(tasks *TaskService) {
 	s.vip.tasks = tasks
 	if recovery, ok := s.repo.(architectureRunRecoveryRepository); ok {
 		_ = recovery.MarkInterruptedArchitectureRuns(context.Background())
+	}
+}
+
+func (s *HAService) SaveTopologyIntent(ctx context.Context, intent hadomain.TopologyIntent) error {
+	repo, ok := s.repo.(topologyIntentRepository)
+	if !ok {
+		return nil
+	}
+	intent.ClusterID = strings.TrimSpace(intent.ClusterID)
+	intent.Architecture = strings.TrimSpace(intent.Architecture)
+	intent.UpdatedAt = time.Now().UTC()
+	return repo.SaveTopologyIntent(ctx, intent)
+}
+
+func (s *HAService) GetTopologyIntent(ctx context.Context, clusterID string) (hadomain.TopologyIntent, bool, error) {
+	repo, ok := s.repo.(topologyIntentRepository)
+	if !ok {
+		return hadomain.TopologyIntent{}, false, nil
+	}
+	return repo.GetTopologyIntent(ctx, strings.TrimSpace(clusterID))
+}
+
+func topologyIntentFromArchitectureRun(run hadomain.ArchitectureRun) hadomain.TopologyIntent {
+	primary := strings.TrimSpace(run.Request.PreferredNewMasterMachineID)
+	if primary == "" {
+		primary = strings.TrimSpace(run.Request.CurrentMasterMachineID)
+	}
+	if primary == "" {
+		primary = strings.TrimSpace(run.Plan.SelectedCandidate.MachineID)
+	}
+	return hadomain.TopologyIntent{
+		ClusterID: run.ClusterID, Architecture: run.Request.Architecture,
+		PrimaryMachineID: primary, MGRGroupName: run.Request.MGRGroupName,
+		Nodes:     append([]hadomain.ArchitectureNodeRequest(nil), run.Request.Nodes...),
+		UpdatedAt: time.Now().UTC(),
 	}
 }
 

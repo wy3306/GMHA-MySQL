@@ -109,6 +109,7 @@ func (h *TaskHandler) HandleTasks(w http.ResponseWriter, r *http.Request) {
 		}
 		var req struct {
 			TaskIDs     []string `json:"task_ids"`
+			All         bool     `json:"all"`
 			AllFiltered bool     `json:"all_filtered"`
 			Keyword     string   `json:"keyword"`
 			Status      string   `json:"status"`
@@ -119,7 +120,7 @@ func (h *TaskHandler) HandleTasks(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		result, err := h.service.DeleteTasks(r.Context(), app.DeleteTasksRequest{
-			TaskIDs: req.TaskIDs, AllFiltered: req.AllFiltered,
+			TaskIDs: req.TaskIDs, All: req.All, AllFiltered: req.AllFiltered,
 			Query: app.TaskListQuery{Keyword: req.Keyword, Statuses: taskStatusFilter(req.Status), Types: taskTypeFilter(req.Type)},
 		})
 		if err != nil {

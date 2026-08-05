@@ -52,6 +52,9 @@ type TaskService struct {
 	flameGraphs    FlameGraphTaskResultSaver
 	clusterHA      *HAService
 	clusterBackup  *BackupService
+	topologyIntent interface {
+		SaveTopologyIntent(context.Context, hadomain.TopologyIntent) error
+	}
 }
 
 // FlameGraphTaskResultSaver keeps TaskService independent from the profiling
@@ -117,6 +120,7 @@ type TaskListPage struct {
 
 type DeleteTasksRequest struct {
 	TaskIDs     []string
+	All         bool
 	AllFiltered bool
 	Query       TaskListQuery
 }
@@ -459,7 +463,65 @@ func (s *TaskService) syncParentTask(ctx context.Context, parentTaskID string) e
 	if err != nil || len(children) == 0 {
 		return err
 	}
-	return s.repo.UpdateTask(ctx, aggregated)
+	if err := s.repo.UpdateTask(ctx, aggregated); err != nil {
+		return err
+	}
+	if aggregated.Status == taskdomain.StatusSuccess && s.topologyIntent != nil {
+		var parentSpec map[string]any
+		_ = json.Unmarshal(aggregated.SpecJSON, &parentSpec)
+		if strings.EqualFold(fmt.Sprint(parentSpec["operation"]), "mysql_topology") {
+			if err := s.recordCompletedTopologyIntent(ctx, children); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (s *TaskService) recordCompletedTopologyIntent(ctx context.Context, children []taskdomain.Task) error {
+	if len(children) == 0 || s.machines == nil || s.topologyIntent == nil {
+		return nil
+	}
+	var spec taskdomain.MySQLTopologySpec
+	if err := json.Unmarshal(children[0].SpecJSON, &spec); err != nil {
+		return err
+	}
+	machine, found, err := s.machines.GetByID(ctx, children[0].MachineID)
+	if err != nil || !found {
+		return err
+	}
+	architecture := hadomain.ArchitectureMasterSlave
+	if spec.Topology == taskusecase.MySQLTopologyMultiMaster {
+		architecture = hadomain.ArchitectureDualMaster
+	}
+	primary := strings.TrimSpace(spec.PrimaryMachine)
+	primaryIsID := false
+	for _, node := range spec.Nodes {
+		if node.MachineID == primary {
+			primaryIsID = true
+		}
+		if primary != "" && (node.MachineName == primary || node.IP == primary) {
+			primary = node.MachineID
+			primaryIsID = true
+		}
+	}
+	if !primaryIsID {
+		primary = ""
+	}
+	nodes := make([]hadomain.ArchitectureNodeRequest, 0, len(spec.Nodes))
+	for _, node := range spec.Nodes {
+		if primary == "" && strings.EqualFold(node.Role, "M") {
+			primary = node.MachineID
+		}
+		nodes = append(nodes, hadomain.ArchitectureNodeRequest{
+			MachineID: node.MachineID, Port: node.Port, Role: node.Role,
+			SourceMachineID: node.SourceMachineID, DelaySeconds: node.ReplicationDelaySeconds,
+		})
+	}
+	return s.topologyIntent.SaveTopologyIntent(ctx, hadomain.TopologyIntent{
+		ClusterID: machine.Cluster, Architecture: architecture,
+		PrimaryMachineID: primary, Nodes: nodes, UpdatedAt: time.Now().UTC(),
+	})
 }
 
 // NewTaskService 创建任务管理服务实例。
@@ -488,6 +550,7 @@ func NewTaskService(repo taskdomain.Repository, createExec *taskusecase.CreateEx
 func (s *TaskService) ConfigureClusterSafetyDependencies(ha *HAService, backup *BackupService) {
 	s.clusterHA = ha
 	s.clusterBackup = backup
+	s.topologyIntent = ha
 }
 
 func (s *TaskService) SetFlameGraphTaskResultSaver(saver FlameGraphTaskResultSaver) {
@@ -2426,9 +2489,11 @@ func (s *TaskService) commonRelatedParent(ctx context.Context, taskIDs []string)
 	return candidate
 }
 
-// DeleteTask removes a terminal task together with its steps and events.
-// Pending or active tasks must remain durable until the Agent reports a final
-// state, otherwise execution could continue without an audit trail.
+// DeleteTask removes a terminal business task together with its complete
+// execution tree. Pending or active top-level tasks remain durable until they
+// reach a final state. A terminal business task may contain an internal child
+// left in a stale active state after orchestration failed; that child is part
+// of the completed business record and must not prevent cleanup.
 func (s *TaskService) DeleteTask(ctx context.Context, taskID string) error {
 	taskID = strings.TrimSpace(taskID)
 	if taskID == "" {
@@ -2444,13 +2509,14 @@ func (s *TaskService) DeleteTask(ctx context.Context, taskID string) error {
 	if task.ParentTaskID != "" {
 		return fmt.Errorf("task %s is a child task; delete its parent task %s instead", taskID, task.ParentTaskID)
 	}
+	storedStatus := task.Status
 	if aggregated, children, aggregateErr := s.aggregateParentTask(ctx, task); aggregateErr != nil {
 		return aggregateErr
 	} else if len(children) > 0 {
 		task = aggregated
 	}
-	if err := s.ensureTaskTreeTerminal(ctx, task); err != nil {
-		return err
+	if !taskdomain.IsTerminalStatus(storedStatus) && !taskdomain.IsTerminalStatus(task.Status) {
+		return fmt.Errorf("task %s is %s and cannot be deleted before completion", task.ID, task.Status)
 	}
 	if repo, ok := s.repo.(taskHierarchyRepository); ok {
 		return repo.DeleteTaskTree(ctx, taskID)
@@ -2458,30 +2524,15 @@ func (s *TaskService) DeleteTask(ctx context.Context, taskID string) error {
 	return s.repo.DeleteTask(ctx, taskID)
 }
 
-func (s *TaskService) ensureTaskTreeTerminal(ctx context.Context, item taskdomain.Task) error {
-	if !taskdomain.IsTerminalStatus(item.Status) {
-		return fmt.Errorf("task %s is %s and cannot be deleted before completion", item.ID, item.Status)
-	}
-	repo, ok := s.repo.(childTaskRepository)
-	if !ok {
-		return nil
-	}
-	children, err := repo.ListChildTasks(ctx, item.ID)
-	if err != nil {
-		return err
-	}
-	for _, child := range children {
-		if err := s.ensureTaskTreeTerminal(ctx, child); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (s *TaskService) DeleteTasks(ctx context.Context, req DeleteTasksRequest) (DeleteTasksResult, error) {
 	ids := append([]string(nil), req.TaskIDs...)
-	if req.AllFiltered {
+	if req.All || req.AllFiltered {
 		query := req.Query
+		if req.All {
+			// The explicit all-records action is independent of whatever filters
+			// happen to be active in the task-center UI.
+			query = TaskListQuery{}
+		}
 		query.Offset, query.Limit = 0, 200
 		for {
 			page, err := s.ListTaskPage(ctx, query)
@@ -2516,7 +2567,7 @@ func (s *TaskService) DeleteTasks(ctx context.Context, req DeleteTasksRequest) (
 		result.Items = append(result.Items, item)
 	}
 	if result.Requested == 0 {
-		return result, errors.New("at least one task id or all_filtered is required")
+		return result, errors.New("at least one task id, all, or all_filtered is required")
 	}
 	return result, nil
 }

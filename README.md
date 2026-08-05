@@ -5,13 +5,29 @@ GMHA（Go MySQL High Availability）是一套 Go 原生的 MySQL 高可用管理
 ## 项目入口
 
 - [产品介绍网站](http://gmha.weiyaonas.club/)：功能概览、系统架构、产品截图与最新稳定版下载。
-- [在线演示网站](http://demo.weiyaonas.club/)：只读体验完整 GMHA 控制台，不会执行真实运维操作。
+- [在线演示网站](http://demo.weiyaonas.club/)：免密进入 admin，只读体验完整 GMHA 控制台，不会执行真实运维操作。
 - [GitHub Releases](https://github.com/wy3306/GMHA-MySQL/releases)：历史版本、Linux 安装包、独立升级制品与 SHA-256 校验文件。
 
 实例管理控制台 14 项操作的完整 HTTP 契约、异步结果读取方式与安全约束见 [实例管理 API 手册](docs/instance-management-api.md)。
 备份目标发现、策略管理、运行查询、批量备份以及物理恢复/时间点恢复/数据闪回的 HTTP 契约见 [备份恢复 API 手册](docs/backup-recovery-api.md)。
 
 ## 版本更新记录
+
+### V0.2.1（2026-08-05）
+
+更新内容：
+
+- 新增平台账号登录、角色与细粒度权限管理，支持管理员、运维、DBA、审计等角色以及两小时安全会话。
+- 告警中心支持按平台用户和角色选择接收人，完善触发/恢复通知、事件上下文、渠道过滤和邮件内容展示。
+- 新增集群拓扑自动恢复与实例运行状态识别，强化主从/MGR 架构调整、故障恢复、健康检查和执行后校验。
+- 优化心跳历史与性能样本的有界清理、任务记录批量清理、MySQL 参数目录及控制台交互反馈。
+- 演示环境支持通过 `GMHA_DEMO_AUTO_LOGIN_ADMIN=true` 免密进入 admin；正式环境默认关闭，演示站继续由反向代理强制只读。
+
+Bug 修复：
+
+- 修复告警重复触发、恢复状态缺失、通知目标不准确以及部分 MySQL 指标缺少实例上下文的问题。
+- 修复心跳历史和任务记录长期增长、异常样本误清理、实例服务状态不同步及拓扑恢复记录不完整的问题。
+- 修复 Manager/MGR 管理、集群自动化参数、实例健康展示和任务中心清理中的多项边界问题。
 
 ### V0.1.1（2026-08-04）
 
@@ -124,10 +140,12 @@ Release 程序包提供独立的 `gmha-web` 启动器。执行 `./start-web.sh` 
 本地构建 Linux x86_64 程序包：
 
 ```bash
-./scripts/build-release.sh V0.1.1
+./scripts/build-release.sh V0.2.1
 ```
 
-构建结果位于 `dist/gmha-V0.1.1-linux-amd64.tar.gz`，并同时生成 SHA-256 校验文件。
+构建结果位于 `dist/gmha-V0.2.1-linux-amd64.tar.gz`，并同时生成 SHA-256 校验文件。
+完整包默认内置同版本的 Manager x86_64、Agent x86_64 与 Agent ARM64 安装包及
+制品索引；控制台会把仓库中的最高版本自动作为默认目标。
 
 ## 数据库配置
 

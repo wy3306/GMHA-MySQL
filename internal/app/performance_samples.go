@@ -36,7 +36,7 @@ func normalizePerformanceSamples(status hbdomain.LatestStatus, metrics []dynamic
 			AgentID: status.AgentID, MachineID: status.MachineID, ClusterID: status.ClusterID,
 			Scope: scope, Category: metric.Category, MetricName: metric.Name,
 			Instance: instance, Labels: performanceCloneLabels(metric.Labels), ValueType: metric.ValueType,
-			Value: metric.Value, Success: metric.Success, Error: metric.Error, CollectedAt: at,
+			Value: metric.Value, Success: metric.Success, HeartbeatAbnormal: heartbeatIsAbnormal(status), Error: metric.Error, CollectedAt: at,
 		}
 		if number, ok := performanceNumber(metric.Value); ok {
 			base.NumericValue = numberPointer(number)
@@ -124,7 +124,7 @@ func flattenPerformanceMetric(metric dynamicdomain.MetricResult) []performanceLe
 			"load1": "host_load_1m", "load5": "host_load_5m", "load15": "host_load_15m",
 		})
 	case "ntp_offset_ms":
-		return flattenFlatMap(metric.Value, "system", map[string]string{"offset_ms": "ntp_offset_ms"})
+		return flattenFlatMap(metric.Value, "system", map[string]string{"offset_ms": "ntp_offset_ms", "offset_abs_ms": "ntp_offset_abs_ms"})
 	case "filesystem_usage":
 		return flattenArray(metric.Value, "mount", "filesystem", map[string]string{
 			"used_percent": "host_filesystem_used_percent", "used_bytes": "host_filesystem_used_bytes",

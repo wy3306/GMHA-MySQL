@@ -18,7 +18,7 @@ func mysql57TopologySpec() taskdomain.MySQLTopologySpec {
 func TestMySQL57TopologyUsesLegacyConfigAndAccounts(t *testing.T) {
 	spec := mysql57TopologySpec()
 	config := topologyConfigureMyCNFCommand(spec)
-	for _, expected := range []string{"log_slave_updates=ON", "skip_slave_start=ON", "slave_parallel_type=LOGICAL_CLOCK", "--verbose --help"} {
+	for _, expected := range []string{"log_slave_updates=ON", "skip_slave_start=OFF", "slave_parallel_type=LOGICAL_CLOCK", "--verbose --help"} {
 		if !strings.Contains(config, expected) {
 			t.Fatalf("MySQL 5.7 topology config missing %q: %s", expected, config)
 		}
@@ -51,7 +51,7 @@ func TestEarlyMySQL80TopologyUsesLegacyAliasesAndCloneBoundary(t *testing.T) {
 	spec := mysql57TopologySpec()
 	spec.Node.Version = "8.0.25"
 	config := topologyConfigureMyCNFCommand(spec)
-	for _, expected := range []string{"log_slave_updates=ON", "skip_slave_start=ON", "slave_parallel_workers=4"} {
+	for _, expected := range []string{"log_slave_updates=ON", "skip_slave_start=OFF", "slave_parallel_workers=4"} {
 		if !strings.Contains(config, expected) {
 			t.Fatalf("MySQL 8.0.25 topology config missing %q: %s", expected, config)
 		}

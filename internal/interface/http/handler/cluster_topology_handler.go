@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"gmha/internal/app"
+	hadomain "gmha/internal/domain/ha"
 )
 
 // ClusterTopologyHandler 为 Web 提供与 CLI“查看当前集群架构”一致的只读拓扑视图。
@@ -19,7 +20,10 @@ type ClusterTopologyHandler struct {
 	mysql     *app.MySQLService
 	heartbeat *app.HeartbeatService
 	backup    *app.BackupService
+	ha        *app.HAService
 }
+
+func (h *ClusterTopologyHandler) SetHAService(service *app.HAService) { h.ha = service }
 
 func NewClusterTopologyHandler(machines *app.MachineService, mysql *app.MySQLService, heartbeat *app.HeartbeatService, backup ...*app.BackupService) *ClusterTopologyHandler {
 	var backupService *app.BackupService
@@ -30,37 +34,43 @@ func NewClusterTopologyHandler(machines *app.MachineService, mysql *app.MySQLSer
 }
 
 type clusterTopologyView struct {
-	Cluster      string                `json:"cluster"`
-	Architecture string                `json:"architecture"`
-	Nodes        []clusterTopologyNode `json:"nodes"`
-	Edges        []clusterTopologyEdge `json:"edges"`
-	Overview     clusterOverviewView   `json:"overview"`
+	Cluster           string                `json:"cluster"`
+	Architecture      string                `json:"architecture"`
+	Nodes             []clusterTopologyNode `json:"nodes"`
+	Edges             []clusterTopologyEdge `json:"edges"`
+	Overview          clusterOverviewView   `json:"overview"`
+	TopologySource    string                `json:"topology_source"`
+	Consistency       string                `json:"consistency"`
+	ConsistencyDetail string                `json:"consistency_detail,omitempty"`
+	expectedEdges     int
 }
 
 type clusterTopologyNode struct {
-	MachineID     string `json:"machine_id"`
-	Name          string `json:"name"`
-	IP            string `json:"ip"`
-	Port          int    `json:"port"`
-	Role          string `json:"role"`
-	ServerID      int    `json:"server_id"`
-	ReadOnly      string `json:"read_only"`
-	SuperRO       string `json:"super_read_only"`
-	Heartbeat     string `json:"heartbeat"`
-	Version       string `json:"version"`
-	QPS           string `json:"qps,omitempty"`
-	TPS           string `json:"tps,omitempty"`
-	Connections   string `json:"connections,omitempty"`
-	Uptime        string `json:"uptime,omitempty"`
-	LastUpdated   string `json:"last_updated"`
-	Error         string `json:"error,omitempty"`
-	GroupName     string `json:"group_name,omitempty"`
-	GroupState    string `json:"group_state,omitempty"`
-	GroupRole     string `json:"group_role,omitempty"`
-	GroupMemberID string `json:"group_member_id,omitempty"`
-	GroupMembers  int    `json:"group_members,omitempty"`
-	GroupOnline   int    `json:"group_online,omitempty"`
-	GroupQuorum   bool   `json:"group_quorum,omitempty"`
+	MachineID        string `json:"machine_id"`
+	Name             string `json:"name"`
+	IP               string `json:"ip"`
+	Port             int    `json:"port"`
+	Role             string `json:"role"`
+	ServerID         int    `json:"server_id"`
+	ReadOnly         string `json:"read_only"`
+	SuperRO          string `json:"super_read_only"`
+	Heartbeat        string `json:"heartbeat"`
+	Version          string `json:"version"`
+	QPS              string `json:"qps,omitempty"`
+	TPS              string `json:"tps,omitempty"`
+	Connections      string `json:"connections,omitempty"`
+	Uptime           string `json:"uptime,omitempty"`
+	LastUpdated      string `json:"last_updated"`
+	Error            string `json:"error,omitempty"`
+	GroupName        string `json:"group_name,omitempty"`
+	GroupState       string `json:"group_state,omitempty"`
+	GroupRole        string `json:"group_role,omitempty"`
+	GroupMemberID    string `json:"group_member_id,omitempty"`
+	GroupMembers     int    `json:"group_members,omitempty"`
+	GroupOnline      int    `json:"group_online,omitempty"`
+	GroupQuorum      bool   `json:"group_quorum,omitempty"`
+	ApplyQueue       int    `json:"apply_queue,omitempty"`
+	RemoteApplyQueue int    `json:"remote_apply_queue,omitempty"`
 }
 
 type clusterTopologyEdge struct {
@@ -76,6 +86,7 @@ type clusterTopologyEdge struct {
 	SQLDelay        int    `json:"sql_delay"`
 	LastError       string `json:"last_error,omitempty"`
 	ReplicationType string `json:"replication_type,omitempty"`
+	Observed        bool   `json:"observed"`
 }
 
 // HandleTopology 返回指定集群的 MySQL 节点与实时复制关系；没有实例时返回空拓扑而非错误。
@@ -180,6 +191,7 @@ func (h *ClusterTopologyHandler) buildAt(ctx context.Context, cluster string, ra
 				node.SuperRO = topologyString(metric.Value)
 			case "mysql_replication_thread_status":
 				if edge, ok := topologyEdgeFromMetric(*node, metric.Value); ok {
+					edge.Observed = true
 					view.Edges = append(view.Edges, edge)
 				}
 			case "mysql_group_replication_status":
@@ -247,10 +259,21 @@ func (h *ClusterTopologyHandler) buildAt(ctx context.Context, cluster string, ra
 					SourceIP: primary.IP, SourcePort: primary.Port, TargetIP: target.IP, TargetPort: target.Port,
 					SourceName: primary.Name, TargetName: target.Name, IORunning: target.GroupState,
 					SQLRunning: target.GroupState, ReplicationType: "group_replication",
+					Observed: true,
 				})
 			}
 		}
 	}
+	view.TopologySource = "runtime"
+	if h.ha != nil {
+		if intent, found, intentErr := h.ha.GetTopologyIntent(ctx, cluster); intentErr == nil && found {
+			applyTopologyIntent(&view, intent)
+		}
+	}
+	if view.Architecture == "" {
+		view.Architecture = hadomain.ArchitectureStandalone
+	}
+	evaluateTopologyConsistency(&view)
 	instanceSelector := ""
 	if len(instanceSelectors) > 0 {
 		instanceSelector = strings.TrimSpace(instanceSelectors[0])
@@ -286,6 +309,149 @@ func applyTopologyGroupReplication(node *clusterTopologyNode, value any) {
 	node.GroupMembers, _ = topologyInt(status["member_count"])
 	node.GroupOnline, _ = topologyInt(status["online_count"])
 	node.GroupQuorum, _ = status["quorum"].(bool)
+	node.ApplyQueue, _ = topologyInt(self["transactions_in_queue"])
+	node.RemoteApplyQueue, _ = topologyInt(self["remote_applier_queue"])
+}
+
+func applyTopologyIntent(view *clusterTopologyView, intent hadomain.TopologyIntent) {
+	if strings.TrimSpace(intent.Architecture) == "" {
+		return
+	}
+	view.Architecture = intent.Architecture
+	for _, node := range intent.Nodes {
+		if strings.TrimSpace(node.SourceMachineID) != "" {
+			view.expectedEdges++
+		}
+	}
+	if intent.Architecture == hadomain.ArchitectureMGRRouter && len(intent.Nodes) > 0 {
+		view.expectedEdges = len(intent.Nodes) - 1
+		if !hasObservedMGR(view.Nodes) {
+			for index := range view.Nodes {
+				if view.Nodes[index].MachineID == intent.PrimaryMachineID {
+					view.Nodes[0], view.Nodes[index] = view.Nodes[index], view.Nodes[0]
+					break
+				}
+			}
+		}
+	}
+	byMachine := make(map[string]*clusterTopologyNode, len(view.Nodes))
+	for i := range view.Nodes {
+		byMachine[view.Nodes[i].MachineID] = &view.Nodes[i]
+	}
+	for _, desired := range intent.Nodes {
+		node := byMachine[desired.MachineID]
+		if node == nil {
+			continue
+		}
+		if intent.Architecture == hadomain.ArchitectureMGRRouter {
+			if node.GroupRole == "" {
+				if desired.MachineID == intent.PrimaryMachineID || strings.EqualFold(desired.Role, "M") {
+					node.Role = "MGR_PRIMARY"
+				} else {
+					node.Role = "MGR_SECONDARY"
+				}
+			}
+			if node.GroupName == "" {
+				node.GroupName = intent.MGRGroupName
+			}
+		} else if intent.Architecture == hadomain.ArchitectureDualMaster || intent.Architecture == hadomain.ArchitectureMultiMaster {
+			if node.Role == "standalone" || node.Role == "readonly" {
+				if strings.EqualFold(desired.Role, "M") {
+					node.Role = "M/S"
+				} else {
+					node.Role = "S"
+				}
+			}
+		} else if node.Role == "standalone" || node.Role == "readonly" {
+			node.Role = strings.ToUpper(desired.Role)
+		}
+	}
+	if view.TopologySource == "runtime" && (len(view.Edges) > 0 || hasObservedMGR(view.Nodes)) {
+		view.TopologySource = "runtime+desired_state"
+		return
+	}
+	view.TopologySource = "desired_state"
+	view.Edges = view.Edges[:0]
+	for _, desired := range intent.Nodes {
+		target, source := byMachine[desired.MachineID], byMachine[desired.SourceMachineID]
+		if intent.Architecture == hadomain.ArchitectureMGRRouter {
+			source = byMachine[intent.PrimaryMachineID]
+		}
+		if source == nil || target == nil || source.MachineID == target.MachineID {
+			continue
+		}
+		view.Edges = append(view.Edges, clusterTopologyEdge{
+			SourceIP: source.IP, SourcePort: source.Port, SourceName: source.Name,
+			TargetIP: target.IP, TargetPort: target.Port, TargetName: target.Name,
+			IORunning: "UNKNOWN", SQLRunning: "UNKNOWN", SQLDelay: desired.DelaySeconds,
+			ReplicationType: map[bool]string{true: "group_replication", false: "async"}[intent.Architecture == hadomain.ArchitectureMGRRouter],
+			Observed:        false,
+		})
+	}
+}
+
+func hasObservedMGR(nodes []clusterTopologyNode) bool {
+	for _, node := range nodes {
+		if node.GroupState != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func evaluateTopologyConsistency(view *clusterTopologyView) {
+	if view.TopologySource == "desired_state" {
+		view.Consistency, view.ConsistencyDetail = "unknown", "节点尚未恢复实时复制状态，当前展示持久化的目标架构"
+		return
+	}
+	if view.Architecture == hadomain.ArchitectureMGRRouter {
+		primary, online, queue := 0, 0, 0
+		groupName, groupMismatch := "", false
+		for _, node := range view.Nodes {
+			if strings.EqualFold(node.GroupState, "ONLINE") {
+				online++
+			}
+			if strings.EqualFold(node.GroupRole, "PRIMARY") {
+				primary++
+			}
+			queue += node.ApplyQueue + node.RemoteApplyQueue
+			if node.GroupName != "" {
+				if groupName == "" {
+					groupName = node.GroupName
+				} else if groupName != node.GroupName {
+					groupMismatch = true
+				}
+			}
+		}
+		if online == len(view.Nodes) && primary == 1 && queue == 0 && !groupMismatch {
+			view.Consistency = "consistent"
+		} else {
+			view.Consistency, view.ConsistencyDetail = "inconsistent", fmt.Sprintf("MGR ONLINE %d/%d，PRIMARY %d，待应用事务 %d，组标识冲突 %t", online, len(view.Nodes), primary, queue, groupMismatch)
+		}
+		return
+	}
+	if len(view.Edges) == 0 {
+		view.Consistency = "unknown"
+		return
+	}
+	if view.expectedEdges > 0 && len(view.Edges) != view.expectedEdges {
+		view.Consistency, view.ConsistencyDetail = "inconsistent", fmt.Sprintf("实时复制链路 %d/%d，部分链路尚未恢复", len(view.Edges), view.expectedEdges)
+		return
+	}
+	delayed := false
+	for _, edge := range view.Edges {
+		lag, lagErr := strconv.Atoi(strings.TrimSpace(edge.Lag))
+		if !edge.Observed || !strings.EqualFold(edge.IORunning, "Yes") || !strings.EqualFold(edge.SQLRunning, "Yes") || lagErr != nil || (edge.SQLDelay == 0 && lag != 0) || strings.TrimSpace(edge.LastError) != "" {
+			view.Consistency, view.ConsistencyDetail = "inconsistent", "复制线程、延迟或最近错误未通过一致性检查"
+			return
+		}
+		delayed = delayed || edge.SQLDelay > 0
+	}
+	if delayed {
+		view.Consistency, view.ConsistencyDetail = "delayed", "复制线程正常，但包含按策略延迟应用的副本"
+		return
+	}
+	view.Consistency = "consistent"
 }
 
 func (h *ClusterTopologyHandler) build(ctx context.Context, cluster string, ranges ...int) (clusterTopologyView, error) {

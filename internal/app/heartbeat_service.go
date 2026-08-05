@@ -12,6 +12,7 @@ import (
 
 	agentdomain "gmha/internal/domain/agent"
 	dynamicdomain "gmha/internal/domain/dynamic"
+	hadomain "gmha/internal/domain/ha"
 	hbdomain "gmha/internal/domain/heartbeat"
 	machinedomain "gmha/internal/domain/machine"
 	mysqlapp "gmha/internal/mysql"
@@ -27,6 +28,8 @@ type HeartbeatConfig struct {
 	ReconcileTick time.Duration
 }
 
+const heartbeatHistoryCleanupInterval = 2 * time.Hour
+
 // HeartbeatService 是心跳处理的核心服务，负责处理 Agent 上报的心跳数据、
 // 管理 Agent 状态转换（INIT→ONLINE→SUSPECT→DEGRADED→OFFLINE）、
 // 协调循环检查超时、同步操作状态到 Agent/Machine 实体、管理动态采集配置。
@@ -39,11 +42,16 @@ type HeartbeatService struct {
 	alertObserver interface {
 		ObserveHeartbeat(context.Context, hbdomain.HeartbeatPayload)
 	}
+	alertTopology      alertTopologyReader
 	mu                 sync.RWMutex
 	latest             map[string]hbdomain.LatestStatus
 	metricSnapshotAt   map[string]time.Time
 	dynamicConfig      dynamicdomain.DynamicCollectConfig
 	mysqlDynamicConfig dynamicdomain.DynamicCollectConfig
+}
+
+type alertTopologyReader interface {
+	GetTopologyIntent(context.Context, string) (hadomain.TopologyIntent, bool, error)
 }
 
 // SetAlertObserver attaches the Manager-side alert engine. Evaluation is
@@ -53,6 +61,14 @@ func (s *HeartbeatService) SetAlertObserver(observer interface {
 }) {
 	s.mu.Lock()
 	s.alertObserver = observer
+	s.mu.Unlock()
+}
+
+// SetAlertTopologyReader lets alert events retain the instance and replication
+// graph that was current when the event was created.
+func (s *HeartbeatService) SetAlertTopologyReader(reader alertTopologyReader) {
+	s.mu.Lock()
+	s.alertTopology = reader
 	s.mu.Unlock()
 }
 
@@ -174,6 +190,18 @@ func (s *HeartbeatService) LoadLatest(ctx context.Context) error {
 
 func (s *HeartbeatService) TickInterval() time.Duration {
 	return s.cfg.ReconcileTick
+}
+
+func (s *HeartbeatService) HistoryCleanupInterval() time.Duration {
+	return heartbeatHistoryCleanupInterval
+}
+
+func (s *HeartbeatService) CleanupHistory(ctx context.Context) (int64, error) {
+	cleaner, ok := s.repo.(hbdomain.MetricHistoryCleaner)
+	if !ok {
+		return 0, nil
+	}
+	return cleaner.CleanupMetricHistory(ctx, time.Now().UTC().Add(-7*24*time.Hour))
 }
 
 func (s *HeartbeatService) Snapshot() []HeartbeatView {
@@ -344,6 +372,7 @@ func (s *HeartbeatService) ProcessHeartbeat(ctx context.Context, req *hbgrpc.Hea
 	now := time.Now().UTC()
 	payload := s.enrichAlertPayload(ctx, mapRequest(req))
 	payload = s.filterUnregisteredMySQLMetrics(ctx, payload)
+	payload = s.enrichAlertTopology(ctx, payload)
 
 	s.mu.Lock()
 	current, ok := s.latest[payload.AgentID]
@@ -370,7 +399,7 @@ func (s *HeartbeatService) ProcessHeartbeat(ctx context.Context, req *hbgrpc.Hea
 		if len(metrics) > 0 {
 			if err := writer.AppendMetricSnapshot(ctx, hbdomain.MetricSnapshot{
 				AgentID: next.AgentID, MachineID: next.MachineID, ClusterID: next.ClusterID,
-				Metrics: metrics, CollectedAt: now,
+				Abnormal: heartbeatIsAbnormal(next), Metrics: metrics, CollectedAt: now,
 			}); err != nil {
 				return nil, err
 			}
@@ -403,6 +432,23 @@ func (s *HeartbeatService) ProcessHeartbeat(ctx context.Context, req *hbgrpc.Hea
 		DynamicCollect:      &cfg,
 		MySQLDynamicCollect: &mysqlCfg,
 	}, nil
+}
+
+func heartbeatIsAbnormal(item hbdomain.LatestStatus) bool {
+	if item.CurrentState != hbdomain.StateOnline || item.OverallHealth != hbdomain.HealthHealthy {
+		return true
+	}
+	for _, check := range item.Checks {
+		if check.Status != hbdomain.CheckOK {
+			return true
+		}
+	}
+	for _, metric := range item.Metrics {
+		if !metric.Success {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *HeartbeatService) dashboardMetricSnapshot(agentID string, metrics []dynamicdomain.MetricResult, now time.Time) []dynamicdomain.MetricResult {
@@ -523,6 +569,280 @@ func (s *HeartbeatService) enrichAlertPayload(ctx context.Context, payload hbdom
 	return payload
 }
 
+func (s *HeartbeatService) enrichAlertTopology(ctx context.Context, payload hbdomain.HeartbeatPayload) hbdomain.HeartbeatPayload {
+	if len(payload.Metrics) == 0 {
+		return payload
+	}
+	s.mu.RLock()
+	topology := s.alertTopology
+	s.mu.RUnlock()
+
+	machineReader, _ := s.machines.(interface {
+		GetByID(context.Context, string) (machinedomain.Machine, bool, error)
+	})
+	machines := make(map[string]machinedomain.Machine)
+	if machineReader != nil {
+		if machine, found, err := machineReader.GetByID(ctx, payload.MachineID); err == nil && found {
+			machines[machine.ID] = machine
+		}
+	}
+
+	var intent hadomain.TopologyIntent
+	hasIntent := false
+	if topology != nil && strings.TrimSpace(payload.ClusterID) != "" {
+		intent, hasIntent, _ = topology.GetTopologyIntent(ctx, payload.ClusterID)
+	}
+	if hasIntent && machineReader != nil {
+		for _, node := range intent.Nodes {
+			if _, ok := machines[node.MachineID]; ok {
+				continue
+			}
+			if machine, found, err := machineReader.GetByID(ctx, node.MachineID); err == nil && found {
+				machines[machine.ID] = machine
+			}
+		}
+	}
+
+	observedRoles := make(map[int]string)
+	runtimeSources := make(map[int]string)
+	for _, metric := range payload.Metrics {
+		port, _ := strconv.Atoi(strings.TrimSpace(metric.Labels["mysql_port"]))
+		if port <= 0 {
+			continue
+		}
+		if metric.Name == "mysql_role" {
+			observedRoles[port] = strings.TrimSpace(fmt.Sprint(metric.Value))
+		}
+		if metric.Name == "mysql_replication_basic_status" || metric.Name == "mysql_replication_thread_status" {
+			if source := alertRuntimeReplicationSource(metric.Value); source != "" {
+				runtimeSources[port] = source
+			}
+		}
+	}
+
+	for index := range payload.Metrics {
+		metric := &payload.Metrics[index]
+		if !strings.HasPrefix(metric.Name, "mysql_") {
+			continue
+		}
+		port, err := strconv.Atoi(strings.TrimSpace(metric.Labels["mysql_port"]))
+		if err != nil || port <= 0 {
+			continue
+		}
+		labels := cloneStringMap(metric.Labels)
+		machine := machines[payload.MachineID]
+		machineName := strings.TrimSpace(payload.MachineName)
+		machineIP := strings.TrimSpace(payload.MachineIP)
+		if machineName == "" {
+			machineName = strings.TrimSpace(machine.Name)
+		}
+		if machineIP == "" {
+			machineIP = strings.TrimSpace(machine.IP)
+		}
+		instanceName := alertInstanceName(machineName, payload.MachineID, port)
+		labels["machine_name"] = machineName
+		labels["machine_ip"] = machineIP
+		labels["cluster_name"] = strings.TrimSpace(payload.ClusterID)
+		labels["instance_name"] = instanceName
+		labels["instance_ip"] = machineIP
+		labels["instance_port"] = strconv.Itoa(port)
+		labels["instance_endpoint"] = alertInstanceEndpoint(machineIP, port)
+		if role := observedRoles[port]; role != "" {
+			labels["observed_instance_role"] = role
+			labels["instance_role"] = alertObservedRoleLabel(role)
+		}
+		if source := runtimeSources[port]; source != "" {
+			labels["source_instance_name"] = source
+			labels["source_instance_endpoint"] = source
+			labels["instance_relation"] = "从库，复制自 " + source
+		}
+
+		if hasIntent {
+			labels["topology_architecture"] = intent.Architecture
+			labels["topology_architecture_label"] = alertArchitectureLabel(intent.Architecture)
+			if node, found := alertTopologyNode(intent.Nodes, payload.MachineID, port); found {
+				role := alertTopologyRole(intent, node)
+				labels["instance_role"] = role
+				labels["instance_role_code"] = node.Role
+				labels["instance_relation"] = alertTopologyRelation(intent, node, machines)
+				if source, sourceFound := alertTopologySource(intent.Nodes, node); sourceFound {
+					sourceMachine := machines[source.MachineID]
+					sourceName := alertInstanceName(sourceMachine.Name, source.MachineID, source.Port)
+					labels["source_machine_id"] = source.MachineID
+					labels["source_instance_name"] = sourceName
+					labels["source_instance_ip"] = strings.TrimSpace(sourceMachine.IP)
+					labels["source_instance_port"] = strconv.Itoa(source.Port)
+					labels["source_instance_endpoint"] = alertInstanceEndpoint(sourceMachine.IP, source.Port)
+				}
+			}
+		}
+		metric.Labels = labels
+	}
+	return payload
+}
+
+func alertTopologyNode(nodes []hadomain.ArchitectureNodeRequest, machineID string, port int) (hadomain.ArchitectureNodeRequest, bool) {
+	for _, node := range nodes {
+		if node.MachineID == machineID && node.Port == port {
+			return node, true
+		}
+	}
+	return hadomain.ArchitectureNodeRequest{}, false
+}
+
+func alertTopologySource(nodes []hadomain.ArchitectureNodeRequest, node hadomain.ArchitectureNodeRequest) (hadomain.ArchitectureNodeRequest, bool) {
+	sourceID := strings.TrimSpace(node.SourceMachineID)
+	if sourceID == "" {
+		return hadomain.ArchitectureNodeRequest{}, false
+	}
+	for _, candidate := range nodes {
+		if candidate.MachineID == sourceID {
+			return candidate, true
+		}
+	}
+	return hadomain.ArchitectureNodeRequest{}, false
+}
+
+func alertTopologyRole(intent hadomain.TopologyIntent, node hadomain.ArchitectureNodeRequest) string {
+	if intent.Architecture == hadomain.ArchitectureMGRRouter {
+		if node.MachineID == intent.PrimaryMachineID {
+			return "MGR 主节点"
+		}
+		return "MGR 从节点"
+	}
+	switch strings.ToUpper(strings.TrimSpace(node.Role)) {
+	case "M":
+		return "主库"
+	case "S":
+		return "从库"
+	case "I":
+		return "独立实例"
+	default:
+		return valueOrDash(node.Role)
+	}
+}
+
+func alertTopologyRelation(intent hadomain.TopologyIntent, node hadomain.ArchitectureNodeRequest, machines map[string]machinedomain.Machine) string {
+	if intent.Architecture == hadomain.ArchitectureMGRRouter {
+		if node.MachineID == intent.PrimaryMachineID {
+			return "MGR 组内主节点，承担读写"
+		}
+		return "MGR 组内从节点，复制主节点数据"
+	}
+	if source, found := alertTopologySource(intent.Nodes, node); found {
+		machine := machines[source.MachineID]
+		sourceName := alertInstanceName(machine.Name, source.MachineID, source.Port)
+		if intent.Architecture == hadomain.ArchitectureDualMaster || intent.Architecture == hadomain.ArchitectureMultiMaster {
+			return "互为主库，复制自 " + sourceName
+		}
+		return "从库，复制自 " + sourceName
+	}
+	switch strings.ToUpper(strings.TrimSpace(node.Role)) {
+	case "M":
+		return "主库 / 下游实例的复制源"
+	case "I":
+		return "独立实例，无复制上下游"
+	default:
+		return "未配置复制上游"
+	}
+}
+
+func alertArchitectureLabel(architecture string) string {
+	switch architecture {
+	case hadomain.ArchitectureStandalone:
+		return "独立实例"
+	case hadomain.ArchitectureMasterSlave:
+		return "主从复制"
+	case hadomain.ArchitectureDualMaster:
+		return "双主复制"
+	case hadomain.ArchitectureMultiMaster:
+		return "多主复制"
+	case hadomain.ArchitectureMGRRouter:
+		return "MGR + Router"
+	default:
+		return valueOrDash(architecture)
+	}
+}
+
+func alertObservedRoleLabel(role string) string {
+	normalized := strings.ToLower(strings.TrimSpace(role))
+	switch {
+	case strings.HasPrefix(normalized, "mgr_primary"):
+		return "MGR 主节点"
+	case strings.HasPrefix(normalized, "mgr_secondary"):
+		return "MGR 从节点"
+	case normalized == "primary":
+		return "主库"
+	case normalized == "replica", normalized == "replica_or_readonly":
+		return "从库"
+	case normalized == "standalone":
+		return "独立实例"
+	default:
+		return valueOrDash(role)
+	}
+}
+
+func alertRuntimeReplicationSource(value any) string {
+	outer := alertAnyMap(value)
+	status := alertAnyMap(outer["replica_status"])
+	host := firstAlertMapString(status, "Source_Host", "Master_Host", "source_host", "master_host")
+	port := firstAlertMapString(status, "Source_Port", "Master_Port", "source_port", "master_port")
+	if host == "" {
+		return ""
+	}
+	if port == "" || port == "0" {
+		return host
+	}
+	return host + ":" + port
+}
+
+func alertAnyMap(value any) map[string]any {
+	switch typed := value.(type) {
+	case map[string]any:
+		return typed
+	case map[string]string:
+		out := make(map[string]any, len(typed))
+		for key, item := range typed {
+			out[key] = item
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func firstAlertMapString(values map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(fmt.Sprint(values[key])); value != "" && value != "<nil>" {
+			return value
+		}
+	}
+	return ""
+}
+
+func alertInstanceName(machineName, machineID string, port int) string {
+	name := strings.TrimSpace(machineName)
+	if name == "" {
+		name = strings.TrimSpace(machineID)
+	}
+	return fmt.Sprintf("%s:%d", valueOrDash(name), port)
+}
+
+func alertInstanceEndpoint(ip string, port int) string {
+	if strings.TrimSpace(ip) == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s:%d", strings.TrimSpace(ip), port)
+}
+
+func cloneStringMap(source map[string]string) map[string]string {
+	clone := make(map[string]string, len(source)+16)
+	for key, value := range source {
+		clone[key] = value
+	}
+	return clone
+}
+
 // filterUnregisteredMySQLMetrics prevents an Agent without mysql-heartbeat
 // configuration from inventing a default :3306 instance and raising alarms.
 // Only metrics that map to a Manager-registered instance are retained.
@@ -613,6 +933,7 @@ func (s *HeartbeatService) syncMySQLState(ctx context.Context, item hbdomain.Lat
 	if s.mysql == nil {
 		return
 	}
+	agentUnavailable := item.CurrentState == hbdomain.StateOffline || item.CurrentState == hbdomain.StateSuspect
 	for _, check := range item.Checks {
 		if !strings.HasPrefix(check.Name, "mysql.heartbeat.") {
 			continue
@@ -623,7 +944,12 @@ func (s *HeartbeatService) syncMySQLState(ctx context.Context, item hbdomain.Lat
 			continue
 		}
 		status := mysqlapp.StatusRunning
-		if check.Status == hbdomain.CheckFail {
+		// The checks on an offline Agent are the last successfully reported
+		// snapshot, not proof that MySQL is still reachable. Connectivity loss
+		// therefore wins over a stale OK check.
+		if agentUnavailable {
+			status = mysqlapp.StatusHeartbeatFailed
+		} else if check.Status == hbdomain.CheckFail {
 			status = mysqlapp.StatusHeartbeatFailed
 			if strings.Contains(check.Detail, "systemctl start failed") {
 				status = mysqlapp.StatusInstanceError

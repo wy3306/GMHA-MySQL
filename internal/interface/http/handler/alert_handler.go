@@ -40,6 +40,12 @@ func (h *AlertHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		h.channels(w, r)
 	case path == "/channels/test":
 		h.testChannel(w, r)
+	case path == "/recipient-directory":
+		h.recipientDirectory(w, r)
+	case path == "/roles":
+		h.notificationRoles(w, r)
+	case path == "/recipients":
+		h.notificationRecipients(w, r)
 	case path == "/deliveries":
 		h.deliveries(w, r)
 	case path == "/metrics":
@@ -52,6 +58,53 @@ func (h *AlertHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		h.zabbix(w, r)
 	default:
 		http.NotFound(w, r)
+	}
+}
+
+func (h *AlertHandler) recipientDirectory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	directory, err := h.alerts.AlertRecipientDirectory(r.Context())
+	writeAlert(w, directory, err)
+}
+
+func (h *AlertHandler) notificationRoles(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		items, err := h.alerts.ListNotificationRoles(r.Context())
+		writeAlert(w, items, err)
+	case http.MethodPost, http.MethodPut:
+		var x alertdomain.NotificationRole
+		if !decodeAlert(w, r, &x) {
+			return
+		}
+		item, err := h.alerts.SaveNotificationRole(r.Context(), x)
+		writeAlert(w, item, err)
+	case http.MethodDelete:
+		writeAlert(w, map[string]bool{"deleted": true}, h.alerts.DeleteNotificationRole(r.Context(), r.URL.Query().Get("id")))
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *AlertHandler) notificationRecipients(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		items, err := h.alerts.ListNotificationRecipients(r.Context())
+		writeAlert(w, items, err)
+	case http.MethodPost, http.MethodPut:
+		var x alertdomain.NotificationRecipient
+		if !decodeAlert(w, r, &x) {
+			return
+		}
+		item, err := h.alerts.SaveNotificationRecipient(r.Context(), x)
+		writeAlert(w, item, err)
+	case http.MethodDelete:
+		writeAlert(w, map[string]bool{"deleted": true}, h.alerts.DeleteNotificationRecipient(r.Context(), r.URL.Query().Get("id")))
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
 }
 func (h *AlertHandler) deliveries(w http.ResponseWriter, r *http.Request) {
@@ -178,6 +231,17 @@ func (h *AlertHandler) channels(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		item, err := h.alerts.SaveChannel(r.Context(), x)
+		item.Config = maskAlertSecrets(item.Config)
+		writeAlert(w, item, err)
+	case http.MethodPatch:
+		var x struct {
+			ID      string `json:"id"`
+			Enabled bool   `json:"enabled"`
+		}
+		if !decodeAlert(w, r, &x) {
+			return
+		}
+		item, err := h.alerts.SetChannelEnabled(r.Context(), x.ID, x.Enabled)
 		item.Config = maskAlertSecrets(item.Config)
 		writeAlert(w, item, err)
 	case http.MethodDelete:
@@ -325,6 +389,9 @@ func writeAlert(w http.ResponseWriter, v any, err error) {
 func maskAlertSecrets(cfg map[string]string) map[string]string {
 	out := map[string]string{}
 	for k, v := range cfg {
+		if strings.EqualFold(strings.TrimSpace(k), "to") {
+			continue
+		}
 		if isAlertSecretKey(k) && v != "" {
 			out[k] = "******"
 		} else {

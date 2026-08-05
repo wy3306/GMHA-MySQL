@@ -33,16 +33,23 @@ func NewRouter(core *app.App) http.Handler {
 	dynamicHandler := handler.NewDynamicCollectHandler(core.HeartbeatService, core.AlertService)
 	haHandler := handler.NewHAHandler(core.HAService)
 	topologyHandler := handler.NewClusterTopologyHandler(core.MachineService, core.MySQLService, core.HeartbeatService, core.BackupService)
+	topologyHandler.SetHAService(core.HAService)
 	backupHandler := handler.NewBackupHandler(core.BackupService)
 	alertHandler := handler.NewAlertHandler(core.AlertService, core.HeartbeatService)
 	sqlDiagnosticHandler := handler.NewSQLDiagnosticHandler(core.SQLDiagnosticService)
 	performanceHandler := handler.NewPerformanceHandler(core.HeartbeatService)
 	flameGraphHandler := handler.NewFlameGraphHandler(core.FlameGraphService)
 	aiHandler := handler.NewAIHandler(core.AIService)
+	accountHandler := handler.NewAccountHandler(core.AccountService)
 	mux.HandleFunc("/api/v1/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
+	mux.HandleFunc("/api/v1/auth/login", accountHandler.HandleLogin)
+	mux.HandleFunc("/api/v1/auth/session", accountHandler.HandleSession)
+	mux.HandleFunc("/api/v1/auth/logout", accountHandler.HandleLogout)
+	mux.HandleFunc("/api/v1/accounts", accountHandler.HandleAccounts)
+	mux.HandleFunc("/api/v1/accounts/", accountHandler.HandleAccounts)
 	mux.HandleFunc("/api/v1/machines", machineHandler.HandleMachines)
 	mux.HandleFunc("/api/v1/machines/batch-delete", machineHandler.HandleBatchDeleteMachines)
 	mux.HandleFunc("/api/v1/machines/precheck", machineHandler.HandlePrecheck)
@@ -173,7 +180,7 @@ func NewRouter(core *app.App) http.Handler {
 	mux.HandleFunc("/api/v1/ai/", aiHandler.Handle)
 	mux.HandleFunc("/api/v1/software/mysql/", taskHandler.HandleMySQLPackageDownload)
 	mux.Handle("/ws/agent/tasks", taskHandler.HandleAgentWS())
-	return trackPlatformOperations(mux, core.TaskService)
+	return accountHandler.Middleware(trackPlatformOperations(mux, core.TaskService))
 }
 
 func isHAClusterActionPath(path string) bool {

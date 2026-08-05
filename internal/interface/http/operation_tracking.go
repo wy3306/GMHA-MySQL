@@ -134,6 +134,8 @@ func isInternalPlatformMutation(path string) bool {
 
 func isResourceMaintenanceMutation(path string) bool {
 	switch {
+	case strings.HasPrefix(path, "/api/v1/auth/") || strings.HasPrefix(path, "/api/v1/accounts"):
+		return true
 	case strings.HasPrefix(path, "/api/v1/machines"):
 		// Batch deletion creates its own durable business parent before any
 		// remote cleanup starts; the generic "维护机器" wrapper is noise.

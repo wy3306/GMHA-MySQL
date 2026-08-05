@@ -10,12 +10,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"mime"
+	"mime/multipart"
+	"mime/quotedprintable"
 	"net"
 	"net/http"
 	"net/mail"
 	"net/smtp"
+	"net/textproto"
 	"net/url"
 	"regexp"
 	"sort"
@@ -34,12 +38,14 @@ import (
 // a slow third-party endpoint can never delay Agent heartbeat processing.
 type AlertService struct {
 	repo        alertdomain.Repository
+	accounts    *AccountService
 	queue       chan alertdomain.NotificationJob
 	evaluations chan hbdomain.HeartbeatPayload
 	http        *http.Client
 
 	overflowMu sync.Mutex
 	overflow   map[string]hbdomain.HeartbeatPayload
+	channelMu  sync.RWMutex
 	inFlight   sync.Map
 	runtime    alertRuntimeCounters
 }
@@ -95,6 +101,109 @@ func NewAlertService(repo alertdomain.Repository) *AlertService {
 	return s
 }
 
+func (s *AlertService) ConfigureAccountRecipients(accounts *AccountService) {
+	s.accounts = accounts
+}
+
+func (s *AlertService) AlertRecipientDirectory(ctx context.Context) (AlertRecipientDirectory, error) {
+	if s.accounts == nil {
+		return AlertRecipientDirectory{}, errors.New("平台账号服务尚未就绪")
+	}
+	return s.accounts.AlertRecipientDirectory(ctx)
+}
+
+func alertLevel(severity alertdomain.Severity, threshold float64) alertdomain.ThresholdLevel {
+	return alertdomain.ThresholdLevel{Severity: severity, Threshold: threshold, Enabled: true}
+}
+
+func defaultAlertRule(name, metric, operator string, consecutive int, levels ...alertdomain.ThresholdLevel) alertdomain.Rule {
+	rule := alertdomain.Rule{
+		Name: name, Metric: metric, Operator: operator, Thresholds: levels,
+		ConsecutiveCount: consecutive, Enabled: true, Scope: "all",
+		RepeatIntervalSeconds: 300, MaxNotifications: 10,
+		Description: "系统内置基线规则，可按业务负载、实例规格和维护窗口调整",
+	}
+	if len(levels) > 0 {
+		rule.Severity, rule.Threshold = levels[0].Severity, levels[0].Threshold
+	}
+	return rule
+}
+
+func defaultAlertRules() []alertdomain.Rule {
+	notice, warning := alertdomain.SeverityNotice, alertdomain.SeverityWarning
+	critical, fatal := alertdomain.SeverityCritical, alertdomain.SeverityFatal
+	return []alertdomain.Rule{
+		// Host capacity and operating-system health.
+		defaultAlertRule("主机 CPU 使用率过高", "cpu_usage_percent", ">=", 3, alertLevel(warning, 80), alertLevel(critical, 90), alertLevel(fatal, 97)),
+		defaultAlertRule("主机内存使用率过高", "mem_usage_percent", ">=", 3, alertLevel(warning, 85), alertLevel(critical, 92), alertLevel(fatal, 97)),
+		defaultAlertRule("主机文件系统空间不足", "host_filesystem_used_percent", ">=", 2, alertLevel(notice, 80), alertLevel(warning, 85), alertLevel(critical, 92), alertLevel(fatal, 97)),
+		defaultAlertRule("主机 Inode 使用率过高", "host_inode_used_percent", ">=", 2, alertLevel(warning, 85), alertLevel(critical, 92), alertLevel(fatal, 97)),
+		defaultAlertRule("主机 Swap 使用率过高", "host_swap_used_percent", ">=", 3, alertLevel(notice, 50), alertLevel(warning, 80), alertLevel(critical, 95)),
+		defaultAlertRule("主机磁盘 IO 持续繁忙", "host_disk_busy_percent", ">=", 6, alertLevel(warning, 80), alertLevel(critical, 95)),
+		defaultAlertRule("主机时钟偏移过大", "ntp_offset_abs_ms", ">=", 2, alertLevel(warning, 100), alertLevel(critical, 500), alertLevel(fatal, 2000)),
+		defaultAlertRule("SSH 服务探测失败", "host_ssh_probe_ok", "==", 2, alertLevel(critical, 0)),
+
+		// Agent availability and self-observation.
+		defaultAlertRule("Agent 心跳中断", "agent_heartbeat_alive", "==", 1, alertLevel(fatal, 0)),
+		defaultAlertRule("Agent 健康状态异常", "agent_overall_health", ">=", 2, alertLevel(warning, 1)),
+		defaultAlertRule("Agent 健康检查失败", "agent_health_check_failed", ">=", 2, alertLevel(warning, 1)),
+		defaultAlertRule("Agent 内存占用过高", "agent_memory_rss_mb", ">=", 5, alertLevel(warning, 256), alertLevel(critical, 512)),
+		defaultAlertRule("Agent CPU 占用过高", "agent_cpu_usage_percent", ">=", 5, alertLevel(warning, 10), alertLevel(critical, 30)),
+
+		// MySQL availability and connection capacity. Restart events are emitted
+		// by the uptime observer and classified as manual or unexpected.
+		defaultAlertRule("MySQL 无法连接", "mysql_connectivity", "==", 2, alertLevel(fatal, 0)),
+		defaultAlertRule("MySQL 进程停止", "mysql_process_alive", "==", 2, alertLevel(fatal, 0)),
+		defaultAlertRule("MySQL 端口未监听", "mysql_port_listening", "==", 2, alertLevel(critical, 0)),
+		defaultAlertRule("连接使用率偏高", "mysql_connection_usage_percent", ">=", 3, alertLevel(notice, 70), alertLevel(warning, 80), alertLevel(critical, 90), alertLevel(fatal, 95)),
+		defaultAlertRule("长时间空闲连接过多", "mysql_long_sleep_connections", ">=", 3, alertLevel(warning, 50), alertLevel(critical, 200)),
+
+		// Replication and consistency.
+		defaultAlertRule("复制延迟过高", "mysql_replication_lag", ">=", 3, alertLevel(notice, 10), alertLevel(warning, 30), alertLevel(critical, 120), alertLevel(fatal, 600)),
+		defaultAlertRule("复制 IO 线程异常", "mysql_replica_io_thread", "==", 2, alertLevel(critical, 0)),
+		defaultAlertRule("复制 SQL 线程异常", "mysql_replica_sql_thread", "==", 2, alertLevel(critical, 0)),
+		defaultAlertRule("复制通道报错", "mysql_replication_error_count", ">=", 1, alertLevel(critical, 1)),
+		defaultAlertRule("从库未追平", "mysql_replica_catchup_status", "==", 3, alertLevel(warning, 0)),
+		defaultAlertRule("GTID 同步状态异常", "mysql_gtid_sync_status", "==", 3, alertLevel(warning, 0)),
+
+		// Transactions, locks, query behavior and cache pressure.
+		defaultAlertRule("长事务持续", "mysql_longest_transaction_seconds", ">=", 3, alertLevel(warning, 300), alertLevel(critical, 1800), alertLevel(fatal, 3600)),
+		defaultAlertRule("存在行锁等待", "mysql_lock_wait_sessions", ">=", 2, alertLevel(warning, 1), alertLevel(critical, 10)),
+		defaultAlertRule("存在元数据锁等待", "mysql_metadata_lock_waits", ">=", 2, alertLevel(warning, 1), alertLevel(critical, 5)),
+		defaultAlertRule("阻塞持续时间过长", "mysql_max_blocking_seconds", ">=", 2, alertLevel(warning, 30), alertLevel(critical, 300), alertLevel(fatal, 1800)),
+		defaultAlertRule("阻塞链过长", "mysql_blocking_chain_length", ">=", 2, alertLevel(warning, 3), alertLevel(critical, 10)),
+		defaultAlertRule("磁盘临时表比例过高", "mysql_tmp_disk_table_ratio", ">=", 3, alertLevel(warning, 25), alertLevel(critical, 50)),
+		defaultAlertRule("全表扫描比例过高", "mysql_table_scan_ratio", ">=", 6, alertLevel(warning, 25), alertLevel(critical, 50)),
+		defaultAlertRule("无索引 Join 比例过高", "mysql_join_full_scan_ratio", ">=", 6, alertLevel(warning, 5), alertLevel(critical, 20)),
+		defaultAlertRule("最慢 SQL 耗时过长", "mysql_slowest_sql_seconds", ">=", 2, alertLevel(warning, 5), alertLevel(critical, 30), alertLevel(fatal, 120)),
+		defaultAlertRule("Buffer Pool 命中率偏低", "mysql_buffer_pool_hit_ratio", "<=", 6, alertLevel(warning, 99), alertLevel(critical, 95)),
+		defaultAlertRule("Buffer Pool 脏页比例过高", "mysql_buffer_pool_dirty_ratio", ">=", 6, alertLevel(warning, 60), alertLevel(critical, 80)),
+		defaultAlertRule("文件句柄使用率过高", "mysql_open_files_usage_percent", ">=", 3, alertLevel(warning, 80), alertLevel(critical, 90)),
+		defaultAlertRule("表缓存使用率过高", "mysql_table_cache_usage_percent", ">=", 6, alertLevel(warning, 90), alertLevel(critical, 98)),
+		defaultAlertRule("线程缓存命中率偏低", "mysql_thread_cache_hit_ratio", "<=", 6, alertLevel(warning, 90), alertLevel(critical, 70)),
+		defaultAlertRule("Undo History List 积压", "mysql_history_list_length", ">=", 3, alertLevel(warning, 100000), alertLevel(critical, 1000000)),
+
+		// Database filesystems and logical capacity.
+		defaultAlertRule("数据盘空间不足", "mysql_data_disk_usage", ">=", 2, alertLevel(warning, 80), alertLevel(critical, 90), alertLevel(fatal, 97)),
+		defaultAlertRule("Binlog 盘空间不足", "mysql_binlog_disk_usage", ">=", 2, alertLevel(warning, 80), alertLevel(critical, 90), alertLevel(fatal, 97)),
+		defaultAlertRule("Redo 盘空间不足", "mysql_redo_disk_usage", ">=", 2, alertLevel(warning, 80), alertLevel(critical, 90), alertLevel(fatal, 97)),
+		defaultAlertRule("临时盘空间不足", "mysql_tmp_disk_usage", ">=", 2, alertLevel(warning, 80), alertLevel(critical, 90), alertLevel(fatal, 97)),
+		defaultAlertRule("Undo 盘空间不足", "mysql_undo_disk_usage", ">=", 2, alertLevel(warning, 80), alertLevel(critical, 90), alertLevel(fatal, 97)),
+		defaultAlertRule("数据库高碎片表过多", "mysql_fragmented_table_count", ">=", 1, alertLevel(warning, 1), alertLevel(critical, 5), alertLevel(fatal, 20)),
+		defaultAlertRule("数据库单表碎片率过高", "mysql_max_table_fragment_percent", ">=", 1, alertLevel(warning, 30), alertLevel(critical, 50), alertLevel(fatal, 70)),
+		defaultAlertRule("数据库可回收碎片空间过大", "mysql_tablespace_fragment_total_bytes", ">=", 1, alertLevel(warning, 10737418240), alertLevel(critical, 53687091200)),
+
+		// Error log, durability and safety signals.
+		defaultAlertRule("慢查询日志未开启", "mysql_slow_query_log_enabled", "==", 1, alertLevel(notice, 0)),
+		defaultAlertRule("错误日志 ERROR 激增", "mysql_recent_error_count", ">=", 2, alertLevel(warning, 10), alertLevel(critical, 100)),
+		defaultAlertRule("检测到 MySQL OOM", "mysql_oom_keyword_count", ">=", 1, alertLevel(fatal, 1)),
+		defaultAlertRule("检测到磁盘写满错误", "mysql_disk_full_keyword_count", ">=", 1, alertLevel(fatal, 1)),
+		defaultAlertRule("检测到表损坏", "mysql_table_corruption_keyword_count", ">=", 1, alertLevel(fatal, 1)),
+		defaultAlertRule("检测到崩溃恢复", "mysql_crash_recovery_keyword_count", ">=", 1, alertLevel(critical, 1)),
+		defaultAlertRule("数据库权限失败激增", "mysql_permission_failed_keyword_count", ">=", 2, alertLevel(warning, 10), alertLevel(critical, 100)),
+	}
+}
+
 func (s *AlertService) EnsureDefaults(ctx context.Context) error {
 	rules, err := s.repo.ListRules(ctx)
 	if err != nil {
@@ -104,42 +213,16 @@ func (s *AlertService) EnsureDefaults(ctx context.Context) error {
 	for _, item := range rules {
 		existing[item.ID] = true
 	}
-	defaults := []alertdomain.Rule{
-		{Name: "主机 CPU 使用率过高", Metric: "cpu_usage_percent", Operator: ">=", Threshold: 85, Severity: alertdomain.SeverityWarning, ConsecutiveCount: 3},
-		{Name: "主机内存使用率严重", Metric: "mem_usage_percent", Operator: ">=", Threshold: 90, Severity: alertdomain.SeverityCritical, ConsecutiveCount: 3},
-		{Name: "主机文件系统空间不足", Metric: "host_filesystem_used_percent", Operator: ">=", Threshold: 85, Severity: alertdomain.SeverityCritical, ConsecutiveCount: 2},
-		{Name: "主机 Inode 使用率过高", Metric: "host_inode_used_percent", Operator: ">=", Threshold: 85, Severity: alertdomain.SeverityWarning, ConsecutiveCount: 2},
-		{Name: "主机 Swap 使用率过高", Metric: "host_swap_used_percent", Operator: ">=", Threshold: 80, Severity: alertdomain.SeverityWarning, ConsecutiveCount: 3},
-		{Name: "SSH 服务探测失败", Metric: "host_ssh_probe_ok", Operator: "==", Threshold: 0, Severity: alertdomain.SeverityCritical, ConsecutiveCount: 2},
-		{Name: "数据盘空间不足", Metric: "mysql_data_disk_usage", Operator: ">=", Threshold: 85, Severity: alertdomain.SeverityCritical, ConsecutiveCount: 2},
-		{Name: "Binlog 盘空间不足", Metric: "mysql_binlog_disk_usage", Operator: ">=", Threshold: 85, Severity: alertdomain.SeverityCritical, ConsecutiveCount: 2},
-		{Name: "MySQL 无法连接", Metric: "mysql_connectivity", Operator: "==", Threshold: 0, Severity: alertdomain.SeverityFatal, ConsecutiveCount: 2},
-		{Name: "MySQL 进程停止", Metric: "mysql_process_alive", Operator: "==", Threshold: 0, Severity: alertdomain.SeverityFatal, ConsecutiveCount: 2},
-		{Name: "复制延迟过高", Metric: "mysql_replication_lag", Operator: ">=", Threshold: 30, Severity: alertdomain.SeverityCritical, ConsecutiveCount: 3},
-		{Name: "复制 IO 线程异常", Metric: "mysql_replica_io_thread", Operator: "==", Threshold: 0, Severity: alertdomain.SeverityCritical, ConsecutiveCount: 2},
-		{Name: "复制 SQL 线程异常", Metric: "mysql_replica_sql_thread", Operator: "==", Threshold: 0, Severity: alertdomain.SeverityCritical, ConsecutiveCount: 2},
-		{Name: "连接使用率偏高", Metric: "mysql_connection_usage_percent", Operator: ">=", Threshold: 80, Severity: alertdomain.SeverityWarning, ConsecutiveCount: 3},
-		{Name: "连接数需要关注", Metric: "mysql_threads_connected", Operator: ">=", Threshold: 100, Severity: alertdomain.SeverityNotice, ConsecutiveCount: 3},
-		{Name: "长事务持续", Metric: "mysql_longest_transaction_seconds", Operator: ">=", Threshold: 300, Severity: alertdomain.SeverityWarning, ConsecutiveCount: 3},
-		{Name: "Agent 内存占用过高", Metric: "agent_memory_rss_mb", Operator: ">=", Threshold: 256, Severity: alertdomain.SeverityWarning, ConsecutiveCount: 5},
-		{Name: "Agent CPU 占用过高", Metric: "agent_cpu_usage_percent", Operator: ">=", Threshold: 10, Severity: alertdomain.SeverityWarning, ConsecutiveCount: 5},
-		{Name: "Agent 心跳中断", Metric: "agent_heartbeat_alive", Operator: "==", Threshold: 0, Severity: alertdomain.SeverityFatal, ConsecutiveCount: 1},
-		{Name: "Agent 健康状态异常", Metric: "agent_overall_health", Operator: ">=", Threshold: 1, Severity: alertdomain.SeverityWarning, ConsecutiveCount: 2},
-	}
+	defaults := defaultAlertRules()
 	now := time.Now().UTC()
 	for i := range defaults {
 		defaults[i].ID = stableID("default", defaults[i].Metric)
 		if existing[defaults[i].ID] {
 			continue
 		}
-		defaults[i].Description = "系统默认规则，可按业务负载调整阈值"
-		defaults[i].Enabled = true
-		defaults[i].Scope = "all"
-		defaults[i].RepeatIntervalSeconds = 300
-		defaults[i].MaxNotifications = 10
 		defaults[i].CreatedAt = now
 		defaults[i].UpdatedAt = now
-		if err := s.repo.SaveRule(ctx, defaults[i]); err != nil {
+		if _, err := s.SaveRule(ctx, defaults[i]); err != nil {
 			return err
 		}
 	}
@@ -323,9 +406,6 @@ func (s *AlertService) SaveChannel(ctx context.Context, x alertdomain.Channel) (
 	default:
 		return x, alertdomain.Invalid("unsupported channel type")
 	}
-	if err := validateChannelConfig(x); err != nil {
-		return x, err
-	}
 	now := time.Now().UTC()
 	if x.ID == "" {
 		x.ID = stableID(x.Name, fmt.Sprint(now.UnixNano()))
@@ -337,10 +417,219 @@ func (s *AlertService) SaveChannel(ctx context.Context, x alertdomain.Channel) (
 	if alertdomain.SeverityRank(x.MinimumSeverity) == 0 {
 		return x, alertdomain.Invalid("minimum severity is invalid")
 	}
+	x.RecipientIDs = normalizeStringIDs(x.RecipientIDs)
+	var err error
+	if s.accounts != nil {
+		if x.Type == "email" {
+			x.RecipientRoles, err = normalizeChannelChoices(x.RecipientRoles, platformRecipientRoles, nil)
+			if err != nil {
+				return x, alertdomain.Invalid("选择的平台角色无效")
+			}
+		} else {
+			x.RecipientIDs, x.RecipientRoles = nil, nil
+		}
+	} else {
+		x.RecipientRoles, err = normalizeChannelChoices(x.RecipientRoles, channelRecipientRoles, []string{"oncall"})
+		if err != nil {
+			return x, alertdomain.Invalid("recipient role is invalid")
+		}
+	}
+	if x, err = s.bindEmailRecipients(ctx, x, false); err != nil {
+		return x, err
+	}
+	if err := validateChannelConfig(x); err != nil {
+		return x, err
+	}
+	x.ContentFilter.Categories, err = normalizeChannelChoices(x.ContentFilter.Categories, channelContentCategories, nil)
+	if err != nil {
+		return x, alertdomain.Invalid("content category is invalid")
+	}
+	x.ContentFilter.EventStates, err = normalizeChannelChoices(x.ContentFilter.EventStates, channelEventStates, nil)
+	if err != nil {
+		return x, alertdomain.Invalid("event state is invalid")
+	}
 	x.UpdatedAt = now
+	s.channelMu.Lock()
+	defer s.channelMu.Unlock()
 	return x, s.repo.SaveChannel(ctx, x)
 }
+
+func (s *AlertService) ListNotificationRoles(ctx context.Context) ([]alertdomain.NotificationRole, error) {
+	return s.repo.ListNotificationRoles(ctx)
+}
+
+func (s *AlertService) SaveNotificationRole(ctx context.Context, x alertdomain.NotificationRole) (alertdomain.NotificationRole, error) {
+	x.Name, x.Description = strings.TrimSpace(x.Name), strings.TrimSpace(x.Description)
+	if x.Name == "" {
+		return x, alertdomain.Invalid("角色名称不能为空")
+	}
+	now := time.Now().UTC()
+	if x.ID == "" {
+		x.ID, x.CreatedAt = stableID("notification-role", x.Name, fmt.Sprint(now.UnixNano())), now
+	}
+	x.UpdatedAt = now
+	return x, s.repo.SaveNotificationRole(ctx, x)
+}
+
+func (s *AlertService) DeleteNotificationRole(ctx context.Context, id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return alertdomain.Invalid("角色编号不能为空")
+	}
+	recipients, err := s.repo.ListNotificationRecipients(ctx)
+	if err != nil {
+		return err
+	}
+	for _, recipient := range recipients {
+		for _, roleID := range recipient.RoleIDs {
+			if roleID == id {
+				return alertdomain.ErrConflict
+			}
+		}
+	}
+	return s.repo.DeleteNotificationRole(ctx, id)
+}
+
+func (s *AlertService) ListNotificationRecipients(ctx context.Context) ([]alertdomain.NotificationRecipient, error) {
+	return s.repo.ListNotificationRecipients(ctx)
+}
+
+func (s *AlertService) SaveNotificationRecipient(ctx context.Context, x alertdomain.NotificationRecipient) (alertdomain.NotificationRecipient, error) {
+	x.Name, x.Email = strings.TrimSpace(x.Name), strings.ToLower(strings.TrimSpace(x.Email))
+	if x.Name == "" || x.Email == "" {
+		return x, alertdomain.Invalid("人员姓名和邮箱不能为空")
+	}
+	address, err := mail.ParseAddress(x.Email)
+	if err != nil || !strings.EqualFold(address.Address, x.Email) {
+		return x, alertdomain.Invalid("邮箱格式不正确")
+	}
+	x.RoleIDs = normalizeStringIDs(x.RoleIDs)
+	roles, err := s.repo.ListNotificationRoles(ctx)
+	if err != nil {
+		return x, err
+	}
+	roleSet := make(map[string]bool, len(roles))
+	for _, role := range roles {
+		roleSet[role.ID] = true
+	}
+	for _, roleID := range x.RoleIDs {
+		if !roleSet[roleID] {
+			return x, alertdomain.Invalid("选择的角色不存在")
+		}
+	}
+	now := time.Now().UTC()
+	if x.ID == "" {
+		x.ID, x.CreatedAt = stableID("notification-recipient", x.Email, fmt.Sprint(now.UnixNano())), now
+	}
+	x.UpdatedAt = now
+	return x, s.repo.SaveNotificationRecipient(ctx, x)
+}
+
+func (s *AlertService) DeleteNotificationRecipient(ctx context.Context, id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return alertdomain.Invalid("人员编号不能为空")
+	}
+	channels, err := s.repo.ListChannels(ctx)
+	if err != nil {
+		return err
+	}
+	for _, channel := range channels {
+		for _, recipientID := range channel.RecipientIDs {
+			if recipientID == id {
+				return alertdomain.ErrConflict
+			}
+		}
+	}
+	return s.repo.DeleteNotificationRecipient(ctx, id)
+}
+
+func (s *AlertService) bindEmailRecipients(ctx context.Context, channel alertdomain.Channel, activeOnly bool) (alertdomain.Channel, error) {
+	if channel.Type != "email" {
+		return channel, nil
+	}
+	if s.accounts != nil {
+		roles := make([]string, 0, len(channel.RecipientRoles))
+		for _, role := range channel.RecipientRoles {
+			if platformRecipientRoles[strings.ToLower(strings.TrimSpace(role))] {
+				roles = append(roles, strings.ToLower(strings.TrimSpace(role)))
+			}
+		}
+		if len(channel.RecipientIDs) == 0 && len(roles) == 0 {
+			if strings.TrimSpace(channel.Config["to"]) != "" {
+				return channel, nil
+			}
+			return channel, alertdomain.Invalid("请至少选择一名推送人员或一个平台角色")
+		}
+		emails, err := s.accounts.ResolveAlertRecipientEmails(ctx, channel.RecipientIDs, roles)
+		if err != nil {
+			return channel, alertdomain.Invalid(err.Error())
+		}
+		config := make(map[string]string, len(channel.Config)+1)
+		for key, value := range channel.Config {
+			config[key] = value
+		}
+		config["to"] = strings.Join(emails, ",")
+		channel.Config = config
+		return channel, nil
+	}
+	if len(channel.RecipientIDs) == 0 {
+		return channel, nil
+	}
+	recipients, err := s.repo.ListNotificationRecipients(ctx)
+	if err != nil {
+		return channel, err
+	}
+	byID := make(map[string]alertdomain.NotificationRecipient, len(recipients))
+	for _, recipient := range recipients {
+		byID[recipient.ID] = recipient
+	}
+	emails := make([]string, 0, len(channel.RecipientIDs))
+	for _, id := range channel.RecipientIDs {
+		recipient, ok := byID[id]
+		if !ok {
+			return channel, alertdomain.Invalid("选择的通知人员不存在")
+		}
+		if activeOnly && !recipient.Enabled {
+			continue
+		}
+		emails = append(emails, recipient.Email)
+	}
+	if len(emails) == 0 {
+		return channel, alertdomain.Invalid("没有可接收邮件的已启用人员")
+	}
+	config := make(map[string]string, len(channel.Config)+1)
+	for key, value := range channel.Config {
+		config[key] = value
+	}
+	config["to"] = strings.Join(emails, ",")
+	channel.Config = config
+	return channel, nil
+}
+func (s *AlertService) SetChannelEnabled(ctx context.Context, id string, enabled bool) (alertdomain.Channel, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return alertdomain.Channel{}, alertdomain.Invalid("channel id is required")
+	}
+	s.channelMu.Lock()
+	defer s.channelMu.Unlock()
+	channels, err := s.repo.ListChannels(ctx)
+	if err != nil {
+		return alertdomain.Channel{}, err
+	}
+	for _, channel := range channels {
+		if channel.ID != id {
+			continue
+		}
+		channel.Enabled = enabled
+		channel.UpdatedAt = time.Now().UTC()
+		return channel, s.repo.SaveChannel(ctx, channel)
+	}
+	return alertdomain.Channel{}, alertdomain.ErrNotFound
+}
 func (s *AlertService) DeleteChannel(ctx context.Context, id string) error {
+	s.channelMu.Lock()
+	defer s.channelMu.Unlock()
 	return s.repo.DeleteChannel(ctx, id)
 }
 func (s *AlertService) ListDeliveries(ctx context.Context, limit int) ([]alertdomain.Delivery, error) {
@@ -827,7 +1116,31 @@ func (s *AlertService) deliveryLoop() {
 				allSucceeded, lastError = false, err.Error()
 			} else {
 				for _, channel := range channels {
-					if channel.Enabled && alertdomain.SeverityRank(event.Severity) >= alertdomain.SeverityRank(channel.MinimumSeverity) {
+					if channelMatchesEvent(channel, event) {
+						s.channelMu.RLock()
+						refreshCtx, refreshCancel := context.WithTimeout(context.Background(), 3*time.Second)
+						current, found, refreshErr := s.channelByID(refreshCtx, channel.ID)
+						refreshCancel()
+						if refreshErr != nil {
+							s.channelMu.RUnlock()
+							allSucceeded, lastError = false, refreshErr.Error()
+							continue
+						}
+						if !found || !channelMatchesEvent(current, event) {
+							s.channelMu.RUnlock()
+							continue
+						}
+						channel = current
+						channel, err = s.bindEmailRecipients(context.Background(), channel, true)
+						if err != nil {
+							now := time.Now().UTC()
+							_ = s.repo.UpdateChannelDeliveryStatus(context.Background(), channel.ID, "failed", err.Error(), channel.LastDeliveredAt, now)
+							_ = s.repo.SaveDelivery(context.Background(), alertdomain.Delivery{ID: stableID(event.ID, channel.ID, fmt.Sprint(now.UnixNano())), EventID: event.ID, RuleName: event.RuleName, Severity: event.Severity, MachineID: event.MachineID, ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: channel.Type, Status: "failed", Error: err.Error(), DeliveredAt: now})
+							s.runtime.deliveriesFailed.Add(1)
+							allSucceeded, lastError = false, err.Error()
+							s.channelMu.RUnlock()
+							continue
+						}
 						ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 						var deliveryErr error
 					retryLoop:
@@ -857,7 +1170,7 @@ func (s *AlertService) deliveryLoop() {
 							s.runtime.deliveriesSucceeded.Add(1)
 						}
 						persistCtx, persistCancel := context.WithTimeout(context.Background(), 3*time.Second)
-						if err := s.repo.SaveChannel(persistCtx, channel); err != nil {
+						if err := s.repo.UpdateChannelDeliveryStatus(persistCtx, channel.ID, channel.LastStatus, channel.LastError, channel.LastDeliveredAt, channel.UpdatedAt); err != nil {
 							allSucceeded, lastError = false, err.Error()
 						}
 						delivery := alertdomain.Delivery{ID: stableID(event.ID, channel.ID, fmt.Sprint(now.UnixNano())), EventID: event.ID, RuleName: event.RuleName, Severity: event.Severity, MachineID: event.MachineID, ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: channel.Type, Status: channel.LastStatus, DeliveredAt: now}
@@ -868,6 +1181,7 @@ func (s *AlertService) deliveryLoop() {
 							allSucceeded, lastError = false, err.Error()
 						}
 						persistCancel()
+						s.channelMu.RUnlock()
 						s.runtime.lastDeliveryUnixMS.Store(now.UnixMilli())
 					}
 				}
@@ -879,6 +1193,19 @@ func (s *AlertService) deliveryLoop() {
 			}
 		}()
 	}
+}
+
+func (s *AlertService) channelByID(ctx context.Context, id string) (alertdomain.Channel, bool, error) {
+	channels, err := s.repo.ListChannels(ctx)
+	if err != nil {
+		return alertdomain.Channel{}, false, err
+	}
+	for _, channel := range channels {
+		if channel.ID == id {
+			return channel, true, nil
+		}
+	}
+	return alertdomain.Channel{}, false, nil
 }
 
 func (s *AlertService) notificationRecoveryLoop() {
@@ -987,6 +1314,107 @@ func validateChannelConfig(c alertdomain.Channel) error {
 	}
 	return nil
 }
+
+var channelRecipientRoles = map[string]bool{"oncall": true, "dba": true, "ops": true, "developer": true, "manager": true}
+var platformRecipientRoles = map[string]bool{"admin": true, "operator": true, "dba": true, "auditor": true}
+var channelContentCategories = map[string]bool{"host": true, "agent": true, "availability": true, "connection": true, "replication": true, "transaction": true, "performance": true, "storage": true, "fragmentation": true, "log": true}
+var channelEventStates = map[string]bool{"firing": true, "resolved": true}
+
+func normalizeChannelChoices(values []string, allowed map[string]bool, fallback []string) ([]string, error) {
+	if len(values) == 0 {
+		return append([]string(nil), fallback...), nil
+	}
+	seen := make(map[string]bool, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if !allowed[value] {
+			return nil, alertdomain.Invalid("unsupported channel routing value")
+		}
+		if !seen[value] {
+			seen[value] = true
+			out = append(out, value)
+		}
+	}
+	return out, nil
+}
+
+func normalizeStringIDs(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func channelMatchesEvent(channel alertdomain.Channel, event alertdomain.Event) bool {
+	if !channel.Enabled || alertdomain.SeverityRank(event.Severity) < alertdomain.SeverityRank(channel.MinimumSeverity) {
+		return false
+	}
+	if !channelChoiceMatches(channel.ContentFilter.EventStates, event.Status) {
+		return false
+	}
+	return channelChoiceMatches(channel.ContentFilter.Categories, channelContentCategory(event))
+}
+
+func channelChoiceMatches(choices []string, value string) bool {
+	if len(choices) == 0 {
+		return true
+	}
+	for _, choice := range choices {
+		if choice == value {
+			return true
+		}
+	}
+	return false
+}
+
+func channelContentCategory(event alertdomain.Event) string {
+	metric := strings.ToLower(event.Metric)
+	if strings.HasPrefix(metric, "agent_") {
+		return "agent"
+	}
+	if !strings.HasPrefix(metric, "mysql_") {
+		return "host"
+	}
+	if containsMetricFragment(metric, "connectivity", "process_alive", "port_listening", "probe", "socket_ok") {
+		return "availability"
+	}
+	if containsMetricFragment(metric, "replica", "replication", "gtid", "semisync", "master_role") {
+		return "replication"
+	}
+	if containsMetricFragment(metric, "connection", "threads_connected", "long_sleep", "active_connections") {
+		return "connection"
+	}
+	if containsMetricFragment(metric, "longest_transaction", "lock_wait", "metadata_lock", "blocking", "history_list", "purge_backlog", "max_blocking") {
+		return "transaction"
+	}
+	if containsMetricFragment(metric, "fragment", "tablespace_fragment", "max_table_fragment") {
+		return "fragmentation"
+	}
+	if containsMetricFragment(metric, "disk_full", "oom", "table_corruption", "crash_recovery", "permission_failed", "recent_error", "error_log", "slow_query_log_enabled") {
+		return "log"
+	}
+	if containsMetricFragment(metric, "data_disk", "binlog_disk", "redo_disk", "tmp_disk_usage", "undo_disk", "buffer_pool", "open_files", "table_cache") {
+		return "storage"
+	}
+	return "performance"
+}
+
+func containsMetricFragment(value string, fragments ...string) bool {
+	for _, fragment := range fragments {
+		if strings.Contains(value, fragment) {
+			return true
+		}
+	}
+	return false
+}
 func validateAlertHTTPURL(raw string) error {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
@@ -1005,6 +1433,11 @@ func validatePort(raw string, defaultPort int) error {
 	return nil
 }
 func (s *AlertService) TestChannel(ctx context.Context, channel alertdomain.Channel) error {
+	var err error
+	channel.RecipientIDs = normalizeStringIDs(channel.RecipientIDs)
+	if channel, err = s.bindEmailRecipients(ctx, channel, true); err != nil {
+		return err
+	}
 	if err := validateChannelConfig(channel); err != nil {
 		return err
 	}
@@ -1015,7 +1448,8 @@ func (s *AlertService) deliver(ctx context.Context, c alertdomain.Channel, e ale
 	text := fmt.Sprintf("%s\n状态: %s\n机器: %s\n指标: %s\n当前值: %v %s 阈值: %v\n时间: %s", title, e.Status, e.MachineID, e.Metric, e.Value, e.Operator, e.Threshold, e.LastSeenAt.Format(time.RFC3339))
 	switch c.Type {
 	case "email":
-		return sendAlertEmail(ctx, c.Config, title, text)
+		subject, plainBody, htmlBody := renderAlertEmail(e)
+		return sendAlertEmail(ctx, c.Config, subject, plainBody, htmlBody)
 	case "dingtalk":
 		return s.postJSON(ctx, c.Config["webhook"], map[string]any{"msgtype": "markdown", "markdown": map[string]string{"title": title, "text": text}})
 	case "feishu":
@@ -1082,7 +1516,7 @@ func (s *AlertService) postJSON(ctx context.Context, url string, payload any) er
 	}
 	return nil
 }
-func sendAlertEmail(ctx context.Context, cfg map[string]string, subject, body string) error {
+func sendAlertEmail(ctx context.Context, cfg map[string]string, subject, plainBody, htmlBody string) error {
 	host := strings.TrimSpace(cfg["host"])
 	port := strings.TrimSpace(cfg["port"])
 	from := strings.TrimSpace(cfg["from"])
@@ -1095,7 +1529,7 @@ func sendAlertEmail(ctx context.Context, cfg map[string]string, subject, body st
 	if host == "" || from == "" || len(to) == 0 {
 		return errors.New("email host, from and to are required")
 	}
-	fromAddress, recipients, msg, err := buildAlertEmail(from, to, subject, body)
+	fromAddress, recipients, msg, err := buildAlertEmail(from, to, subject, plainBody, htmlBody)
 	if err != nil {
 		return err
 	}
@@ -1156,7 +1590,7 @@ func sendAlertEmail(ctx context.Context, cfg map[string]string, subject, body st
 	return nil
 }
 
-func buildAlertEmail(from string, to []string, subject, body string) (string, []string, []byte, error) {
+func buildAlertEmail(from string, to []string, subject, plainBody, htmlBody string) (string, []string, []byte, error) {
 	fromAddress, err := mail.ParseAddress(strings.TrimSpace(from))
 	if err != nil {
 		return "", nil, nil, fmt.Errorf("发件邮箱地址格式无效: %w", err)
@@ -1171,17 +1605,296 @@ func buildAlertEmail(from string, to []string, subject, body string) (string, []
 		recipients = append(recipients, address.Address)
 		toHeaders = append(toHeaders, address.String())
 	}
+	var alternative bytes.Buffer
+	writer := multipart.NewWriter(&alternative)
+	plainHeaders := textproto.MIMEHeader{}
+	plainHeaders.Set("Content-Type", "text/plain; charset=UTF-8")
+	plainHeaders.Set("Content-Transfer-Encoding", "quoted-printable")
+	plainPart, err := writer.CreatePart(plainHeaders)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	if err = writeAlertEmailPart(plainPart, plainBody); err != nil {
+		return "", nil, nil, err
+	}
+	htmlHeaders := textproto.MIMEHeader{}
+	htmlHeaders.Set("Content-Type", "text/html; charset=UTF-8")
+	htmlHeaders.Set("Content-Transfer-Encoding", "quoted-printable")
+	htmlPart, err := writer.CreatePart(htmlHeaders)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	if err = writeAlertEmailPart(htmlPart, htmlBody); err != nil {
+		return "", nil, nil, err
+	}
+	if err = writer.Close(); err != nil {
+		return "", nil, nil, err
+	}
 	headers := []string{
 		"From: " + fromAddress.String(),
 		"To: " + strings.Join(toHeaders, ", "),
 		"Date: " + time.Now().Format(time.RFC1123Z),
-		"Subject: " + mime.QEncoding.Encode("UTF-8", subject),
+		"Subject: " + mime.QEncoding.Encode("UTF-8", safeMailHeader(subject)),
 		"MIME-Version: 1.0",
-		"Content-Type: text/plain; charset=UTF-8",
-		"Content-Transfer-Encoding: 8bit",
+		fmt.Sprintf("Content-Type: multipart/alternative; boundary=%q", writer.Boundary()),
 	}
-	message := strings.Join(headers, "\r\n") + "\r\n\r\n" + strings.ReplaceAll(body, "\n", "\r\n")
+	message := strings.Join(headers, "\r\n") + "\r\n\r\n" + alternative.String()
 	return fromAddress.Address, recipients, []byte(message), nil
+}
+
+func writeAlertEmailPart(part io.Writer, body string) error {
+	body = strings.ReplaceAll(body, "\r\n", "\n")
+	body = strings.ReplaceAll(body, "\n", "\r\n")
+	encoded := quotedprintable.NewWriter(part)
+	if _, err := io.WriteString(encoded, body); err != nil {
+		_ = encoded.Close()
+		return err
+	}
+	return encoded.Close()
+}
+
+func renderAlertEmail(event alertdomain.Event) (string, string, string) {
+	severityLabel, severityColor, severityBackground := alertEmailSeverity(event.Severity)
+	statusLabel, statusColor, statusBackground := alertEmailStatus(event.Status)
+	ruleName := strings.TrimSpace(event.RuleName)
+	if ruleName == "" {
+		ruleName = "未命名告警"
+	}
+	context := alertEmailEventContext(event)
+	subject := fmt.Sprintf("[GMHA][%s][%s] %s", severityLabel, statusLabel, ruleName)
+	if context.InstanceName != "" {
+		subject += " - " + context.InstanceName
+	}
+	currentValue := strconv.FormatFloat(event.Value, 'f', -1, 64)
+	threshold := strconv.FormatFloat(event.Threshold, 'f', -1, 64)
+	plainRows := []string{
+		"GMHA 告警通知",
+		"",
+		fmt.Sprintf("告警：%s", ruleName),
+		fmt.Sprintf("等级：%s", severityLabel),
+		fmt.Sprintf("状态：%s", statusLabel),
+		fmt.Sprintf("当前值：%s", currentValue),
+		fmt.Sprintf("触发条件：%s %s %s", currentValue, valueOrDash(event.Operator), threshold),
+		"",
+		"定位信息：",
+		"实例名称：" + valueOrDash(context.InstanceName),
+		"所属集群：" + valueOrDash(context.ClusterName),
+		"实例地址：" + valueOrDash(context.InstanceEndpoint),
+		"实例角色：" + valueOrDash(context.InstanceRole),
+		"架构类型：" + valueOrDash(context.Architecture),
+		"实例关系：" + valueOrDash(context.Relation),
+	}
+	if context.SourceInstance != "" {
+		plainRows = append(plainRows, "上游实例："+context.SourceInstance)
+	}
+	plainRows = append(plainRows,
+		"机器名称："+valueOrDash(context.MachineName),
+		"机器 IP："+valueOrDash(context.MachineIP),
+		"监控指标："+valueOrDash(event.Metric),
+		"",
+		"事件信息：",
+		"首次出现："+formatAlertEmailTime(event.FirstSeenAt),
+		"最近出现："+formatAlertEmailTime(event.LastSeenAt),
+		fmt.Sprintf("出现次数：%d", event.OccurrenceCount),
+		"事件编号："+valueOrDash(event.ID),
+	)
+	additionalLabelKeys := sortedAlertAdditionalLabelKeys(event.Labels)
+	if len(additionalLabelKeys) > 0 {
+		plainRows = append(plainRows, "", "附加标签：")
+		for _, key := range additionalLabelKeys {
+			plainRows = append(plainRows, fmt.Sprintf("- %s: %s", key, event.Labels[key]))
+		}
+	}
+
+	labelsHTML := ""
+	if len(additionalLabelKeys) > 0 {
+		var labels strings.Builder
+		labels.WriteString(`<tr><td style="padding:0 32px 28px"><div style="font-size:12px;font-weight:700;color:#52667d;margin-bottom:10px">附加标签</div><div>`)
+		for _, key := range additionalLabelKeys {
+			labels.WriteString(`<span style="display:inline-block;margin:0 6px 6px 0;padding:5px 8px;border:1px solid #dbe4ee;border-radius:5px;background:#f7f9fc;color:#53677d;font-size:11px">`)
+			labels.WriteString(html.EscapeString(key + ": " + event.Labels[key]))
+			labels.WriteString(`</span>`)
+		}
+		labels.WriteString(`</div></td></tr>`)
+		labelsHTML = labels.String()
+	}
+	locationRows := alertEmailTableRow("实例名称", context.InstanceName) +
+		alertEmailTableRow("所属集群", context.ClusterName) +
+		alertEmailTableRow("实例地址", context.InstanceEndpoint) +
+		alertEmailTableRow("实例角色", context.InstanceRole) +
+		alertEmailTableRow("架构类型", context.Architecture) +
+		alertEmailTableRow("实例关系", context.Relation)
+	if context.SourceInstance != "" {
+		locationRows += alertEmailTableRow("上游实例", context.SourceInstance)
+	}
+	locationRows += alertEmailTableRow("机器名称", context.MachineName) + alertEmailTableRow("机器 IP", context.MachineIP)
+	eventRows := alertEmailTableRow("监控指标", event.Metric) +
+		alertEmailTableRow("首次出现", formatAlertEmailTime(event.FirstSeenAt)) +
+		alertEmailTableRow("最近出现", formatAlertEmailTime(event.LastSeenAt)) +
+		alertEmailTableRow("出现次数", strconv.Itoa(event.OccurrenceCount)) +
+		alertEmailTableRow("通知次数", strconv.Itoa(event.NotificationCount))
+	htmlBody := fmt.Sprintf(`<!doctype html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#eef3f8;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',Arial,sans-serif;color:#21344a">
+<table role="presentation" width="100%%" cellspacing="0" cellpadding="0" style="background:#eef3f8"><tr><td align="center" style="padding:28px 14px">
+<table role="presentation" width="640" cellspacing="0" cellpadding="0" style="width:100%%;max-width:640px;border:1px solid #dce5ef;border-radius:12px;background:#ffffff;overflow:hidden;box-shadow:0 10px 30px rgba(37,58,82,.08)">
+<tr><td style="padding:18px 28px;border-bottom:1px solid #e8edf3;background:#f8fafc"><table role="presentation" width="100%%"><tr><td style="font-size:15px;font-weight:750;color:#1e3854">GMHA 告警通知</td><td align="right" style="font-size:11px;color:#7d8da0">%s</td></tr></table></td></tr>
+<tr><td style="padding:30px 32px 22px"><span style="display:inline-block;margin-right:7px;padding:5px 9px;border-radius:5px;background:%s;color:%s;font-size:11px;font-weight:750">%s</span><span style="display:inline-block;padding:5px 9px;border-radius:5px;background:%s;color:%s;font-size:11px;font-weight:750">%s</span><h1 style="margin:16px 0 8px;font-size:23px;line-height:1.4;color:#1d334b">%s</h1><p style="margin:0;color:#748599;font-size:12px">事件编号：%s</p></td></tr>
+<tr><td style="padding:0 32px 24px"><table role="presentation" width="100%%" cellspacing="0" cellpadding="0" style="border-radius:9px;background:%s"><tr><td style="padding:18px 20px"><div style="margin-bottom:6px;color:%s;font-size:11px;font-weight:700">当前值 / 触发条件</div><div style="color:#1f3349;font-size:22px;font-weight:750">%s <span style="color:#8190a1;font-size:14px;font-weight:600">%s %s</span></div></td></tr></table></td></tr>
+<tr><td style="padding:0 32px 8px"><div style="font-size:12px;font-weight:750;color:#324b66;margin-bottom:8px">实例与拓扑</div><table role="presentation" width="100%%" cellspacing="0" cellpadding="0" style="border-top:1px solid #e7edf3">%s</table></td></tr>
+<tr><td style="padding:20px 32px 28px"><div style="font-size:12px;font-weight:750;color:#324b66;margin-bottom:8px">事件信息</div><table role="presentation" width="100%%" cellspacing="0" cellpadding="0" style="border-top:1px solid #e7edf3">%s</table></td></tr>
+%s
+<tr><td style="padding:17px 28px;border-top:1px solid #e8edf3;background:#f8fafc;color:#7b8a9b;font-size:10px;line-height:1.6">此邮件由 GMHA 告警系统自动发送。请登录管理平台查看告警详情与处置记录。</td></tr>
+</table></td></tr></table></body></html>`,
+		formatAlertEmailTime(event.LastSeenAt),
+		severityBackground, severityColor, html.EscapeString(severityLabel),
+		statusBackground, statusColor, html.EscapeString(statusLabel),
+		html.EscapeString(ruleName), html.EscapeString(valueOrDash(event.ID)),
+		severityBackground, severityColor, html.EscapeString(currentValue), html.EscapeString(valueOrDash(event.Operator)), html.EscapeString(threshold),
+		locationRows, eventRows,
+		labelsHTML,
+	)
+	return subject, strings.Join(plainRows, "\n"), htmlBody
+}
+
+type alertEmailContext struct {
+	InstanceName     string
+	ClusterName      string
+	InstanceEndpoint string
+	InstanceRole     string
+	Architecture     string
+	Relation         string
+	SourceInstance   string
+	MachineName      string
+	MachineIP        string
+}
+
+func alertEmailEventContext(event alertdomain.Event) alertEmailContext {
+	labels := event.Labels
+	context := alertEmailContext{
+		InstanceName:     strings.TrimSpace(labels["instance_name"]),
+		ClusterName:      strings.TrimSpace(labels["cluster_name"]),
+		InstanceEndpoint: strings.TrimSpace(labels["instance_endpoint"]),
+		InstanceRole:     strings.TrimSpace(labels["instance_role"]),
+		Architecture:     strings.TrimSpace(labels["topology_architecture_label"]),
+		Relation:         strings.TrimSpace(labels["instance_relation"]),
+		MachineName:      strings.TrimSpace(labels["machine_name"]),
+		MachineIP:        strings.TrimSpace(labels["machine_ip"]),
+	}
+	if context.ClusterName == "" {
+		context.ClusterName = strings.TrimSpace(event.ClusterID)
+	}
+	if context.MachineName == "" {
+		context.MachineName = strings.TrimSpace(event.MachineID)
+	}
+	if context.InstanceEndpoint == "" {
+		context.InstanceEndpoint = strings.TrimSpace(labels["mysql_endpoint"])
+	}
+	if context.InstanceName == "" && strings.TrimSpace(labels["mysql_port"]) != "" {
+		context.InstanceName = context.MachineName + ":" + strings.TrimSpace(labels["mysql_port"])
+	}
+	if context.InstanceRole == "" {
+		context.InstanceRole = strings.TrimSpace(labels["observed_instance_role"])
+	}
+	if context.InstanceEndpoint == "" && context.MachineIP != "" && strings.TrimSpace(labels["mysql_port"]) != "" {
+		context.InstanceEndpoint = context.MachineIP + ":" + strings.TrimSpace(labels["mysql_port"])
+	}
+	sourceName := strings.TrimSpace(labels["source_instance_name"])
+	sourceEndpoint := strings.TrimSpace(labels["source_instance_endpoint"])
+	context.SourceInstance = sourceName
+	if sourceEndpoint != "" && sourceEndpoint != sourceName {
+		if context.SourceInstance != "" {
+			context.SourceInstance += "（" + sourceEndpoint + "）"
+		} else {
+			context.SourceInstance = sourceEndpoint
+		}
+	}
+	return context
+}
+
+func alertEmailSeverity(severity alertdomain.Severity) (string, string, string) {
+	switch severity {
+	case alertdomain.SeverityFatal:
+		return "致命", "#8f1d2c", "#fdecef"
+	case alertdomain.SeverityCritical:
+		return "严重", "#bf293f", "#fff0f2"
+	case alertdomain.SeverityWarning:
+		return "警告", "#a96409", "#fff7e6"
+	default:
+		return "通知", "#176dcc", "#edf5ff"
+	}
+}
+
+func alertEmailStatus(status string) (string, string, string) {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "resolved":
+		return "已恢复", "#177a52", "#ebf8f2"
+	case "firing":
+		return "告警中", "#bf293f", "#fff0f2"
+	default:
+		return valueOrDash(status), "#53677d", "#f1f4f7"
+	}
+}
+
+func alertEmailTableRow(label, value string) string {
+	return fmt.Sprintf(`<tr><td style="width:104px;padding:10px 0;border-bottom:1px solid #edf1f5;color:#7b8b9d;font-size:11px">%s</td><td style="padding:10px 0;border-bottom:1px solid #edf1f5;color:#2d4259;font-size:12px;font-weight:600;word-break:break-all">%s</td></tr>`, html.EscapeString(label), html.EscapeString(valueOrDash(value)))
+}
+
+func sortedAlertLabelKeys(labels map[string]string) []string {
+	keys := make([]string, 0, len(labels))
+	for key := range labels {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func sortedAlertAdditionalLabelKeys(labels map[string]string) []string {
+	keys := make([]string, 0, len(labels))
+	for key, value := range labels {
+		if strings.TrimSpace(value) == "" || alertCoreContextLabel(key) {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func alertCoreContextLabel(key string) bool {
+	switch key {
+	case "display_name", "metric_scope", "machine_name", "machine_ip", "cluster_name", "alert_category", "resolution_reason",
+		"mysql_host", "mysql_endpoint", "mysql_instance", "mysql_port",
+		"instance_name", "instance_ip", "instance_port", "instance_endpoint", "instance_role", "instance_role_code", "observed_instance_role",
+		"topology_architecture", "topology_architecture_label", "instance_relation",
+		"source_machine_id", "source_instance_name", "source_instance_ip", "source_instance_port", "source_instance_endpoint":
+		return true
+	default:
+		return false
+	}
+}
+
+func formatAlertEmailTime(value time.Time) string {
+	if value.IsZero() {
+		return "—"
+	}
+	return value.Local().Format("2006-01-02 15:04:05 MST")
+}
+
+func valueOrDash(value string) string {
+	if value = strings.TrimSpace(value); value != "" {
+		return value
+	}
+	return "—"
+}
+
+func safeMailHeader(value string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\r' || r == '\n' {
+			return -1
+		}
+		return r
+	}, value)
 }
 
 func metricNumber(v any) (float64, bool) {
@@ -1288,6 +2001,9 @@ func alertIdentityLabels(labels map[string]string) map[string]string {
 }
 
 func alertIdentityLabel(key string, hasMySQLPort bool) bool {
+	if alertCoreContextLabel(key) && key != "mysql_port" {
+		return false
+	}
 	switch key {
 	case "display_name", "metric_scope", "machine_name", "machine_ip", "alert_category", "resolution_reason":
 		return false

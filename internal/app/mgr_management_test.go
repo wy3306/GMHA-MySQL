@@ -152,8 +152,17 @@ func TestPrepareMGRActionsUseAdminAPIWithoutForce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(script, "rebootClusterFromCompleteOutage") || strings.Contains(strings.ToLower(script), "force") {
+	if !strings.Contains(script, "rebootClusterFromCompleteOutage") || strings.Contains(script, "{primary:") || strings.Contains(strings.ToLower(script), "force") {
 		t.Fatalf("unsafe outage recovery script: %s", script)
+	}
+}
+
+func TestMGRCompleteOutageVerificationRequiresAllApplied(t *testing.T) {
+	command := mgrRecoveredGroupVerifyCommand("mha", "secret", 3306, "group-1", 3)
+	for _, required := range []string{"COUNT(*)=3", "MEMBER_STATE", "ONLINE", "MEMBER_ROLE", "PRIMARY", "COUNT_TRANSACTIONS_IN_QUEUE", "COUNT_TRANSACTIONS_REMOTE_IN_APPLIER_QUEUE", "MGR_RECOVERY_CONSISTENT"} {
+		if !strings.Contains(command, required) {
+			t.Fatalf("complete-outage verification missing %q: %s", required, command)
+		}
 	}
 }
 

@@ -6,10 +6,16 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"strings"
 	"time"
 
 	hbdomain "gmha/internal/domain/heartbeat"
+)
+
+const (
+	metricHistoryRetention = 7 * 24 * time.Hour
+	metricCleanupBatchSize = 1000
 )
 
 // HeartbeatRepository 是心跳状态的 SQLite 仓储实现。
@@ -63,6 +69,7 @@ func (r *HeartbeatRepository) Migrate() error {
 			agent_id text not null,
 			machine_id text not null,
 			cluster_id text not null default '',
+			is_abnormal integer not null default 0,
 			metrics_json text not null default '[]',
 			collected_at text not null
 		);
@@ -83,6 +90,7 @@ func (r *HeartbeatRepository) Migrate() error {
 			numeric_value real,
 			value_json text not null default 'null',
 			success integer not null default 1,
+			heartbeat_abnormal integer not null default 0,
 			error text not null default '',
 			collected_at varchar(64) not null
 		);
@@ -92,12 +100,14 @@ func (r *HeartbeatRepository) Migrate() error {
 		create index if not exists idx_performance_metric_instance_name_time on performance_metric_sample(instance, metric_name, collected_at desc);
 	`)
 	_, _ = r.db.Exec(`alter table agent_latest_status add column metrics_json text not null default '[]'`)
+	_, _ = r.db.Exec(`alter table agent_metric_snapshot add column is_abnormal integer not null default 0`)
+	_, _ = r.db.Exec(`alter table performance_metric_sample add column heartbeat_abnormal integer not null default 0`)
 	return err
 }
 
-// AppendMetricSnapshot stores only snapshots that contain metrics and keeps a
-// rolling seven-day window. Cleanup is intentionally amortized to every 128th
-// insert so the heartbeat hot path does not perform a delete each time.
+// AppendMetricSnapshot only persists the heartbeat payload. Retention cleanup
+// runs independently every two hours so persistence never performs maintenance
+// work in the heartbeat request path.
 func (r *HeartbeatRepository) AppendMetricSnapshot(ctx context.Context, item hbdomain.MetricSnapshot) error {
 	if len(item.Metrics) == 0 {
 		return nil
@@ -106,19 +116,62 @@ func (r *HeartbeatRepository) AppendMetricSnapshot(ctx context.Context, item hbd
 	if err != nil {
 		return err
 	}
-	result, err := r.db.ExecContext(ctx, `
-		insert into agent_metric_snapshot (agent_id, machine_id, cluster_id, metrics_json, collected_at)
-		values (?, ?, ?, ?, ?)
-	`, item.AgentID, item.MachineID, item.ClusterID, string(metricsJSON), item.CollectedAt.UTC().Format(time.RFC3339Nano))
+	_, err = r.db.ExecContext(ctx, `
+		insert into agent_metric_snapshot (agent_id, machine_id, cluster_id, is_abnormal, metrics_json, collected_at)
+		values (?, ?, ?, ?, ?, ?)
+	`, item.AgentID, item.MachineID, item.ClusterID, boolInteger(item.Abnormal), string(metricsJSON), item.CollectedAt.UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+func (r *HeartbeatRepository) deleteExpiredMetricBatch(ctx context.Context, table, cutoff string) (int64, error) {
+	var statement string
+	switch table {
+	case "agent_metric_snapshot":
+		statement = `
+			delete from agent_metric_snapshot where id in (
+				select id from agent_metric_snapshot
+				where collected_at < ? and is_abnormal = 0 order by id limit ?
+			)`
+	case "performance_metric_sample":
+		statement = `
+			delete from performance_metric_sample where id in (
+				select id from performance_metric_sample
+				where collected_at < ? and success = 1 and heartbeat_abnormal = 0 order by id limit ?
+			)`
+	default:
+		return 0, errors.New("unsupported metric history table")
+	}
+	result, err := r.db.ExecContext(ctx, statement, cutoff, metricCleanupBatchSize)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	if id, idErr := result.LastInsertId(); idErr == nil && id%128 == 0 {
-		cutoff := time.Now().UTC().Add(-7 * 24 * time.Hour).Format(time.RFC3339Nano)
-		_, _ = r.db.ExecContext(ctx, `delete from agent_metric_snapshot where collected_at < ?`, cutoff)
-		_, _ = r.db.ExecContext(ctx, `delete from performance_metric_sample where collected_at < ?`, cutoff)
+	return result.RowsAffected()
+}
+
+// CleanupMetricHistory removes expired normal samples in short transactions.
+// Failed metrics and heartbeats marked abnormal are intentionally retained.
+func (r *HeartbeatRepository) CleanupMetricHistory(ctx context.Context, before time.Time) (int64, error) {
+	cutoff := before.UTC().Format(time.RFC3339Nano)
+	var total int64
+	for {
+		snapshots, err := r.deleteExpiredMetricBatch(ctx, "agent_metric_snapshot", cutoff)
+		if err != nil {
+			return total, err
+		}
+		samples, err := r.deleteExpiredMetricBatch(ctx, "performance_metric_sample", cutoff)
+		if err != nil {
+			return total, err
+		}
+		total += snapshots + samples
+		if snapshots == 0 && samples == 0 {
+			return total, nil
+		}
+		select {
+		case <-ctx.Done():
+			return total, ctx.Err()
+		case <-time.After(25 * time.Millisecond):
+		}
 	}
-	return nil
 }
 
 func (r *HeartbeatRepository) AppendMetricSamples(ctx context.Context, items []hbdomain.MetricSample) error {
@@ -147,12 +200,12 @@ func (r *HeartbeatRepository) AppendMetricSamples(ctx context.Context, items []h
 			insert into performance_metric_sample (
 				sample_key, agent_id, machine_id, cluster_id, scope, category,
 				metric_name, instance, labels_json, value_type, numeric_value,
-				value_json, success, error, collected_at
-			) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				value_json, success, heartbeat_abnormal, error, collected_at
+			) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			on conflict(sample_key) do nothing
 		`, metricSampleKey(item, string(labelsJSON)), item.AgentID, item.MachineID, item.ClusterID,
 			item.Scope, item.Category, item.MetricName, item.Instance, string(labelsJSON),
-			item.ValueType, numeric, string(valueJSON), boolInteger(item.Success), item.Error,
+			item.ValueType, numeric, string(valueJSON), boolInteger(item.Success), boolInteger(item.HeartbeatAbnormal), item.Error,
 			item.CollectedAt.UTC().Format(time.RFC3339Nano)); err != nil {
 			return err
 		}
@@ -169,7 +222,7 @@ func (r *HeartbeatRepository) ListMetricSamples(ctx context.Context, query hbdom
 	sqlText.WriteString(`
 		select id, agent_id, machine_id, cluster_id, scope, category, metric_name,
 			instance, labels_json, value_type, numeric_value, value_json, success,
-			error, collected_at
+			heartbeat_abnormal, error, collected_at
 		from performance_metric_sample
 		where cluster_id = ? and metric_name = ? and collected_at >= ? and collected_at <= ?
 	`)
@@ -194,10 +247,10 @@ func (r *HeartbeatRepository) ListMetricSamples(ctx context.Context, query hbdom
 		var item hbdomain.MetricSample
 		var labelsJSON, valueJSON, collectedAt string
 		var numeric sql.NullFloat64
-		var success int
+		var success, heartbeatAbnormal int
 		if err := rows.Scan(&item.ID, &item.AgentID, &item.MachineID, &item.ClusterID,
 			&item.Scope, &item.Category, &item.MetricName, &item.Instance, &labelsJSON,
-			&item.ValueType, &numeric, &valueJSON, &success, &item.Error, &collectedAt); err != nil {
+			&item.ValueType, &numeric, &valueJSON, &success, &heartbeatAbnormal, &item.Error, &collectedAt); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(labelsJSON), &item.Labels)
@@ -207,6 +260,7 @@ func (r *HeartbeatRepository) ListMetricSamples(ctx context.Context, query hbdom
 			item.NumericValue = &value
 		}
 		item.Success = success != 0
+		item.HeartbeatAbnormal = heartbeatAbnormal != 0
 		item.CollectedAt, _ = time.Parse(time.RFC3339Nano, collectedAt)
 		out = append(out, item)
 	}
@@ -243,7 +297,7 @@ func (r *HeartbeatRepository) ListMetricSnapshots(ctx context.Context, clusterID
 		limit = 10000
 	}
 	rows, err := r.db.QueryContext(ctx, `
-		select id, agent_id, machine_id, cluster_id, metrics_json, collected_at
+		select id, agent_id, machine_id, cluster_id, is_abnormal, metrics_json, collected_at
 		from agent_metric_snapshot
 		where cluster_id = ? and collected_at >= ?
 		order by collected_at asc limit ?
@@ -256,10 +310,12 @@ func (r *HeartbeatRepository) ListMetricSnapshots(ctx context.Context, clusterID
 	for rows.Next() {
 		var item hbdomain.MetricSnapshot
 		var metricsJSON, collectedAt string
-		if err := rows.Scan(&item.ID, &item.AgentID, &item.MachineID, &item.ClusterID, &metricsJSON, &collectedAt); err != nil {
+		var abnormal int
+		if err := rows.Scan(&item.ID, &item.AgentID, &item.MachineID, &item.ClusterID, &abnormal, &metricsJSON, &collectedAt); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(metricsJSON), &item.Metrics)
+		item.Abnormal = abnormal != 0
 		item.CollectedAt, _ = time.Parse(time.RFC3339Nano, collectedAt)
 		out = append(out, item)
 	}
@@ -271,9 +327,9 @@ func (r *HeartbeatRepository) ListMetricSnapshotsRange(ctx context.Context, clus
 		limit = 10000
 	}
 	rows, err := r.db.QueryContext(ctx, `
-		select id, agent_id, machine_id, cluster_id, metrics_json, collected_at
+		select id, agent_id, machine_id, cluster_id, is_abnormal, metrics_json, collected_at
 		from (
-			select id, agent_id, machine_id, cluster_id, metrics_json, collected_at
+			select id, agent_id, machine_id, cluster_id, is_abnormal, metrics_json, collected_at
 			from agent_metric_snapshot
 			where cluster_id = ? and collected_at >= ? and collected_at <= ?
 			order by collected_at desc limit ?
@@ -288,10 +344,12 @@ func (r *HeartbeatRepository) ListMetricSnapshotsRange(ctx context.Context, clus
 	for rows.Next() {
 		var item hbdomain.MetricSnapshot
 		var metricsJSON, collectedAt string
-		if err := rows.Scan(&item.ID, &item.AgentID, &item.MachineID, &item.ClusterID, &metricsJSON, &collectedAt); err != nil {
+		var abnormal int
+		if err := rows.Scan(&item.ID, &item.AgentID, &item.MachineID, &item.ClusterID, &abnormal, &metricsJSON, &collectedAt); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(metricsJSON), &item.Metrics)
+		item.Abnormal = abnormal != 0
 		item.CollectedAt, _ = time.Parse(time.RFC3339Nano, collectedAt)
 		out = append(out, item)
 	}

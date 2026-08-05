@@ -10,6 +10,7 @@ import (
 	"time"
 
 	hadomain "gmha/internal/domain/ha"
+	taskdomain "gmha/internal/domain/task"
 )
 
 // HARepository 是高可用领域实体的 SQLite 仓储实现，管理 VIP 配置、故障转移策略、事件等。
@@ -249,8 +250,201 @@ func (r *HARepository) Migrate() error {
 			updated_at text not null
 		);
 		create index if not exists idx_architecture_run_cluster on architecture_adjustment_run(cluster_id, created_at);
+		create table if not exists cluster_topology_intent (
+			cluster_id text primary key,
+			architecture text not null,
+			intent_json text not null,
+			updated_at text not null
+		);
 	`)
 	return err
+}
+
+// SaveTopologyIntent persists only topology metadata. Passwords are not part
+// of TopologyIntent and can therefore never leak into this recovery record.
+func (r *HARepository) SaveTopologyIntent(ctx context.Context, intent hadomain.TopologyIntent) error {
+	intent.ClusterID = strings.TrimSpace(intent.ClusterID)
+	if intent.ClusterID == "" || strings.TrimSpace(intent.Architecture) == "" {
+		return errors.New("cluster_id and architecture are required")
+	}
+	if intent.UpdatedAt.IsZero() {
+		intent.UpdatedAt = time.Now().UTC()
+	}
+	payload, err := json.Marshal(intent)
+	if err != nil {
+		return err
+	}
+	_, err = r.db.ExecContext(ctx, `
+		insert into cluster_topology_intent (cluster_id, architecture, intent_json, updated_at)
+		values (?, ?, ?, ?)
+		on conflict(cluster_id) do update set architecture=excluded.architecture,
+			intent_json=excluded.intent_json, updated_at=excluded.updated_at
+	`, intent.ClusterID, intent.Architecture, string(payload), intent.UpdatedAt.UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+func (r *HARepository) GetTopologyIntent(ctx context.Context, clusterID string) (hadomain.TopologyIntent, bool, error) {
+	var payload string
+	err := r.db.QueryRowContext(ctx, `select intent_json from cluster_topology_intent where cluster_id = ?`, strings.TrimSpace(clusterID)).Scan(&payload)
+	if errors.Is(err, sql.ErrNoRows) {
+		return hadomain.TopologyIntent{}, false, nil
+	}
+	if err != nil {
+		return hadomain.TopologyIntent{}, false, err
+	}
+	var intent hadomain.TopologyIntent
+	if err := json.Unmarshal([]byte(payload), &intent); err != nil {
+		return hadomain.TopologyIntent{}, false, err
+	}
+	return intent, true, nil
+}
+
+func (r *HARepository) ListTopologyIntents(ctx context.Context) ([]hadomain.TopologyIntent, error) {
+	rows, err := r.db.QueryContext(ctx, `select intent_json from cluster_topology_intent order by cluster_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var intents []hadomain.TopologyIntent
+	for rows.Next() {
+		var payload string
+		if err := rows.Scan(&payload); err != nil {
+			return nil, err
+		}
+		var intent hadomain.TopologyIntent
+		if err := json.Unmarshal([]byte(payload), &intent); err != nil {
+			return nil, err
+		}
+		intents = append(intents, intent)
+	}
+	return intents, rows.Err()
+}
+
+// BackfillTopologyIntents upgrades existing installations. It extracts only
+// the graph from successful historical runs/tasks and never copies the
+// credentials present in legacy task payloads.
+func (r *HARepository) BackfillTopologyIntents(ctx context.Context) error {
+	existing, err := r.ListTopologyIntents(ctx)
+	if err != nil {
+		return err
+	}
+	hasIntent := make(map[string]bool, len(existing))
+	for _, intent := range existing {
+		hasIntent[intent.ClusterID] = true
+	}
+	type candidate struct {
+		intent hadomain.TopologyIntent
+		at     time.Time
+	}
+	candidates := make(map[string]candidate)
+
+	runRows, err := r.db.QueryContext(ctx, `select run_json from architecture_adjustment_run where status = ? order by updated_at`, hadomain.ArchitectureRunSucceeded)
+	if err != nil {
+		return err
+	}
+	for runRows.Next() {
+		var payload string
+		if err := runRows.Scan(&payload); err != nil {
+			_ = runRows.Close()
+			return err
+		}
+		var run hadomain.ArchitectureRun
+		if json.Unmarshal([]byte(payload), &run) != nil || strings.TrimSpace(run.ClusterID) == "" {
+			continue
+		}
+		primary := strings.TrimSpace(run.Request.PreferredNewMasterMachineID)
+		if primary == "" {
+			primary = strings.TrimSpace(run.Request.CurrentMasterMachineID)
+		}
+		if primary == "" {
+			primary = strings.TrimSpace(run.Plan.SelectedCandidate.MachineID)
+		}
+		at := run.UpdatedAt
+		if run.FinishedAt != nil {
+			at = *run.FinishedAt
+		}
+		intent := hadomain.TopologyIntent{ClusterID: run.ClusterID, Architecture: run.Request.Architecture, PrimaryMachineID: primary, MGRGroupName: run.Request.MGRGroupName, Nodes: append([]hadomain.ArchitectureNodeRequest(nil), run.Request.Nodes...), UpdatedAt: at}
+		if current, ok := candidates[run.ClusterID]; !ok || at.After(current.at) {
+			candidates[run.ClusterID] = candidate{intent: intent, at: at}
+		}
+	}
+	if err := runRows.Err(); err != nil {
+		_ = runRows.Close()
+		return err
+	}
+	if err := runRows.Close(); err != nil {
+		return err
+	}
+
+	taskRows, err := r.db.QueryContext(ctx, `
+		select t.spec_json, m.cluster_name, coalesce(t.finished_at,t.created_at)
+		from tasks t join machines m on m.id=t.machine_id
+		where t.type = ? and t.status = ? order by t.created_at`, taskdomain.TypeMySQLTopology, taskdomain.StatusSuccess)
+	if err != nil {
+		return err
+	}
+	for taskRows.Next() {
+		var payload, clusterID, atText string
+		if err := taskRows.Scan(&payload, &clusterID, &atText); err != nil {
+			_ = taskRows.Close()
+			return err
+		}
+		var spec taskdomain.MySQLTopologySpec
+		if json.Unmarshal([]byte(payload), &spec) != nil || strings.TrimSpace(clusterID) == "" {
+			continue
+		}
+		architecture := hadomain.ArchitectureMasterSlave
+		if spec.Topology == "multi_master" {
+			architecture = hadomain.ArchitectureDualMaster
+		}
+		primary := strings.TrimSpace(spec.PrimaryMachine)
+		primaryIsID := false
+		nodes := make([]hadomain.ArchitectureNodeRequest, 0, len(spec.Nodes))
+		for _, node := range spec.Nodes {
+			if node.MachineID == primary {
+				primaryIsID = true
+			}
+			if primary != "" && (node.MachineName == primary || node.IP == primary) {
+				primary, primaryIsID = node.MachineID, true
+			}
+			nodes = append(nodes, hadomain.ArchitectureNodeRequest{MachineID: node.MachineID, Port: node.Port, Role: node.Role, SourceMachineID: node.SourceMachineID, DelaySeconds: node.ReplicationDelaySeconds})
+		}
+		if !primaryIsID {
+			primary = ""
+		}
+		if primary == "" {
+			for _, node := range spec.Nodes {
+				if strings.EqualFold(node.Role, "M") {
+					primary = node.MachineID
+					break
+				}
+			}
+		}
+		at, parseErr := time.Parse(time.RFC3339Nano, atText)
+		if parseErr != nil {
+			at, _ = time.Parse(time.RFC3339, atText)
+		}
+		intent := hadomain.TopologyIntent{ClusterID: clusterID, Architecture: architecture, PrimaryMachineID: primary, Nodes: nodes, UpdatedAt: at}
+		if current, ok := candidates[clusterID]; !ok || at.After(current.at) {
+			candidates[clusterID] = candidate{intent: intent, at: at}
+		}
+	}
+	if err := taskRows.Err(); err != nil {
+		_ = taskRows.Close()
+		return err
+	}
+	if err := taskRows.Close(); err != nil {
+		return err
+	}
+	for clusterID, item := range candidates {
+		if hasIntent[clusterID] || strings.TrimSpace(item.intent.Architecture) == "" || len(item.intent.Nodes) == 0 {
+			continue
+		}
+		if err := r.SaveTopologyIntent(ctx, item.intent); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // SaveArchitectureRun 持久化架构调整状态机快照。

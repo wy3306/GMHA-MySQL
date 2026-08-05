@@ -47,6 +47,8 @@ GET /api/v1/tasks?id=<task_id>
 GET /api/v1/mysql/instances
 ```
 
+响应中的 `agent_state` 表示实例所在机器的当前 Agent 连通状态。实例健康度以当前连通性优先：当 Agent 为 `OFFLINE` 或 `SUSPECT` 时，即使最后一次 MySQL 检查为 `OK`，接口也会返回 `heartbeat_failed` / `FAIL`，避免把机器关机前的旧快照显示为“运行正常”。
+
 安全重启：
 
 ```json

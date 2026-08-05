@@ -52,6 +52,29 @@ func (r *RecoveryRepository) Migrate() error {
 			updated_at text not null
 		);
 	`)
+	if err != nil {
+		return err
+	}
+	// Recovery workers live only in the Manager process. If the process exits
+	// mid-recovery, no worker can finish the persisted active state after the
+	// next start, so close it explicitly instead of displaying "recovering"
+	// forever for an Agent that has already returned online.
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := r.db.Exec(`
+		update recovery_tasks
+		set status = 'failed',
+			last_error = case when trim(last_error) = '' then 'recovery interrupted by manager restart' else last_error end,
+			updated_at = ?
+		where status in ('pending','confirming','executing','waiting_heartbeat')
+	`, now); err != nil {
+		return err
+	}
+	_, err = r.db.Exec(`
+		update recovery_latest_state
+		set in_progress = 0, lock_until = null,
+			last_result = 'recovery interrupted by manager restart', updated_at = ?
+		where in_progress = 1
+	`, now)
 	return err
 }
 

@@ -1,6 +1,9 @@
 package dynamic
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestBuildDefaultMySQLDynamicCollectConfig(t *testing.T) {
 	cfg := BuildDefaultMySQLDynamicCollectConfig()
@@ -23,7 +26,10 @@ func TestBuildDefaultMySQLDynamicCollectConfig(t *testing.T) {
 			t.Fatalf("expected positive interval for %s", task.Name)
 		}
 	}
-	for _, name := range []string{"mysql_threads_connected", "mysql_connectivity", "mysql_qps", "mysql_error_log_size", "mysql_slow_query_threshold"} {
+	for _, name := range []string{
+		"mysql_threads_connected", "mysql_connectivity", "mysql_qps", "mysql_error_log_size", "mysql_slow_query_threshold",
+		"mysql_fragmented_table_count", "mysql_max_table_fragment_percent", "mysql_tablespace_fragment_total_bytes",
+	} {
 		if _, ok := seen[name]; !ok {
 			t.Fatalf("expected default mysql task %s", name)
 		}
@@ -39,5 +45,15 @@ func TestBuildDefaultMySQLDynamicCollectConfig(t *testing.T) {
 	}
 	if got := seen["mysql_slow_query_threshold"].IntervalSeconds; got != 300 {
 		t.Fatalf("expected 300s task, got %d", got)
+	}
+	for _, name := range []string{"mysql_fragmented_table_count", "mysql_max_table_fragment_percent", "mysql_tablespace_fragment_total_bytes"} {
+		task := seen[name]
+		if !task.Enabled || task.IntervalSeconds != 300 {
+			t.Fatalf("expected enabled 300s fragmentation task %s, got %+v", name, task)
+		}
+		query := task.Params["query"]
+		if query == "" || !strings.Contains(query, "information_schema.tables") {
+			t.Fatalf("fragmentation task %s has no table metadata query: %q", name, query)
+		}
 	}
 }

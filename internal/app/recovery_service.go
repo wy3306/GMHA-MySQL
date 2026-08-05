@@ -35,6 +35,7 @@ type RecoveryConfig struct {
 	ConfirmWindow       time.Duration
 	WaitHeartbeat       time.Duration
 	MinAutoRecoverEvery time.Duration
+	StaleStateAfter     time.Duration
 	SuppressAfterFails  int
 	SuppressFor         time.Duration
 	MaxRecentTasks      int
@@ -63,6 +64,7 @@ func (s *RecoveryService) config() RecoveryConfig {
 		ConfirmWindow:       3 * time.Second,
 		WaitHeartbeat:       20 * time.Second,
 		MinAutoRecoverEvery: 2 * time.Minute,
+		StaleStateAfter:     3 * time.Minute,
 		SuppressAfterFails:  3,
 		SuppressFor:         15 * time.Minute,
 		MaxRecentTasks:      20,
@@ -101,10 +103,38 @@ func (s *RecoveryService) LatestSnapshot(ctx context.Context) (map[string]recove
 		return nil, err
 	}
 	out := make(map[string]recoverydomain.LatestState, len(items))
+	now := time.Now().UTC()
 	for _, item := range items {
+		if recoveryStateExpired(item, now, s.config().StaleStateAfter) {
+			item.InProgress = false
+			item.LastResult = "stale recovery state cleared"
+			if s.heartbeat != nil {
+				hb, ok, heartbeatErr := s.heartbeat.GetByMachineID(ctx, item.MachineID)
+				if heartbeatErr == nil && ok && (hb.CurrentState == hbdomain.StateOnline || hb.CurrentState == hbdomain.StateDegraded) {
+					item.LastSuccessAt = ptrTime(now)
+					item.ConsecutiveFailures = 0
+					item.SuppressedUntil = nil
+					item.LastResult = "heartbeat restored; stale recovery state cleared"
+				}
+			}
+			if err := s.repo.SaveLatestState(ctx, item); err != nil {
+				return nil, err
+			}
+		}
 		out[item.MachineID] = item
 	}
 	return out, nil
+}
+
+func recoveryStateExpired(state recoverydomain.LatestState, now time.Time, staleAfter time.Duration) bool {
+	if !state.InProgress || staleAfter <= 0 {
+		return false
+	}
+	reference := state.UpdatedAt
+	if state.LastAttemptAt != nil && state.LastAttemptAt.After(reference) {
+		reference = *state.LastAttemptAt
+	}
+	return !reference.IsZero() && !reference.Add(staleAfter).After(now)
 }
 
 func (s *RecoveryService) TriggerManualRecoverByIP(ctx context.Context, ip string) (RecoveryView, error) {
@@ -172,7 +202,13 @@ func (s *RecoveryService) ExecuteTask(ctx context.Context, task recoverydomain.T
 	if !locked {
 		return errors.New("recovery already in progress")
 	}
-	defer s.repo.ReleaseLock(ctx, task.MachineID)
+	defer func() {
+		// The execution context can be canceled exactly when a recovery times
+		// out. Releasing with that canceled context leaves in_progress stuck.
+		releaseCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = s.repo.ReleaseLock(releaseCtx, task.MachineID)
+	}()
 
 	state, _, _ := s.repo.GetLatestState(ctx, task.MachineID)
 	// 冷却窗口用于限制后台自动恢复的重复尝试。用户主动点击“手动拉起”

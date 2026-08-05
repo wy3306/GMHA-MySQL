@@ -273,7 +273,7 @@ export const manualDeepDive = {
       ['先持久化后分发', '有副作用的操作先取得 task_id，再向 Agent 发送；客户端断开仍能按 ID 查询。'],
       ['父子关系', '批量、备份和架构运行用父任务表达意图，子任务对应机器或阶段，可精确表达部分成功。'],
       ['结构化事件', 'Reporter 串行回传进度、INFO/WARN/ERROR 和结果，Manager 持久化原始证据。'],
-      ['清理边界', '删除只移除已完成任务的 Manager 历史，不撤销远端变化；运行中任务禁止删除。']
+      ['清理边界', '支持选中记录、筛选结果和一键全部清理；只移除已完成任务的 Manager 历史，不撤销远端变化，运行中任务会安全保留。']
     ],
     ['远端副作用必须有任务或运行记录', '终态不可回退', '运行中不能删除', '父任务不得掩盖失败子任务', '日志不得含秘密'],
     ['TaskService', 'Task / Step / Event repositories', 'Agent WebSocket', 'Reporter', 'Parent-child aggregator'],
@@ -308,5 +308,20 @@ export const manualDeepDive = {
     ['必须使用共享 MySQL/PostgreSQL', '备用节点必须已纳管', 'bootstrap token 必须短期且禁止缓存', '目标健康前不得作为入口', '源节点删除失败不得绑定目标'],
     ['ManagerHAService', 'Shared repository', 'Agent systemd installer', 'Bootstrap endpoints', 'iproute2 / arping'],
     ['当前没有自动选主共识协议。', 'Manager VIP 不支持 BGP 或业务 VIP 级防脑裂。', '旧节点失联时需外部主机/网络围栏。']
+  ),
+
+  accounts: detail(
+    ['提交账号和密码', 'bcrypt 校验密码摘要', '生成 256 位随机会话令牌', '仅持久化令牌 SHA-256 摘要', '通过 HttpOnly Cookie 返回会话', '每次请求校验账号状态、角色和功能权限', '固定 2 小时后自动失效'],
+    [
+      ['默认管理员', '启动迁移确保 username=admin 的内置账号存在；可用 GMHA_ADMIN_PASSWORD 覆盖首次密码。该账号始终启用、保持 admin 角色和全部权限。'],
+      ['密码保护', '密码使用 bcrypt 摘要持久化，不保存可逆明文；普通新账号要求至少 8 位密码。'],
+      ['固定会话', '登录生成密码学随机令牌，数据库只保存 SHA-256 摘要与过期时间；Cookie 使用 HttpOnly 和 SameSite=Strict，固定 2 小时而非无限滑动。'],
+      ['双层授权', '前端按权限过滤菜单，AccountHandler 中间件再次按 API 路径检查权限；绕过页面直接请求仍会返回 403。'],
+      ['会话撤销', '退出删除单个会话；停用、改密或删除账号会清除该账号的全部会话。'],
+      ['最高账号保护', 'admin 角色可创建和管理账号，但内置 admin 只能由其自身修改，且不能删除、停用或移除最高权限。']
+    ],
+    ['密码不得以明文持久化或回显', '会话令牌不得暴露给页面脚本', '所有受保护 API 必须在服务端校验权限', '内置 admin 不得删除、停用或降权', '停用和改密必须撤销已有会话'],
+    ['AccountService', 'AccountRepository', 'AccountHandler middleware', 'bcrypt', 'HttpOnly session cookie'],
+    ['当前角色为内置模板，不支持在页面创建新的角色类型。', '固定 2 小时会话到期后必须重新输入密码。', '首次默认密码仅用于初始化，生产环境必须及时更换。']
   )
 }
