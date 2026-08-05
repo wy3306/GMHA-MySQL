@@ -211,6 +211,11 @@ func TestMGRRouterCommandsAreDeterministicAndUsePrimaryPort(t *testing.T) {
 			t.Fatalf("Router deploy command missing %q: %s", required, command)
 		}
 	}
+	for _, required := range []string{`rm -rf -- "$config_dir"`, `install_tmp="${target}.new.$$"`, `cp -a -- "$root_dir" "$install_tmp"`} {
+		if !strings.Contains(command, required) {
+			t.Fatalf("Router deploy command missing safe idempotent cleanup %q: %s", required, command)
+		}
+	}
 	if strings.Contains(command, "mha@10.0.0.1:4406") {
 		t.Fatalf("Router bootstrap must use the primary MySQL port, not the local member port: %s", command)
 	}
@@ -379,6 +384,65 @@ func TestExistingMGRPlanSwitchesPrimaryAndReconcilesRouter(t *testing.T) {
 		if codes[forbidden] {
 			t.Fatalf("existing MGR primary switch must not run %s: %+v", forbidden, steps)
 		}
+	}
+}
+
+func TestMGRReentryPlanCleansManagedRouterBeforePreflight(t *testing.T) {
+	steps := architecturePlanSteps(hadomain.ArchitectureAdjustmentRequest{
+		Architecture:        hadomain.ArchitectureMGRRouter,
+		CurrentArchitecture: hadomain.ArchitectureMasterSlave,
+	})
+	positions := map[string]int{}
+	for index, step := range steps {
+		positions[step.Code] = index
+	}
+	if positions["cleanup_stale_router"] == 0 || positions["preflight"] == 0 || positions["stop_stale_group"] == 0 {
+		t.Fatalf("MGR reentry plan is missing stale Router cleanup or preflight: %+v", steps)
+	}
+	if positions["cleanup_stale_router"] >= positions["preflight"] {
+		t.Fatalf("managed Router ports must be released before MGR port preflight: %+v", steps)
+	}
+	if positions["stop_stale_group"] <= positions["preflight"] || positions["stop_stale_group"] >= positions["align_group_data"] {
+		t.Fatalf("stale Group Replication must stop after preflight and before data alignment: %+v", steps)
+	}
+}
+
+func TestMGRToMasterSlavePlanUsesExplicitTeardown(t *testing.T) {
+	steps := architecturePlanSteps(hadomain.ArchitectureAdjustmentRequest{
+		Architecture:        hadomain.ArchitectureMasterSlave,
+		CurrentArchitecture: hadomain.ArchitectureMGRRouter,
+	})
+	codes := map[string]bool{}
+	for _, step := range steps {
+		codes[step.Code] = true
+	}
+	for _, required := range []string{"freeze_business_access", "verify_group", "teardown_mgr", "promote_new_master", "reconfigure_topology", "verify_topology", "pt_verify_replication"} {
+		if !codes[required] {
+			t.Fatalf("MGR-to-master-slave plan is missing %s: %+v", required, steps)
+		}
+	}
+	for _, unwanted := range []string{"elect_candidate", "force_gate", "pt_repair_on_failure"} {
+		if codes[unwanted] {
+			t.Fatalf("MGR-to-master-slave conversion must not use generic failover step %s: %+v", unwanted, steps)
+		}
+	}
+}
+
+func TestMGRAsyncTeardownDisablesRestartAndRecoveryChannel(t *testing.T) {
+	command := mgrAsyncTeardownCommand(
+		hadomain.ArchitectureAdjustmentRequest{},
+		hadomain.ArchitectureNodeRequest{MachineID: "db-1", Port: 3306},
+		mysqlapp.Instance{MyCnfPath: "/etc/mysql/db-1.cnf"},
+	)
+	for _, required := range []string{"STOP GROUP_REPLICATION", "group_replication_start_on_boot=OFF", "group_replication_recovery", "replication_group_members", "/etc/mysql/db-1.cnf"} {
+		if !strings.Contains(command, required) {
+			t.Fatalf("MGR teardown command is missing %q: %s", required, command)
+		}
+	}
+	check := exec.Command("bash", "-n")
+	check.Stdin = strings.NewReader(command)
+	if output, err := check.CombinedOutput(); err != nil {
+		t.Fatalf("MGR teardown command has invalid shell syntax: %v\n%s\n%s", err, output, command)
 	}
 }
 

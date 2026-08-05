@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	machinedomain "gmha/internal/domain/machine"
@@ -87,33 +88,42 @@ func (s *HAService) MGRManagementStatus(ctx context.Context, clusterID string) (
 	if !status.Available {
 		return status, nil
 	}
-	seed, ok := mgrOnlineSeed(targets)
-	if !ok {
+	seeds := mgrOnlineSeeds(targets)
+	if len(seeds) == 0 {
 		status.AdminAPIError = "当前没有 ONLINE 成员，AdminAPI 与 Router 元数据暂不可读"
 		return status, nil
 	}
 	username, password := s.architectureManagementAccount(ctx)
-	taskID, output, shellErr := s.runMGRTask(ctx, seed.machine, "mgr_status", "读取 MGR 与 Router 状态",
-		mysqlShellMGRCommand(username, password, seed.instance.Port, mgrStatusScript()), 2*time.Minute)
-	if taskID != "" {
-		status.TaskIDs = append(status.TaskIDs, taskID)
+	attemptSeeds := seeds
+	if len(attemptSeeds) > 2 {
+		attemptSeeds = attemptSeeds[:2]
 	}
-	if shellErr != nil {
-		status.AdminAPIError = shellErr.Error()
+	adminErrors := make([]string, 0, len(attemptSeeds))
+	for _, seed := range attemptSeeds {
+		taskID, output, shellErr := s.runMGRTask(ctx, seed.machine, "mgr_status", "读取 MGR 与 Router 状态",
+			mysqlShellMGRCommand(username, password, seed.instance.Port, mgrStatusScript()), 30*time.Second)
+		if taskID != "" {
+			status.TaskIDs = append(status.TaskIDs, taskID)
+		}
+		if shellErr != nil {
+			adminErrors = append(adminErrors, shellErr.Error())
+			continue
+		}
+		var payload struct {
+			Status        any `json:"status"`
+			Routers       any `json:"routers"`
+			RouterOptions any `json:"router_options"`
+		}
+		if parseErr := parseMGRJSONMarker(output, &payload); parseErr != nil {
+			adminErrors = append(adminErrors, fmt.Sprintf("%s: %v", seed.machine.Name, parseErr))
+			continue
+		}
+		status.AdminAPIStatus = payload.Status
+		status.Routers = payload.Routers
+		status.RouterOptions = payload.RouterOptions
 		return status, nil
 	}
-	var payload struct {
-		Status        any `json:"status"`
-		Routers       any `json:"routers"`
-		RouterOptions any `json:"router_options"`
-	}
-	if err := parseMGRJSONMarker(output, &payload); err != nil {
-		status.AdminAPIError = err.Error()
-		return status, nil
-	}
-	status.AdminAPIStatus = payload.Status
-	status.Routers = payload.Routers
-	status.RouterOptions = payload.RouterOptions
+	status.AdminAPIError = fmt.Sprintf("已尝试 %d 个 ONLINE 成员，均未能读取 AdminAPI 元数据：%s", len(attemptSeeds), strings.Join(adminErrors, "；"))
 	return status, nil
 }
 
@@ -205,31 +215,49 @@ func (s *HAService) collectMGRManagementStatus(ctx context.Context, clusterID st
 		return status, nil, err
 	}
 	username, password := s.architectureManagementAccount(ctx)
-	var targets []mgrClusterTarget
+	type mgrProbeResult struct {
+		target mgrClusterTarget
+		taskID string
+	}
+	probeInputs := make([]mgrClusterTarget, 0, len(instances))
 	for _, instance := range instances {
 		machine, ok := machineByID[instance.MachineID]
 		if !ok {
 			continue
 		}
-		member := MGRManagementMember{
+		probeInputs = append(probeInputs, mgrClusterTarget{machine: machine, instance: instance, member: MGRManagementMember{
 			MachineID: machine.ID, MachineName: machine.Name, IP: machine.IP, Port: instance.Port,
 			ServerID: instance.ServerID, State: "UNKNOWN", Role: "UNKNOWN",
+		}})
+	}
+	probeResults := make([]mgrProbeResult, len(probeInputs))
+	var probeWait sync.WaitGroup
+	for index := range probeInputs {
+		probeWait.Add(1)
+		go func(index int) {
+			defer probeWait.Done()
+			target := probeInputs[index]
+			taskID, output, probeErr := s.runMGRTask(ctx, target.machine, "mgr_member_status", "读取 MGR 成员状态",
+				mgrMemberProbeCommand(username, password, target.instance.Port), 45*time.Second)
+			if probeErr != nil {
+				target.member.Error = probeErr.Error()
+			} else if parsed, found := parseMGRMemberMarker(output); found {
+				parsed.MachineID, parsed.MachineName, parsed.IP, parsed.Port = target.machine.ID, target.machine.Name, target.machine.IP, target.instance.Port
+				target.member = parsed
+			} else {
+				target.member.Reachable = true
+			}
+			probeResults[index] = mgrProbeResult{target: target, taskID: taskID}
+		}(index)
+	}
+	probeWait.Wait()
+	targets := make([]mgrClusterTarget, 0, len(probeResults))
+	for _, result := range probeResults {
+		if result.taskID != "" {
+			status.TaskIDs = append(status.TaskIDs, result.taskID)
 		}
-		taskID, output, probeErr := s.runMGRTask(ctx, machine, "mgr_member_status", "读取 MGR 成员状态",
-			mgrMemberProbeCommand(username, password, instance.Port), 45*time.Second)
-		if taskID != "" {
-			status.TaskIDs = append(status.TaskIDs, taskID)
-		}
-		if probeErr != nil {
-			member.Error = probeErr.Error()
-		} else if parsed, found := parseMGRMemberMarker(output); found {
-			parsed.MachineID, parsed.MachineName, parsed.IP, parsed.Port = machine.ID, machine.Name, machine.IP, instance.Port
-			member = parsed
-		} else {
-			member.Reachable = true
-		}
-		status.Members = append(status.Members, member)
-		targets = append(targets, mgrClusterTarget{machine: machine, instance: instance, member: member})
+		status.Members = append(status.Members, result.target.member)
+		targets = append(targets, result.target)
 	}
 	if len(status.Members) == 0 {
 		return status, targets, nil
@@ -305,12 +333,15 @@ func parseMGRMemberMarker(output string) (MGRManagementMember, bool) {
 }
 
 func mgrStatusScript() string {
+	// Pretty-printed JSON keeps every output line below the Agent event payload
+	// limit. A single extended status line can otherwise be dropped before the
+	// Manager gets a chance to parse it.
 	return `var c=dba.getCluster(); var o=null; try { o=c.routerOptions({extended:1}); } catch(e) { o={unavailable:String(e.message||e)}; } print("` +
-		mgrJSONMarker + `"+JSON.stringify({status:c.status({extended:2}),routers:c.listRouters(),router_options:o}));`
+		mgrJSONMarker + `"); print(JSON.stringify({status:c.status({extended:2}),routers:c.listRouters(),router_options:o},null,2));`
 }
 
 func mysqlShellMGRCommand(username, password string, port int, script string) string {
-	findShell := `if [ -x /opt/gmha/mysql-shell/current/bin/mysqlsh ]; then mysqlsh_bin=/opt/gmha/mysql-shell/current/bin/mysqlsh; else mysqlsh_bin=$(command -v mysqlsh || find /opt /usr/local -type f -path '*/bin/mysqlsh' -perm -111 -print -quit 2>/dev/null); fi; [ -n "$mysqlsh_bin" ]`
+	findShell := `if [ -x /opt/gmha/mysql-shell/current/bin/mysqlsh ]; then mysqlsh_bin=/opt/gmha/mysql-shell/current/bin/mysqlsh; else mysqlsh_bin=$(command -v mysqlsh || find /opt /usr/local -type f -path '*/bin/mysqlsh' -perm -111 -print -quit 2>/dev/null); fi; if [ -z "$mysqlsh_bin" ]; then echo '未找到 MySQL Shell，请重新执行 MGR 架构部署中的 MySQL Shell 步骤' >&2; exit 127; fi`
 	uri := fmt.Sprintf("%s@127.0.0.1:%d", url.User(strings.TrimSpace(username)).String(), port)
 	return "set -eu; " + findShell +
 		`; mysqlsh_home=$(mktemp -d /tmp/gmha-mysqlsh.XXXXXX); chmod 700 "$mysqlsh_home"; trap 'rm -rf "$mysqlsh_home"' EXIT; ` +
@@ -434,17 +465,26 @@ func mgrRecoveredGroupVerifyCommand(username, password string, port int, groupNa
 }
 
 func mgrOnlineSeed(targets []mgrClusterTarget) (mgrClusterTarget, bool) {
-	for _, target := range targets {
-		if strings.EqualFold(target.member.State, "ONLINE") && strings.EqualFold(target.member.Role, "PRIMARY") {
-			return target, true
-		}
-	}
-	for _, target := range targets {
-		if strings.EqualFold(target.member.State, "ONLINE") {
-			return target, true
-		}
+	seeds := mgrOnlineSeeds(targets)
+	if len(seeds) > 0 {
+		return seeds[0], true
 	}
 	return mgrClusterTarget{}, false
+}
+
+func mgrOnlineSeeds(targets []mgrClusterTarget) []mgrClusterTarget {
+	seeds := make([]mgrClusterTarget, 0, len(targets))
+	for _, target := range targets {
+		if strings.EqualFold(target.member.State, "ONLINE") && strings.EqualFold(target.member.Role, "PRIMARY") {
+			seeds = append(seeds, target)
+		}
+	}
+	for _, target := range targets {
+		if strings.EqualFold(target.member.State, "ONLINE") && !strings.EqualFold(target.member.Role, "PRIMARY") {
+			seeds = append(seeds, target)
+		}
+	}
+	return seeds
 }
 
 func mgrActionSuccessMessage(action string) string {

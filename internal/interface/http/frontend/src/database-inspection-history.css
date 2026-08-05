@@ -1,0 +1,30 @@
+.inspection-history { overflow: hidden; }
+.inspection-history > header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 20px; border-bottom: 1px solid #e8edf3; }
+.inspection-history > header h3 { margin: 0 0 4px; color: #293d57; font-size: 15px; }
+.inspection-history > header p { margin: 0; color: #788ba3; font-size: 11px; }
+.inspection-history-table { overflow: auto; }
+.inspection-history-table table { width: 100%; min-width: 980px; }
+.inspection-history-table th { padding: 10px 14px; background: #f7f9fc; color: #64748b; font-size: 11px; white-space: nowrap; }
+.inspection-history-table td { padding: 12px 14px; border-top: 1px solid #edf1f5; color: #475569; font-size: 11px; vertical-align: middle; }
+.inspection-history-table tr:first-child td { border-top: 0; }
+.inspection-history-table tr.active td { background: #f4f8ff; }
+.inspection-history-table td b,
+.inspection-history-table td small { display: block; }
+.inspection-history-table td small { margin-top: 4px; color: #8a9bb0; font-size: 10px; }
+.inspection-history-table td:last-child { display: flex; align-items: center; gap: 10px; white-space: nowrap; }
+.inspection-history-table td:last-child a { color: #1769c2; font-weight: 600; text-decoration: none; }
+.history-score { color: #1769c2; font-size: 18px; }
+.history-risk { display: inline-flex; margin-right: 5px; padding: 3px 7px; border-radius: 999px; white-space: nowrap; }
+.history-risk.critical { background: #ffebeb; color: #c43838; }
+.history-risk.warning { background: #fff5dc; color: #a86200; }
+.inspection-status.success { background: #e8f7f0; color: #15825e; }
+.inspection-status.running,
+.inspection-status.sent,
+.inspection-status.pending { background: #eaf2ff; color: #1769c2; }
+.inspection-history-error { margin: 12px 16px; padding: 9px 11px; border-radius: 6px; background: #fff5f5; color: #b42318; font-size: 11px; }
+.inspection-history-empty { padding: 28px; text-align: center; color: #8292a6; font-size: 11px; }
+.inspection-history > footer { padding: 9px 14px; border-top: 1px solid #edf1f5; color: #8a9bb0; font-size: 10px; text-align: right; }
+
+@media (max-width: 700px) {
+  .inspection-history > header { align-items: flex-start; flex-direction: column; }
+}

@@ -140,6 +140,28 @@ func (h *PackageHandler) HandlePackageByPath(w http.ResponseWriter, r *http.Requ
 	}
 }
 
+// HandleAgentPackageDownload exposes a read-only package path for managed
+// Agents. Browser package management remains authenticated; this endpoint
+// accepts GET only and is used by architecture workflows that cannot carry a
+// human web session cookie.
+func (h *PackageHandler) HandleAgentPackageDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/software/packages/"), "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		writeError(w, http.StatusBadRequest, http.ErrMissingFile)
+		return
+	}
+	path, err := h.service.Open(parts[0], parts[1])
+	if err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	http.ServeFile(w, r, path)
+}
+
 func (h *PackageHandler) HandleSettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:

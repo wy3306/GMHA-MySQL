@@ -13,6 +13,23 @@ GMHA（Go MySQL High Availability）是一套 Go 原生的 MySQL 高可用管理
 
 ## 版本更新记录
 
+### V0.2.2（2026-08-05）
+
+更新内容：
+
+- 数据库巡检新增持久化历史记录，可按集群查看已保留的标准/深度巡检、重新打开详情并导出 Excel；新增 `GET /api/v1/tasks/database-inspection/history`。
+- MGR 管理状态改为并发探测成员，并在 PRIMARY 不可用时自动尝试其他 ONLINE 成员读取 AdminAPI 与 Router 元数据。
+- 集群控制台可基于实时 Group Replication 拓扑恢复 MGR 管理入口，并在页面重连或重新可见后自动续接架构任务进度。
+- 新增 MGR + Router 安全转换为异步主从/多主架构的完整流程，并在重复部署前幂等清理旧 Router 与复制组运行态。
+- 新增供 Agent 架构任务只读下载已校验制品的接口，避免后台任务依赖浏览器登录 Cookie。
+
+Bug 修复：
+
+- 修复 AdminAPI 大型单行 JSON 可能超过 Agent 事件限制，导致健康的 MGR 被误报为管理组件不可用的问题。
+- 修复旧 Router 服务、端口或 Group Replication 运行态残留，导致重新部署 MGR 时预检或启动失败的问题。
+- 修复从 MGR 切换到异步复制时缺少冻结、追平、退出组、重建拓扑和恢复业务访问的安全闭环问题。
+- 修复数据库巡检刷新页面后历史结果不可回看、无法继续观察运行中任务及导出入口不稳定的问题。
+
 ### V0.2.1（2026-08-05）
 
 更新内容：
@@ -140,10 +157,10 @@ Release 程序包提供独立的 `gmha-web` 启动器。执行 `./start-web.sh` 
 本地构建 Linux x86_64 程序包：
 
 ```bash
-./scripts/build-release.sh V0.2.1
+./scripts/build-release.sh V0.2.2
 ```
 
-构建结果位于 `dist/gmha-V0.2.1-linux-amd64.tar.gz`，并同时生成 SHA-256 校验文件。
+构建结果位于 `dist/gmha-V0.2.2-linux-amd64.tar.gz`，并同时生成 SHA-256 校验文件。
 完整包默认内置同版本的 Manager x86_64、Agent x86_64 与 Agent ARM64 安装包及
 制品索引；控制台会把仓库中的最高版本自动作为默认目标。
 

@@ -34,3 +34,23 @@ func TestAsyncConsistencyRejectsMissingDesiredEdge(t *testing.T) {
 		t.Fatalf("partial async topology reported consistent: %+v", view)
 	}
 }
+
+func TestOfflineMGRMetadataDoesNotOverrideAsyncIntent(t *testing.T) {
+	view := clusterTopologyView{Nodes: []clusterTopologyNode{
+		{MachineID: "m1", IP: "10.0.0.1", Port: 3306, Role: "M", GroupName: "group-1", GroupState: "OFFLINE", GroupRole: "PRIMARY"},
+		{MachineID: "m2", IP: "10.0.0.2", Port: 3306, Role: "S", GroupName: "group-1", GroupState: "OFFLINE", GroupRole: "SECONDARY"},
+	}, Edges: []clusterTopologyEdge{{SourceIP: "10.0.0.1", SourcePort: 3306, TargetIP: "10.0.0.2", TargetPort: 3306, Observed: true}}, TopologySource: "runtime"}
+	intent := hadomain.TopologyIntent{Architecture: hadomain.ArchitectureMasterSlave, PrimaryMachineID: "m1", Nodes: []hadomain.ArchitectureNodeRequest{
+		{MachineID: "m1", Port: 3306, Role: "M"},
+		{MachineID: "m2", Port: 3306, Role: "S", SourceMachineID: "m1"},
+	}}
+
+	applyTopologyIntent(&view, intent)
+
+	if view.Architecture != hadomain.ArchitectureMasterSlave || view.TopologySource != "runtime+desired_state" {
+		t.Fatalf("offline MGR metadata overrode the asynchronous topology: %+v", view)
+	}
+	if hasObservedMGR(view.Nodes) {
+		t.Fatalf("offline MGR metadata was treated as a live group: %+v", view.Nodes)
+	}
+}

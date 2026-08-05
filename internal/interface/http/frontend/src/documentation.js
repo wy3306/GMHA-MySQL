@@ -116,6 +116,7 @@ export const apiEndpoints = [
   endpoint('任务与自动化', 'GET', '/tasks/cluster-automation/report?task_ids=task-01,task-02&format=html', '下载自动化报告', { query: ['task_ids', 'format'], contentType: 'text/html 或 text/csv', response: '<html>...</html>' }),
   endpoint('任务与自动化', 'GET', '/tasks/cluster-automation/artifacts/{task_id}/{file_name}', '下载任务产物', { contentType: 'application/octet-stream', response: '二进制文件' }),
   endpoint('任务与自动化', 'GET', '/tasks/database-inspection/results?task_ids=task-01,task-02', '汇总数据库巡检结果', { query: ['task_ids'], response: { ready: true, pending: 0, failed: 0, targets: [{ task_id: 'task-01', machine_id: 'machine-01', port: 3306, level: 'standard', status: 'success', score: 92, passed: 11, warnings: 1, critical: 0 }], checks: [], exported_at: '2026-07-23T10:00:00Z' } }),
+  endpoint('任务与自动化', 'GET', '/tasks/database-inspection/history?cluster=prod&limit=50', '查询保留的数据库巡检记录', { query: ['cluster', 'limit'], response: { items: [{ id: 'batch-task-01', level: 'standard', status: 'success', ready: true, clusters: ['prod'], task_ids: ['task-01'], target_count: 1, average_score: 92, warnings: 1, critical: 0, created_at: '2026-07-23T10:00:00Z' }], total: 1 } }),
   endpoint('任务与自动化', 'GET', '/tasks/database-inspection/report?task_ids=task-01,task-02', '下载数据库巡检 Word 报告', { contentType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', response: 'DOCX 二进制文件' }),
   endpoint('任务与自动化', 'GET', '/tasks/database-inspection/data?task_ids=task-01,task-02', '导出数据库巡检 Excel 数据', { contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', response: 'XLSX 二进制文件' }),
 
@@ -175,6 +176,7 @@ export const apiEndpoints = [
   endpoint('安装包', 'POST', '/packages/fetch-bundle', '下载推荐软件包组合', { status: 201, body: { bundle_id: 'mysql-8.0.46-x86_64' }, response: { bundle_id: 'mysql-8.0.46-x86_64', complete: true, installed: [], failed: [] }, note: '部分成功时返回 207 Multi-Status。' }),
   endpoint('安装包', 'POST', '/packages/verify', '校验安装包', { body: { category: 'mysql', name: 'mysql-8.0.46.tar.xz' }, response: { name: 'mysql-8.0.46.tar.xz', sha256: '...', verified: true } }),
   endpoint('安装包', 'GET', '/packages/{category}/{file_name}', '下载安装包', { contentType: 'application/octet-stream', response: '二进制文件' }),
+  endpoint('安装包', 'GET', '/software/packages/{category}/{file_name}', 'Agent 只读下载安装包', { contentType: 'application/octet-stream', response: '二进制文件', note: '仅供受管节点执行安装工作流时读取，不接受上传、修改或删除。' }),
   endpoint('安装包', 'DELETE', '/packages/{category}/{file_name}', '删除安装包', { status: 204, response: null }),
   endpoint('安装包', 'POST', '/packages/delete', '通过表单删除安装包', { status: 303, contentType: 'application/x-www-form-urlencoded', body: { category: 'mysql', name: 'mysql-8.0.46.tar.xz' }, response: '303 See Other，Location: /', note: '兼容传统表单的入口；API 客户端优先使用 DELETE /packages/{category}/{file_name}。' }),
   endpoint('安装包', 'GET', '/package-settings', '查询仓库设置', { response: { storage_path: './software', categories: [], catalog: [], bundles: [] } }),
@@ -264,7 +266,7 @@ export const apiEndpoints = [
 // available to an API client, including how to retrieve asynchronous results.
 export const instanceManagementOperations = [
   { name: '实例', mode: '查询 / 生命周期', apis: ['GET /mysql/instances', 'POST /tasks/mysql-lifecycle', 'POST /tasks/mysql-uninstall', 'DELETE /mysql/instances'] },
-  { name: '数据库巡检', mode: '异步任务 + 报告', apis: ['POST /tasks/cluster-automation', 'GET /tasks/database-inspection/results', 'GET /tasks/database-inspection/report', 'GET /tasks/database-inspection/data'] },
+  { name: '数据库巡检', mode: '异步任务 + 历史记录 + 报告', apis: ['POST /tasks/cluster-automation', 'GET /tasks/database-inspection/history', 'GET /tasks/database-inspection/results', 'GET /tasks/database-inspection/report', 'GET /tasks/database-inspection/data'] },
   { name: '执行计划', mode: '同步只读', apis: ['POST /sql-diagnostics/explain'] },
   { name: '在线 DDL', mode: '预演 / 执行', apis: ['POST /tasks/mysql-online-ddl', 'GET /tasks?id={task_id}'] },
   { name: '索引管理', mode: '查询 / 变更', apis: ['POST /tasks/mysql-indexes', 'GET /tasks?id={task_id}'] },

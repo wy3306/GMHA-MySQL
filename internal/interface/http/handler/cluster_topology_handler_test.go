@@ -38,3 +38,17 @@ func TestApplyTopologyGroupReplication(t *testing.T) {
 		t.Fatalf("unexpected MGR topology node: %+v", node)
 	}
 }
+
+func TestObservedMGRRequiresAnOnlineMember(t *testing.T) {
+	offline := []clusterTopologyNode{
+		{MachineID: "m1", GroupName: "group-1", GroupState: "OFFLINE", GroupRole: "PRIMARY"},
+		{MachineID: "m2", GroupName: "group-1", GroupState: "OFFLINE", GroupRole: "SECONDARY"},
+	}
+	if hasObservedMGR(offline) {
+		t.Fatal("OFFLINE Group Replication metadata must not be classified as the current MGR architecture")
+	}
+	offline[1].GroupState = "ONLINE"
+	if !hasObservedMGR(offline) {
+		t.Fatal("an ONLINE Group Replication member must be classified as an observed MGR architecture")
+	}
+}

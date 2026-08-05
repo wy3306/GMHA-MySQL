@@ -117,6 +117,25 @@ func TestParseMGRJSONMarker(t *testing.T) {
 	}
 }
 
+func TestMGRStatusScriptPrintsMarkerAndJSONOnSeparateLines(t *testing.T) {
+	script := mgrStatusScript()
+	if !strings.Contains(script, `print("`+mgrJSONMarker+`")`) || !strings.Contains(script, "JSON.stringify(") || !strings.Contains(script, ",null,2)") {
+		t.Fatalf("MGR status output must be split into report-safe lines: %s", script)
+	}
+}
+
+func TestMGROnlineSeedsPreferPrimaryAndRetainFallbacks(t *testing.T) {
+	targets := []mgrClusterTarget{
+		{machine: machinedomain.Machine{ID: "secondary"}, member: MGRManagementMember{State: "ONLINE", Role: "SECONDARY"}},
+		{machine: machinedomain.Machine{ID: "offline"}, member: MGRManagementMember{State: "OFFLINE", Role: "SECONDARY"}},
+		{machine: machinedomain.Machine{ID: "primary"}, member: MGRManagementMember{State: "ONLINE", Role: "PRIMARY"}},
+	}
+	seeds := mgrOnlineSeeds(targets)
+	if len(seeds) != 2 || seeds[0].machine.ID != "primary" || seeds[1].machine.ID != "secondary" {
+		t.Fatalf("unexpected AdminAPI seed order: %#v", seeds)
+	}
+}
+
 func TestPrepareMGRActionsUseAdminAPIWithoutForce(t *testing.T) {
 	targets := []mgrClusterTarget{
 		{machine: machinedomain.Machine{ID: "m1", IP: "10.0.0.1"}, instance: mysqlapp.Instance{MachineID: "m1", Port: 3306}, member: MGRManagementMember{MachineID: "m1", State: "ONLINE", Role: "PRIMARY", Reachable: true}},

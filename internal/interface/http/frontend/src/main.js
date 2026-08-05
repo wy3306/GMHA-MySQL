@@ -52,6 +52,8 @@ import './performance-monitoring.css'
 import './sql-diagnostics.css'
 import './cluster-list.css'
 import './database-inspection.css'
+import './database-inspection-history.css'
+import './database-inspection-refinement.css'
 import './documentation.css'
 import './manager-console.css'
 import './ai-automation.css'
@@ -346,6 +348,20 @@ createApp({
     const architectureDraggingNode = ref('')
     const mgrManagement = ref(null)
     const mgrManagementLoading = ref(false)
+    const topologyHasLiveMGR = computed(() => {
+      if (clusterTopology.value?.architecture === 'mgr_router') return true
+      return (clusterTopology.value?.nodes || []).some(node => {
+        const role = String(node.group_role || node.role || '').toUpperCase()
+        const groupState = String(node.group_state || '').toUpperCase()
+        return (role === 'PRIMARY' || role === 'SECONDARY' || role === 'MGR_PRIMARY' || role === 'MGR_SECONDARY') && (!groupState || groupState === 'ONLINE')
+      })
+    })
+    const mgrNavigationAvailable = computed(() => {
+      const completedRun = architectureRun.value?.status === 'success' && !architectureRun.value?.request?.vip_only
+      if (completedRun) return architectureRun.value?.request?.architecture === 'mgr_router'
+      if (topologyHasLiveMGR.value) return true
+      return Boolean(mgrManagement.value?.available && mgrManagement.value?.architecture === 'mgr_router')
+    })
     const mgrActionBusy = ref('')
     const mgrActionDialog = ref(null)
     const mgrActionConfirmation = ref('')
@@ -373,6 +389,8 @@ createApp({
     })
     const architectureSubmitting = ref(false)
     let architecturePollTimer = null
+    let architecturePollFailures = 0
+    let architecturePollInFlight = false
     let clusterTopologyRefreshTimer = null
     let performanceRefreshTimer = null
     let managerStatusTimer = null
@@ -1897,6 +1915,10 @@ createApp({
         if (options.includeMachines) requests.push(loadClusterMachines())
         const [topology, mysqlInstances] = await Promise.all(requests)
         clusterTopology.value = topology
+        if (data.value.clusterSection === 'mgr' && !mgrNavigationAvailable.value) {
+          data.value.clusterSection = 'architecture'
+          mgrManagement.value = null
+        }
         if (mysqlInstances !== null) data.value.mysqlInstances = asList(mysqlInstances, 'instances')
         clusterTopologyLastUpdated.value = new Date().toISOString()
         clusterTopologyError.value = ''
@@ -2935,8 +2957,9 @@ if (!confirm(`确认向集群 ${cluster} 的集群内所有机器创建 MySQL �
     function detectCurrentArchitecture() {
       const nodes = clusterTopology.value.nodes || []
       const edges = clusterTopology.value.edges || []
-      if (clusterTopology.value.architecture === 'mgr_router' || nodes.some(node => String(node.group_role || '').toUpperCase() === 'PRIMARY')) {
-        const primaryMachineIDs = nodes.filter(node => String(node.group_role || '').toUpperCase() === 'PRIMARY').map(node => node.machine_id)
+      const onlineMGRPrimary = node => String(node.group_role || '').toUpperCase() === 'PRIMARY' && String(node.group_state || '').toUpperCase() === 'ONLINE'
+      if (clusterTopology.value.architecture === 'mgr_router' || nodes.some(onlineMGRPrimary)) {
+        const primaryMachineIDs = nodes.filter(onlineMGRPrimary).map(node => node.machine_id)
         architectureCurrent.value = { type: 'mgr_router', label: architectureTypeLabel('mgr_router'), primary_machine_ids: primaryMachineIDs, nodes, edges }
         return architectureCurrent.value
       }
@@ -3475,13 +3498,53 @@ if (!confirm(`确认向集群 ${cluster} 的集群内所有机器创建 MySQL �
       await Promise.all([refreshClusterTopology(), loadClusterMachines(1), loadVIPConfigs()])
       const current = detectCurrentArchitecture()
       architectureForm.value = architectureDraftFromTopology(current)
-      await Promise.all([refreshVIPManagement(true), loadMGRManagement(false)])
+      await refreshVIPManagement(true)
+      if (topologyHasLiveMGR.value) void loadMGRManagement(false)
+    }
+    function mgrSnapshotFromTopology() {
+      const nodes = clusterTopology.value?.nodes || []
+      const members = nodes.map(node => {
+        const rawRole = String(node.group_role || node.role || '').toUpperCase()
+        const role = rawRole.includes('PRIMARY') ? 'PRIMARY' : rawRole.includes('SECONDARY') ? 'SECONDARY' : 'UNKNOWN'
+        const state = String(node.group_state || node.heartbeat || node.status || '').toUpperCase() === 'ONLINE' || rawRole.startsWith('MGR_') ? 'ONLINE' : 'UNKNOWN'
+        return {
+          machine_id: node.machine_id, machine_name: node.name || node.machine_name || node.ip,
+          ip: node.ip, port: Number(node.port || 3306), server_id: Number(node.server_id || 0),
+          group_name: node.group_name || '', state, role, read_only: role !== 'PRIMARY', super_read_only: role === 'SECONDARY',
+          apply_queue: 0, remote_apply_queue: 0, conflicts: 0, reachable: state === 'ONLINE'
+        }
+      })
+      const online = members.filter(member => member.state === 'ONLINE')
+      const primary = online.find(member => member.role === 'PRIMARY')
+      const groupName = members.find(member => member.group_name)?.group_name || ''
+      return {
+        cluster: selectedClusterDetail.value?.Name || selectedClusterDetail.value?.name,
+        architecture: 'mgr_router', available: true, healthy: online.length === members.length && Boolean(primary),
+        quorum: online.length >= Math.floor(members.length / 2) + 1, member_count: members.length,
+        online_member_count: online.length, primary_machine_id: primary?.machine_id || '', group_name: groupName,
+        members, routers: {}, collected_at: clusterTopologyLastUpdated.value || new Date().toISOString(), topology_snapshot: true
+      }
     }
     async function openMGRManagement() {
       stopPerformanceAutoRefresh()
       stopClusterTopologyAutoRefresh()
+      if (mgrNavigationAvailable.value) {
+        if (!mgrManagement.value && topologyHasLiveMGR.value) mgrManagement.value = mgrSnapshotFromTopology()
+        data.value.clusterSection = 'mgr'
+        void refreshClusterTopology({ silent: true })
+        void loadMGRManagement(true)
+        return
+      }
+      await refreshClusterTopology({ silent: true })
+      if (!mgrNavigationAvailable.value) await loadMGRManagement(false)
+      if (!mgrNavigationAvailable.value) {
+        data.value.clusterSection = 'architecture'
+        error.value = '当前实时拓扑不是 MGR，请在架构调整中完成切换后再进入 MGR 管理。'
+        return
+      }
       data.value.clusterSection = 'mgr'
-      await loadMGRManagement(true)
+      if (!mgrManagement.value && topologyHasLiveMGR.value) mgrManagement.value = mgrSnapshotFromTopology()
+      void loadMGRManagement(true)
     }
     async function loadMGRManagement(showError = true) {
       const cluster = selectedClusterDetail.value?.Name || selectedClusterDetail.value?.name
@@ -3490,7 +3553,11 @@ if (!confirm(`确认向集群 ${cluster} 的集群内所有机器创建 MySQL �
       if (showError) error.value = ''
       try {
         mgrManagement.value = await api(`/clusters/${encodeURIComponent(cluster)}/mgr`)
-        if (mgrManagement.value?.available) {
+        if (mgrManagement.value?.available && mgrManagement.value?.architecture === 'mgr_router') {
+          const completedRun = architectureRun.value?.status === 'success' && !architectureRun.value?.request?.vip_only
+          if (!completedRun || architectureRun.value?.request?.architecture === 'mgr_router') {
+            clusterTopology.value = { ...clusterTopology.value, architecture: 'mgr_router' }
+          }
           architectureCurrent.value = {
             ...architectureCurrent.value,
             type: 'mgr_router',
@@ -3750,6 +3817,7 @@ if (!confirm(`确认向集群 ${cluster} 的集群内所有机器创建 MySQL �
       try {
         const payload = architectureAdjustmentPayload()
         architectureRun.value = await api(`/clusters/${encodeURIComponent(cluster)}/architecture/start`, { method: 'POST', body: JSON.stringify(payload) })
+        architecturePollFailures = 0
         architecturePlanDialog.value = true
         notice.value = `${payload.vip_only ? `VIP ${payload.initialize_vip ? '绑定' : '漂移'}安全流程` : '安全架构调整'}已启动：${architectureRun.value.run_id}`
         syncArchitectureRunTaskSummary()
@@ -3760,8 +3828,20 @@ if (!confirm(`确认向集群 ${cluster} 的集群内所有机器创建 MySQL �
       clearTimeout(architecturePollTimer)
       const cluster = selectedClusterDetail.value?.Name || selectedClusterDetail.value?.name
       const runID = architectureRun.value?.run_id
-      if (!cluster || !runID) return
-      try { architectureRun.value = await api(`/clusters/${encodeURIComponent(cluster)}/architecture/${encodeURIComponent(runID)}`) } catch (err) { error.value = err.message; return }
+      if (!cluster || !runID || architecturePollInFlight) return
+      architecturePollInFlight = true
+      try {
+        architectureRun.value = await api(`/clusters/${encodeURIComponent(cluster)}/architecture/${encodeURIComponent(runID)}`)
+        architecturePollFailures = 0
+      } catch (err) {
+        architecturePollFailures++
+        const retrySeconds = Math.min(10, 2 + architecturePollFailures * 2)
+        architectureRoleChangeFeedback.value = `页面连接暂时中断，后台架构任务仍在继续；将在 ${retrySeconds} 秒后自动恢复进度。`
+        architecturePollTimer = setTimeout(pollArchitectureRun, retrySeconds * 1000)
+        architecturePollInFlight = false
+        return
+      }
+      architecturePollInFlight = false
       syncArchitectureRunTaskSummary()
       if (!['success','failed'].includes(architectureRun.value.status)) architecturePollTimer = setTimeout(pollArchitectureRun, 2000)
       else {
@@ -3784,6 +3864,20 @@ if (!confirm(`确认向集群 ${cluster} 的集群内所有机器创建 MySQL �
         }
         await refresh()
       }
+    }
+
+    async function reconcileArchitectureUI() {
+      if (document.visibilityState === 'hidden' || active.value !== 'clusters' || !selectedClusterDetail.value) return
+      if (architectureRun.value?.run_id && !['success', 'failed'].includes(architectureRun.value.status)) {
+        pollArchitectureRun()
+        return
+      }
+      if (!['architecture', 'mgr'].includes(data.value.clusterSection)) return
+      await refreshClusterTopology({ silent: true })
+      if (!mgrNavigationAvailable.value && data.value.clusterSection === 'architecture') await loadMGRManagement(false)
+    }
+    function handleArchitectureVisibility() {
+      if (document.visibilityState === 'visible') reconcileArchitectureUI()
     }
     async function confirmArchitectureForce() {
       const cluster = selectedClusterDetail.value?.Name || selectedClusterDetail.value?.name
@@ -4206,7 +4300,7 @@ if (!confirm(`确认向集群 ${cluster} 的集群内所有机器创建 MySQL �
     architectureBindings.automationInspectionChecks = automationInspectionChecks
     architectureBindings.automationUpgradePlans = automationUpgradePlans
     architectureBindings.taskFlowStepCount = taskFlowStepCount
-    Object.assign(architectureBindings, { architecturePlanDialog, architectureAdjustmentTitle, architectureAdjustmentDetail, architectureOperationVIPOnly, architectureVIPOperationAction, architectureTopologyHasChanges, architectureVIPActionLabel, architectureRepairingPackages, architectureNeedsMGRPackages, repairArchitectureMGRPackages, vipEditingAddress, vipEditingConfig, vipEditorState, vipEditorIsNew, selectVIPForEdit, beginNewVIP, refreshVIPEditorInterfaces, architectureVIPTargetChanged, vipDraggingAddress, vipMagnetTargetID, vipSnapTargetID, vipDriftDialog, vipCardTargetMachineID, selectArchitectureVIPCard, startArchitectureVIPDrag, finishArchitectureVIPDrag, setVIPMagnetTarget, clearVIPMagnetTarget, dropArchitectureCanvasItem, cancelVIPDrift, confirmVIPDrift, mgrManagement, mgrManagementLoading, mgrActionBusy, mgrActionDialog, mgrActionConfirmation, openMGRManagement, loadMGRManagement, mgrRouterItems, openMGRAction, submitMGRAction, mgrStateClass })
+    Object.assign(architectureBindings, { architecturePlanDialog, architectureAdjustmentTitle, architectureAdjustmentDetail, architectureOperationVIPOnly, architectureVIPOperationAction, architectureTopologyHasChanges, architectureVIPActionLabel, architectureRepairingPackages, architectureNeedsMGRPackages, repairArchitectureMGRPackages, vipEditingAddress, vipEditingConfig, vipEditorState, vipEditorIsNew, selectVIPForEdit, beginNewVIP, refreshVIPEditorInterfaces, architectureVIPTargetChanged, vipDraggingAddress, vipMagnetTargetID, vipSnapTargetID, vipDriftDialog, vipCardTargetMachineID, selectArchitectureVIPCard, startArchitectureVIPDrag, finishArchitectureVIPDrag, setVIPMagnetTarget, clearVIPMagnetTarget, dropArchitectureCanvasItem, cancelVIPDrift, confirmVIPDrift, mgrManagement, mgrManagementLoading, mgrNavigationAvailable, mgrActionBusy, mgrActionDialog, mgrActionConfirmation, openMGRManagement, loadMGRManagement, mgrRouterItems, openMGRAction, submitMGRAction, mgrStateClass })
     architectureBindings.taskFlowSuccessCount = taskFlowSuccessCount
     architectureBindings.selectedTaskFlowDetail = selectedTaskFlowDetail
     architectureBindings.selectedTaskFlowView = selectedTaskFlowView
@@ -4248,8 +4342,8 @@ if (!confirm(`确认向集群 ${cluster} 的集群内所有机器创建 MySQL �
     }
     async function logout() { try { await api('/auth/logout', { method: 'POST', body: '{}' }) } finally { window.location.reload() } }
     function handleUnauthorized() { authUser.value = null; loginError.value = '登录已失效，请重新登录'; authReady.value = true }
-    onMounted(() => { window.addEventListener('gmha:unauthorized', handleUnauthorized); restoreSession() })
-    onUnmounted(() => { window.removeEventListener('gmha:unauthorized', handleUnauthorized); stopTaskPolling(); stopAgentResourceRefresh(); clearTimeout(taskFilterTimer); clearTimeout(architecturePollTimer); clearInterval(managerStatusTimer); clearInterval(agentActionElapsedTimer); clearInterval(upgradeTimer); stopClusterTopologyAutoRefresh(); stopPerformanceAutoRefresh() })
+    onMounted(() => { window.addEventListener('gmha:unauthorized', handleUnauthorized); window.addEventListener('online', reconcileArchitectureUI); document.addEventListener('visibilitychange', handleArchitectureVisibility); restoreSession() })
+    onUnmounted(() => { window.removeEventListener('gmha:unauthorized', handleUnauthorized); window.removeEventListener('online', reconcileArchitectureUI); document.removeEventListener('visibilitychange', handleArchitectureVisibility); stopTaskPolling(); stopAgentResourceRefresh(); clearTimeout(taskFilterTimer); clearTimeout(architecturePollTimer); clearInterval(managerStatusTimer); clearInterval(agentActionElapsedTimer); clearInterval(upgradeTimer); stopClusterTopologyAutoRefresh(); stopPerformanceAutoRefresh() })
     return { authReady, authUser, loginForm, loginBusy, loginError, login, logout, hasPermission, active, current, navGroups, visibleNavGroups, expandedNav, toggleNavGroup, chooseNavigation, data, managerForm, metrics, overviewStats, overviewHealth, overviewComponents, recentTasks, filteredTasks, taskFilter, taskKeyword, selectedTaskDetail, selectedTaskStep, selectedTaskEvents, taskObject, taskSteps, taskEvents, taskTitle, taskTypeLabel, taskStatusLabel, stepStatusLabel, selectedTaskControls, rollbackClassLabel, controlSelectedTask, taskControlSubmitting, elapsed, safeLog, chooseTaskStep, selectCurrentTaskStep, openTaskDetail, refreshSelectedTaskDetail, closeTaskDetail, loading, error, notice, showOnboard, showOnboardFlow, showMachineDetail, showCredential, showAssign, showQuickClusterAssign, showAgentDetail, agentActionDialog, agentActionInput, agentActionSubmitting, agentActionError, agentActionElapsed, closeAgentAction, submitAgentAction, showMySQLInstall, showMySQLTask, mysqlView, packageItems, packageSettings, packageForm, packageKeyword, packageFetching, packageCatalogInstalled, fetchCatalogPackage, verifyPackage, packageChecksum, showClusterEditor, showClusterCleanup, showClusterMembers, clusterCandidatesLoading, clusterCandidatesError, mysqlTaskDetail, clusterCleanupResult, selectedClusterForMembers, clusterCandidates, clusterCandidatePage, clusterCandidateTotal, selectedClusterMachineIDs, clusterMemberAssignResult, clusterPage, clusterTotal, clusterKeyword, clusterPageItems, clusterListStats, selectedClusterDetail, clusterTopology, clusterTopologyError, clusterMachineItems, clusterMachinePage, clusterMachineTotal, selectedClusterOperationMachineIDs, clusterMySQLDialog, clusterMySQLForm, clusterMySQLConfirm, automationSelectedClusters, automationForm, automationRunning, automationResults, automationUpgradeVersions, automationParameterKeyword, automationParameterCategory, automationParameterCategories, automationFilteredParameters, automationSelectedParameter, automationParameterChanges, automationStagedDynamicCount, automationStagedRestartCount, automationParameterTargets, automationParameterVersions, automationParameterChanged, stageAutomationParameter, removeAutomationParameter, toggleAllAutomationClusters, submitAutomationTask, mysqlPrivilegeOptions, mysqlInstallPrivilegeOptions, mysqlInstallIs57, mysqlInstallXtraBackupSeries, mysqlInstallXtraBackupPreview, backupPolicies, backupRuns, showBackupPolicyEditor, backupPolicyForm, architectureForm, architectureCurrent, architectureHasChanges, architecturePlan, architectureRun, vipConfigs, vipStates, vipBusy, vipForm, vipTargetMachine, vipInterfaceOptions, vipStateFor, vipMachineName, vipStatusLabel, openVIPManagement, architectureSubmitting, applyArchitectureRoles, architectureNodeChanged, architectureNodeHasChanges, architectureNodeName, topologyEdgeForNode, openArchitectureAdjustment, previewArchitectureAdjustment, submitArchitectureAdjustment, confirmArchitectureForce, loadVIPConfigs, saveVIPConfig, deleteVIPConfig, openClusterBackup, loadClusterBackups, openBackupPolicyEditor, saveBackupPolicy, deleteBackupPolicy, runBackupPolicy, restoreBackup, backupScheduleLabel, backupMachines, backupInstancesForMachine, backupMachineChanged, backupMachineRole, weekdayName, toggleAllBackupWeekdays, backupTypeLabel, form, credentialForm, mysqlInstallForm, isCustomMySQLAccount, addCustomMySQLAccount, removeCustomMySQLAccount, clusterForm, selectedCredential, assignedMachineIDs, onboardingFlow, onboardingResult, onboardingDetected, canSkipPrecheck, machinePage, credentialPage, machineTotal, credentialTotal, pageSize, selectedMachine, selectedAgent, selectedMachineErrorExpanded, selectedMachineCluster, machineStaticInfo, machineDynamicInfo, machineInfoError, refresh, refreshAgentResources, agentResourceRefreshing, agentResourceUpdatedAt, agentResourceRefreshSeconds, onboard, cleanupTarget, recover, showAgent, retryAgent, upgradeAgent, uninstallAgent, repairMySQLAgentConfig, saveManagerConfig, managerAction, showMachine, showMySQLMachine, saveMachine, deleteMachine, assignMachineCluster, openQuickClusterAssign, quickAssignMachineCluster, collectMachineStaticInfo, loadMachineDynamicInfo, changePage, createCredential, createMySQLInstall, openMySQLInstall, saveMySQLAccountPresets, refreshMySQLTask, uninstallMySQL, forgetMySQL, openCreateCluster, openEditCluster, openClusterDetail, closeClusterDetail, refreshClusterTopology, installClusterMySQL, uninstallClusterMySQL, mysqlInstancesOnMachine, clusterMachineInterfaces, mysqlTopologyNode, mysqlRoleLabel, openClusterMySQLBatch, submitClusterMySQLBatch, removeMachineFromCluster, changeClusterMachinePage, showClusterCapability, saveCluster, deleteCluster, cleanupCluster, clusterMachines, clusterMachineCount, clusterAgentCount, clusterAgentHealth, loadClusterPage, searchClusterPage, changeClusterPage, openClusterMembers, changeClusterCandidatePage, assignClusterMembers, deleteCredential, assignCredential, chooseCredential, applyCredential, loadKeyFile, loadPackages, choosePackageFile, uploadPackage, deletePackage, savePackageStorage, packageDownloadURL, packageCategoryLabel, packageSize, flowReport, toggleFlowError, isFlowErrorExpanded, machineLastError, machineStatus, machineCluster, machineAgentInstallDir, agentStatus, recoveryStateLabel, agentResource, agentCPU, agentMemory, agentResourceAverage, agentResourceTotal, agentResourceCoverage, staticRows, dynamicMetrics, metricValue, errorSummary, ...architectureBindings, ...performanceBindings, state, label, date }
   },
   template: `
@@ -4519,7 +4613,7 @@ if (!confirm(`确认向集群 ${cluster} 的集群内所有机器创建 MySQL �
           <button :class="{active: data.clusterSection==='sql-diagnostics'}" type="button" @click="stopPerformanceAutoRefresh(); stopClusterTopologyAutoRefresh(); data.clusterSection='sql-diagnostics'">SQL 诊断</button>
           <button :class="{active: data.clusterSection==='machines'}" type="button" @click="stopPerformanceAutoRefresh(); stopClusterTopologyAutoRefresh(); data.clusterSection='machines'; refreshClusterTopology({includeMachines:true})">机器管理</button>
           <button :class="{active: data.clusterSection==='instances'}" type="button" @click="stopPerformanceAutoRefresh(); stopClusterTopologyAutoRefresh(); data.clusterSection='instances'; refreshClusterTopology({includeMachines:true})">实例管理</button>
-          <button :class="{active: data.clusterSection==='mgr'}" type="button" @click="openMGRManagement">MGR 管理</button>
+          <button v-if="mgrNavigationAvailable" :class="{active: data.clusterSection==='mgr'}" type="button" @click="openMGRManagement">MGR 管理</button>
           <button :class="{active: data.clusterSection==='architecture'}" type="button" @click="openArchitectureAdjustment">架构调整</button>
           <button :class="{active: data.clusterSection==='backup'}" type="button" @click="openClusterBackup">备份恢复</button>
           <div class="context-danger"><button type="button" @click="cleanupCluster(selectedClusterDetail)">一键清理</button><button type="button" @click="deleteCluster(selectedClusterDetail)">删除集群</button></div>
@@ -4594,19 +4688,18 @@ if (!confirm(`确认向集群 ${cluster} 的集群内所有机器创建 MySQL �
                 <article><small>当前 PRIMARY</small><b>{{ mgrManagement.members.find(item=>item.machine_id===mgrManagement.primary_machine_id)?.machine_name || '无 ONLINE PRIMARY' }}</b><span>{{ mgrManagement.primary_machine_id || '等待恢复' }}</span></article>
                 <article><small>Group UUID</small><b class="mgr-group-id">{{ mgrManagement.group_name }}</b><span>采集于 {{ date(mgrManagement.collected_at) }}</span></article>
               </section>
-              <p v-if="mgrManagement.admin_api_error" class="mgr-admin-warning"><b>AdminAPI / Router 元数据暂不可读</b><span>{{ errorSummary(mgrManagement.admin_api_error,220) }}</span></p>
               <section class="mgr-members-panel">
                 <header><div><b>MGR 成员</b><small>状态、角色与认证应用队列均直接来自各 MySQL 实例。</small></div><span>{{ mgrManagement.online_member_count }} ONLINE</span></header>
                 <div class="mgr-member-table-wrap"><table><thead><tr><th>实例</th><th>状态 / 角色</th><th>只读保护</th><th>应用队列</th><th>冲突</th><th>管理操作</th></tr></thead><tbody>
                   <tr v-for="member in mgrManagement.members" :key="member.machine_id+':'+member.port">
                     <td><b>{{ member.machine_name }}</b><small>{{ member.ip }}:{{ member.port }} · server_id {{ member.server_id || '—' }}</small></td>
-                    <td><span :class="['status',mgrStateClass(member.state)]">{{ member.state }}</span><em :class="{primary:member.role==='PRIMARY'}">{{ member.role }}</em><small v-if="member.error" class="mgr-member-error">{{ errorSummary(member.error,120) }}</small></td>
+                    <td><span :class="['status',mgrStateClass(member.state)]">{{ member.state }}</span><em :class="{'mgr-primary-role':member.role==='PRIMARY'}">{{ member.role }}</em><small v-if="member.error" class="mgr-member-error">{{ errorSummary(member.error,120) }}</small></td>
                     <td><b>{{ member.super_read_only ? 'SUPER READ ONLY' : member.read_only ? 'READ ONLY' : '可写' }}</b><small>{{ member.role==='PRIMARY' ? 'PRIMARY 写入口' : 'SECONDARY 保护' }}</small></td>
                     <td><b>{{ Number(member.apply_queue||0) + Number(member.remote_apply_queue||0) }}</b><small>本地 {{ member.apply_queue||0 }} · 远端 {{ member.remote_apply_queue||0 }}</small></td>
                     <td><b>{{ member.conflicts || 0 }}</b><small>检测到的事务冲突</small></td>
                     <td><div class="mgr-row-actions">
-                      <button v-if="member.state==='ONLINE' && member.role==='SECONDARY'" type="button" :disabled="!!mgrActionBusy || !mgrManagement.quorum" @click="openMGRAction('set_primary',member.machine_id)">设为 PRIMARY</button>
-                      <button v-if="member.reachable && member.state!=='ONLINE'" type="button" :disabled="!!mgrActionBusy || !mgrManagement.quorum" @click="openMGRAction('rejoin_member',member.machine_id)">重新加入</button>
+                      <button v-if="member.state==='ONLINE' && member.role==='SECONDARY'" type="button" :disabled="!!mgrActionBusy || !mgrManagement.quorum || !!mgrManagement.admin_api_error" @click="openMGRAction('set_primary',member.machine_id)">设为 PRIMARY</button>
+                      <button v-if="member.reachable && member.state!=='ONLINE'" type="button" :disabled="!!mgrActionBusy || !mgrManagement.quorum || !!mgrManagement.admin_api_error" @click="openMGRAction('rejoin_member',member.machine_id)">重新加入</button>
                       <button v-if="member.reachable && mgrManagement.online_member_count===0" type="button" class="danger-link" :disabled="!!mgrActionBusy || mgrManagement.members.some(item=>!item.reachable)" @click="openMGRAction('reboot_complete_outage',member.machine_id)">以此成员恢复</button>
                       <small v-if="member.role==='PRIMARY' && member.state==='ONLINE'">当前唯一 PRIMARY</small>
                     </div></td>
@@ -4616,8 +4709,8 @@ if (!confirm(`确认向集群 ${cluster} 的集群内所有机器创建 MySQL �
               <div class="mgr-lower-grid">
                 <section class="mgr-maintenance-panel">
                   <header><div><b>MGR 专属维护</b><small>每个操作均取得集群互斥锁并要求精确确认。</small></div></header>
-                  <article><span>↻</span><div><b>重扫集群元数据</b><small>同步实际 Group Replication 成员与 AdminAPI 元数据。</small></div><button type="button" :disabled="!!mgrActionBusy || !mgrManagement.quorum" @click="openMGRAction('rescan_metadata')">重扫</button></article>
-                  <article><span>⌁</span><div><b>轮换内部恢复账户</b><small>更新 AdminAPI 管理的 distributed recovery 凭证。</small></div><button type="button" :disabled="!!mgrActionBusy || !mgrManagement.healthy" @click="openMGRAction('rotate_recovery_passwords')">轮换</button></article>
+                  <article><span>↻</span><div><b>重扫集群元数据</b><small>同步实际 Group Replication 成员与 AdminAPI 元数据。</small></div><button type="button" :disabled="!!mgrActionBusy || !mgrManagement.quorum || !!mgrManagement.admin_api_error" @click="openMGRAction('rescan_metadata')">重扫</button></article>
+                  <article><span>⌁</span><div><b>轮换内部恢复账户</b><small>更新 AdminAPI 管理的 distributed recovery 凭证。</small></div><button type="button" :disabled="!!mgrActionBusy || !mgrManagement.healthy || !!mgrManagement.admin_api_error" @click="openMGRAction('rotate_recovery_passwords')">轮换</button></article>
                   <p><b>全组停机恢复</b><span>当全部成员均非 ONLINE 时，请在上方选择 GTID 最合适的可达成员。系统仍会让 AdminAPI 做完整 GTID 校验，不提供强制跳过。</span></p>
                 </section>
                 <section class="mgr-router-panel">
@@ -4625,7 +4718,7 @@ if (!confirm(`确认向集群 ${cluster} 的集群内所有机器创建 MySQL �
                   <article v-for="router in mgrRouterItems()" :key="router.id || router.hostname || router.address">
                     <span>R</span><div><b>{{ router.hostname || router.address || router.id || 'MySQL Router' }}</b><small>{{ router.version || '版本未知' }} · {{ router.lastCheckIn || router.last_check_in || '等待 check-in' }}</small></div><em>{{ router.roPort || router.ro_port || 'RO' }} / {{ router.rwPort || router.rw_port || 'RW' }}</em>
                   </article>
-                  <div v-if="!mgrRouterItems().length" class="mgr-router-empty">尚未从 AdminAPI 读取到 Router 注册信息。</div>
+                  <div v-if="!mgrRouterItems().length" class="mgr-router-empty"><b>{{ mgrManagement.admin_api_error ? 'Router 管理组件尚未同步' : '尚未注册 MySQL Router' }}</b><span>{{ mgrManagement.admin_api_error ? 'MGR 成员健康状态不受影响；完成管理组件修复后会自动显示 Router。' : '部署并注册 Router 后，业务入口会自动跟随 PRIMARY。' }}</span><details v-if="mgrManagement.admin_api_error"><summary>查看诊断信息</summary><p>{{ errorSummary(mgrManagement.admin_api_error,220) }}</p></details></div>
                 </section>
               </div>
             </template>

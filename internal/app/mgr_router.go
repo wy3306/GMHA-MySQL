@@ -144,6 +144,13 @@ func (s *HAService) executeMGRRouterArchitecture(
 			instances[machineID] = instance
 		}
 	}
+	if !existingGroup {
+		if err := s.runArchitectureStep(ctx, runs, run, "cleanup_stale_router", func() ([]string, error) {
+			return s.cleanupMGRRouters(ctx, run.ClusterID, req, machines)
+		}); err != nil {
+			return err
+		}
+	}
 	if err := s.runArchitectureStep(ctx, runs, run, "preflight", func() ([]string, error) {
 		return s.preflightMGRRouter(ctx, req, machines, instances)
 	}); err != nil {
@@ -163,6 +170,11 @@ func (s *HAService) executeMGRRouterArchitecture(
 			return s.runOnArchitectureNodes(ctx, req.Nodes, machines, func(node hadomain.ArchitectureNodeRequest, _ machinedomain.Machine) string {
 				return killBusinessSessionsCommand(req, node.MachineID, node.Port)
 			})
+		}); err != nil {
+			return err
+		}
+		if err := s.runArchitectureStep(ctx, runs, run, "stop_stale_group", func() ([]string, error) {
+			return s.stopStaleMGRGroup(ctx, req, machines)
 		}); err != nil {
 			return err
 		}
@@ -216,6 +228,152 @@ func (s *HAService) executeMGRRouterArchitecture(
 		return err
 	}
 	return nil
+}
+
+func (s *HAService) executeMGRToAsyncArchitecture(
+	ctx context.Context,
+	runs architectureRunRepository,
+	run *hadomain.ArchitectureRun,
+	req hadomain.ArchitectureAdjustmentRequest,
+	machines map[string]machinedomain.Machine,
+) error {
+	businessFrozen := false
+	defer func() {
+		if businessFrozen {
+			_, _ = s.resumeArchitectureBusinessConnections(context.Background(), req, machines)
+		}
+	}()
+	if err := s.runArchitectureStep(ctx, runs, run, "freeze_business_access", func() ([]string, error) {
+		return s.runOnArchitectureNodes(ctx, req.Nodes, machines, func(node hadomain.ArchitectureNodeRequest, _ machinedomain.Machine) string {
+			return mysqlArchitectureCommand(architectureRootPassword(req, node.MachineID), node.Port,
+				"SET GLOBAL offline_mode=ON; SET GLOBAL read_only=ON; SET GLOBAL super_read_only=ON; SELECT IF(@@offline_mode=1 AND @@read_only=1 AND @@super_read_only=1,'MGR_FROZEN','MGR_OPEN');") + " | grep -Fxq MGR_FROZEN"
+		})
+	}); err != nil {
+		return err
+	}
+	businessFrozen = true
+	if err := s.runArchitectureStep(ctx, runs, run, "drain_business_sessions", func() ([]string, error) {
+		return s.runOnArchitectureNodes(ctx, req.Nodes, machines, func(node hadomain.ArchitectureNodeRequest, _ machinedomain.Machine) string {
+			return killBusinessSessionsCommand(req, node.MachineID, node.Port)
+		})
+	}); err != nil {
+		return err
+	}
+	if err := s.runArchitectureStep(ctx, runs, run, "verify_group", func() ([]string, error) {
+		ids, err := s.switchMGRPrimary(ctx, req, machines)
+		if err != nil {
+			return ids, err
+		}
+		verified, err := s.verifyMGRGroup(ctx, req, machines)
+		return append(ids, verified...), err
+	}); err != nil {
+		return err
+	}
+	if err := s.runArchitectureStep(ctx, runs, run, "teardown_mgr", func() ([]string, error) {
+		return s.teardownMGRForAsync(ctx, run.ClusterID, req, machines)
+	}); err != nil {
+		return err
+	}
+	if err := s.runArchitectureStep(ctx, runs, run, "promote_new_master", func() ([]string, error) {
+		primary, ok := architectureNode(req.Nodes, req.PreferredNewMasterMachineID)
+		if !ok {
+			return nil, errors.New("target asynchronous primary not found")
+		}
+		client := mysqlArchitectureClient(architectureRootPassword(req, primary.MachineID), primary.Port)
+		command := replicationStopResetShell(client) + mysqlRolePersistenceCommand(client, false)
+		return s.runOneArchitectureCommand(ctx, machines[primary.MachineID], command)
+	}); err != nil {
+		return err
+	}
+	if err := s.runArchitectureStep(ctx, runs, run, "reconfigure_topology", func() ([]string, error) {
+		return s.configureArchitectureTopology(ctx, req, req.PreferredNewMasterMachineID, machines)
+	}); err != nil {
+		return err
+	}
+	if err := s.runArchitectureStep(ctx, runs, run, "verify_topology", func() ([]string, error) {
+		return s.runOnArchitectureNodes(ctx, req.Nodes, machines, func(node hadomain.ArchitectureNodeRequest, _ machinedomain.Machine) string {
+			return verifyArchitectureNodeCommand(req, node, req.PreferredNewMasterMachineID)
+		})
+	}); err != nil {
+		return err
+	}
+	if err := s.runArchitectureStep(ctx, runs, run, "pt_verify_replication", func() ([]string, error) {
+		return s.verifyArchitectureDataWithPT(ctx, req, req.PreferredNewMasterMachineID, machines)
+	}); err != nil {
+		return err
+	}
+	if err := s.runArchitectureStep(ctx, runs, run, "resume_business_connections", func() ([]string, error) {
+		return s.resumeArchitectureBusinessConnections(ctx, req, machines)
+	}); err != nil {
+		return err
+	}
+	businessFrozen = false
+	return nil
+}
+
+func (s *HAService) cleanupMGRRouters(ctx context.Context, clusterID string, req hadomain.ArchitectureAdjustmentRequest, machines map[string]machinedomain.Machine) ([]string, error) {
+	var ids []string
+	for _, node := range req.Nodes {
+		created, err := s.CleanupMGRRouterNode(ctx, clusterID, machines[node.MachineID])
+		ids = append(ids, created...)
+		if err != nil {
+			return ids, fmt.Errorf("cleanup managed MySQL Router on %s: %w", node.MachineID, err)
+		}
+	}
+	return ids, nil
+}
+
+func (s *HAService) stopStaleMGRGroup(ctx context.Context, req hadomain.ArchitectureAdjustmentRequest, machines map[string]machinedomain.Machine) ([]string, error) {
+	return s.runOnArchitectureNodes(ctx, req.Nodes, machines, func(node hadomain.ArchitectureNodeRequest, _ machinedomain.Machine) string {
+		client := mysqlArchitectureClient(architectureRootPassword(req, node.MachineID), node.Port)
+		return "(" + client + " --execute='STOP GROUP_REPLICATION' >/dev/null 2>&1 || true); " +
+			client + " --batch --skip-column-names --execute=\"SELECT COUNT(*) FROM performance_schema.replication_group_members WHERE MEMBER_ID=@@server_uuid\" | grep -Fxq 0"
+	})
+}
+
+func (s *HAService) teardownMGRForAsync(ctx context.Context, clusterID string, req hadomain.ArchitectureAdjustmentRequest, machines map[string]machinedomain.Machine) ([]string, error) {
+	ids, err := s.cleanupMGRRouters(ctx, clusterID, req, machines)
+	if err != nil {
+		return ids, err
+	}
+	instances, err := s.mgrInstances(ctx, req)
+	if err != nil {
+		return ids, err
+	}
+	for _, node := range req.Nodes {
+		command := mgrAsyncTeardownCommand(req, node, instances[node.MachineID])
+		created, runErr := s.runOneArchitectureCommand(ctx, machines[node.MachineID], command)
+		ids = append(ids, created...)
+		if runErr != nil {
+			return ids, fmt.Errorf("stop Group Replication on %s: %w", node.MachineID, runErr)
+		}
+	}
+	return ids, nil
+}
+
+func mgrAsyncTeardownCommand(req hadomain.ArchitectureAdjustmentRequest, node hadomain.ArchitectureNodeRequest, instance mysqlapp.Instance) string {
+	client := mysqlArchitectureClient(architectureRootPassword(req, node.MachineID), node.Port)
+	return fmt.Sprintf(`set -eu
+cnf=%s
+[ -n "$cnf" ] && [ -f "$cnf" ] || { echo "registered MySQL config is missing: $cnf" >&2; exit 72; }
+backup="${cnf}.gmha-mgr-exit.$(date +%%Y%%m%%d%%H%%M%%S).bak"
+cp -a "$cnf" "$backup"
+awk '
+  /^# gmha mgr managed$/ {managed=1}
+  managed && /^group_replication_start_on_boot=/ {$0="group_replication_start_on_boot=OFF"}
+  managed && /^[[:space:]]*$/ {managed=0}
+  {print}
+' "$cnf" > "${cnf}.tmp"
+mv "${cnf}.tmp" "$cnf"
+if ! grep -Fxq 'group_replication_start_on_boot=OFF' "$cnf"; then
+  printf '\n# gmha mgr managed\n[mysqld]\ngroup_replication_start_on_boot=OFF\n\n' >> "$cnf"
+fi
+(%s --execute='STOP GROUP_REPLICATION' >/dev/null 2>&1 || true)
+(%s --execute="RESET REPLICA ALL FOR CHANNEL 'group_replication_recovery'" >/dev/null 2>&1 || %s --execute="RESET SLAVE ALL FOR CHANNEL 'group_replication_recovery'" >/dev/null 2>&1 || true)
+
+grep -Fxq 'group_replication_start_on_boot=OFF' "$cnf"
+%s --batch --skip-column-names --execute="SELECT COUNT(*) FROM performance_schema.replication_group_members WHERE MEMBER_ID=@@server_uuid" | grep -Fxq 0`,
+		shellQuote(instance.MyCnfPath), client, client, client, client)
 }
 
 func (s *HAService) mgrInstances(ctx context.Context, req hadomain.ArchitectureAdjustmentRequest) (map[string]mysqlapp.Instance, error) {
@@ -282,8 +440,12 @@ func (s *HAService) preflightMGRRouter(
 		}
 		if req.CurrentArchitecture != hadomain.ArchitectureMGRRouter {
 			command += fmt.Sprintf(
-				" && command -v ss >/dev/null && { for port in %d %d %d %d %d; do ! ss -ltnH | awk '{print $4}' | grep -Eq \"(^|:)${port}$\" || { echo \"required MGR/Router port ${port} is already listening\" >&2; exit 78; }; done; }",
-				req.MGRPort, req.RouterPort, req.RouterPort+1, req.RouterPort+2, req.RouterPort+3,
+				" && command -v ss >/dev/null && { for port in %d %d %d %d; do ! ss -ltnH | awk '{print $4}' | grep -Eq \"(^|:)${port}$\" || { echo \"required Router port ${port} is already listening\" >&2; exit 78; }; done; }",
+				req.RouterPort, req.RouterPort+1, req.RouterPort+2, req.RouterPort+3,
+			)
+			command += fmt.Sprintf(
+				" && { if ss -ltnH | awk '{print $4}' | grep -Eq '(^|:)%d$'; then mgr_local=$(%s --batch --skip-column-names --execute='SELECT @@global.group_replication_local_address' 2>/dev/null || true); printf '%%s\\n' \"$mgr_local\" | grep -Eq '(^|:)%d$' || { echo 'required MGR port %d is occupied by an unmanaged process' >&2; exit 78; }; fi; }",
+				req.MGRPort, client, req.MGRPort, req.MGRPort,
 			)
 		}
 		command += " && printf 'MGR_PREFLIGHT|%s\\n' \"$probe\""
@@ -942,11 +1104,11 @@ func (s *HAService) deployMySQLShell(ctx context.Context, req hadomain.Architect
 	base := ResolveManagerHTTPAddrForTarget(s.managerHTTPAddr, machine.IP)
 	x86URL, armURL, x86SHA, armSHA := "", "", "", ""
 	if artifacts.X8664.Name != "" {
-		x86URL = strings.TrimRight(base, "/") + "/api/v1/packages/mysql-shell/" + url.PathEscape(artifacts.X8664.Name)
+		x86URL = strings.TrimRight(base, "/") + "/api/v1/software/packages/mysql-shell/" + url.PathEscape(artifacts.X8664.Name)
 		x86SHA = artifacts.X8664.SHA256
 	}
 	if artifacts.AArch64.Name != "" {
-		armURL = strings.TrimRight(base, "/") + "/api/v1/packages/mysql-shell/" + url.PathEscape(artifacts.AArch64.Name)
+		armURL = strings.TrimRight(base, "/") + "/api/v1/software/packages/mysql-shell/" + url.PathEscape(artifacts.AArch64.Name)
 		armSHA = artifacts.AArch64.SHA256
 	}
 	command := mysqlShellDeployCommand(x86URL, armURL, x86SHA, armSHA)
@@ -999,11 +1161,11 @@ func (s *HAService) deployMGRRouters(ctx context.Context, clusterID string, req 
 		base := ResolveManagerHTTPAddrForTarget(s.managerHTTPAddr, machines[node.MachineID].IP)
 		x86URL, armURL, x86SHA, armSHA := "", "", "", ""
 		if artifacts.X8664.Name != "" {
-			x86URL = strings.TrimRight(base, "/") + "/api/v1/packages/mysql-router/" + url.PathEscape(artifacts.X8664.Name)
+			x86URL = strings.TrimRight(base, "/") + "/api/v1/software/packages/mysql-router/" + url.PathEscape(artifacts.X8664.Name)
 			x86SHA = artifacts.X8664.SHA256
 		}
 		if artifacts.AArch64.Name != "" {
-			armURL = strings.TrimRight(base, "/") + "/api/v1/packages/mysql-router/" + url.PathEscape(artifacts.AArch64.Name)
+			armURL = strings.TrimRight(base, "/") + "/api/v1/software/packages/mysql-router/" + url.PathEscape(artifacts.AArch64.Name)
 			armSHA = artifacts.AArch64.SHA256
 		}
 		command := mysqlRouterDeployCommand(clusterID, req, node, machines[primary.MachineID], primary.Port, x86URL, armURL, x86SHA, armSHA)
@@ -1057,16 +1219,23 @@ if [ -n "$package_sha" ]; then printf '%%s  %%s\n' "$package_sha" "$archive" | s
 mkdir -p "$work/extract" /opt/gmha/mysql-router
 case "$package_url" in *.zip) command -v unzip >/dev/null && unzip -q "$archive" -d "$work/extract" ;; *) tar -xf "$archive" -C "$work/extract" ;; esac
 router_bin=$(find "$work/extract" -type f -path '*/bin/mysqlrouter' -perm -111 -print -quit)
-[ -n "$router_bin" ]
-root_dir=${router_bin%%/bin/mysqlrouter}
-target="/opt/gmha/mysql-router/$(basename "$root_dir")"
-rm -rf "$target"
-mv "$root_dir" "$target"
+[ -n "$router_bin" ] || { echo "mysqlrouter binary not found in package" >&2; exit 76; }
+root_dir=$(dirname "$(dirname "$router_bin")")
+[ -d "$root_dir" ] || { echo "invalid Router package root" >&2; exit 77; }
+release_name=$(basename "$root_dir")
+[ -n "$release_name" ] && [ "$release_name" != "." ] && [ "$release_name" != "/" ] || { echo "invalid Router release directory" >&2; exit 78; }
+target="/opt/gmha/mysql-router/$release_name"
+install_tmp="${target}.new.$$"
+rm -rf -- "$install_tmp"
+cp -a -- "$root_dir" "$install_tmp"
+rm -rf -- "$target"
+mv -- "$install_tmp" "$target"
 ln -sfn "$target" /opt/gmha/mysql-router/current
 id mysqlrouter >/dev/null 2>&1 || useradd --system --home-dir /var/lib/mysqlrouter --shell /sbin/nologin mysqlrouter
-install -d -o mysqlrouter -g mysqlrouter %s
 systemctl stop %s 2>/dev/null || true
-rm -f %s/mysqlrouter.conf %s/mysqlrouter.key %s/*.pem
+config_dir=%s
+rm -rf -- "$config_dir"
+install -d -o mysqlrouter -g mysqlrouter "$config_dir"
 printf '%%s\n' %s | /opt/gmha/mysql-router/current/bin/mysqlrouter --bootstrap %s --password-retries=1 --directory %s --name %s --user=mysqlrouter --conf-base-port=%d --force
 printf '%%s' %s > /etc/systemd/system/%s.service
 chown -R mysqlrouter:mysqlrouter %s
@@ -1077,9 +1246,8 @@ systemctl is-active --quiet %s`,
 		shellQuote(x86SHA),
 		shellQuote(armURL),
 		shellQuote(armSHA),
-		shellQuote(configDir),
 		shellQuote(unit),
-		shellQuote(configDir), shellQuote(configDir), shellQuote(configDir),
+		shellQuote(configDir),
 		shellQuote(req.ReplicationPassword),
 		shellQuote(url.User(req.ReplicationUser).String()+"@"+net.JoinHostPort(primary.IP, strconv.Itoa(primaryPort))),
 		shellQuote(configDir),

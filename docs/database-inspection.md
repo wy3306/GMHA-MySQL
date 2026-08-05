@@ -22,6 +22,7 @@
 | --- | --- | --- |
 | `/api/v1/tasks/cluster-automation` | POST | 创建单实例或多集群巡检任务 |
 | `/api/v1/tasks/database-inspection/results` | GET | 按 `task_ids` 查询结构化巡检结果 |
+| `/api/v1/tasks/database-inspection/history` | GET | 按集群查询已保留的巡检记录，可重新查看并导出 |
 | `/api/v1/tasks/database-inspection/report` | GET | 按 `task_ids` 导出 Word 报告 |
 | `/api/v1/tasks/database-inspection/data` | GET | 按 `task_ids` 导出 Excel 明细 |
 

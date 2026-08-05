@@ -40,6 +40,12 @@ func TestPlatformLoginAccountPermissionsAndLogout(t *testing.T) {
 	if got := serveAccountRequest(router, http.MethodGet, "/api/v1/machines", "", nil); got.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated API returned %d: %s", got.Code, got.Body.String())
 	}
+	if got := serveAccountRequest(router, http.MethodGet, "/api/v1/software/packages/mysql-shell/missing.tar.gz", "", nil); got.Code == http.StatusUnauthorized {
+		t.Fatalf("Agent package download was incorrectly protected by a browser session: %s", got.Body.String())
+	}
+	if got := serveAccountRequest(router, http.MethodDelete, "/api/v1/software/packages/mysql-shell/missing.tar.gz", "", nil); got.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("Agent package endpoint accepted a mutating method: %d %s", got.Code, got.Body.String())
+	}
 	if got := serveAccountRequest(router, http.MethodPost, "/api/v1/auth/login", `{"username":"admin","password":"wrong"}`, nil); got.Code != http.StatusUnauthorized {
 		t.Fatalf("invalid login returned %d: %s", got.Code, got.Body.String())
 	}

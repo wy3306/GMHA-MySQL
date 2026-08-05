@@ -301,6 +301,23 @@ func (s *HAService) executeArchitectureAdjustment(ctx context.Context, runs arch
 	}); err != nil {
 		return
 	}
+	if architectureTransitionKind(req) == "mgr_to_async" {
+		if err := s.executeMGRToAsyncArchitecture(ctx, runs, &run, req, machines); err != nil {
+			return
+		}
+		select {
+		case lockErr := <-lockErrors:
+			s.failArchitectureRun(context.Background(), runs, &run, "renew_lock", lockErr)
+			return
+		default:
+		}
+		if err := releaseLock(); err != nil {
+			s.failArchitectureRun(ctx, runs, &run, "release_lock", err)
+			return
+		}
+		s.succeedArchitectureRun(ctx, runs, &run)
+		return
+	}
 	if transition := architectureTransitionKind(req); transition != "" {
 		freezeNodes := make([]hadomain.ArchitectureNodeRequest, 0, len(req.Nodes))
 		for _, node := range req.Nodes {

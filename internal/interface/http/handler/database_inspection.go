@@ -63,6 +63,30 @@ type databaseInspectionResult struct {
 	Exported time.Time                  `json:"exported_at"`
 }
 
+type databaseInspectionHistoryRecord struct {
+	ID           string                     `json:"id"`
+	Level        string                     `json:"level"`
+	Status       string                     `json:"status"`
+	Progress     int                        `json:"progress"`
+	Ready        bool                       `json:"ready"`
+	Clusters     []string                   `json:"clusters"`
+	TaskIDs      []string                   `json:"task_ids"`
+	Targets      []databaseInspectionTarget `json:"targets"`
+	TargetCount  int                        `json:"target_count"`
+	AverageScore int                        `json:"average_score"`
+	Passed       int                        `json:"passed"`
+	Warnings     int                        `json:"warnings"`
+	Critical     int                        `json:"critical"`
+	Failed       int                        `json:"failed"`
+	CreatedAt    time.Time                  `json:"created_at"`
+	FinishedAt   time.Time                  `json:"finished_at,omitempty"`
+}
+
+type databaseInspectionHistoryResponse struct {
+	Items []databaseInspectionHistoryRecord `json:"items"`
+	Total int                               `json:"total"`
+}
+
 func databaseInspectionCommand(client string, deep bool) string {
 	level := "standard"
 	if deep {
@@ -109,6 +133,134 @@ func (h *TaskHandler) HandleDatabaseInspectionResults(w http.ResponseWriter, r *
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+// HandleDatabaseInspectionHistory rebuilds durable inspection records from
+// the persisted batch task and its inspection children. The task/event store
+// remains the single source of truth, so history survives browser refreshes
+// without duplicating potentially large inspection output.
+func (h *TaskHandler) HandleDatabaseInspectionHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit <= 0 {
+		limit = 30
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	cluster := strings.TrimSpace(r.URL.Query().Get("cluster"))
+	parents, err := h.service.ListTasks(r.Context(), 5000)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	response := databaseInspectionHistoryResponse{Items: []databaseInspectionHistoryRecord{}}
+	for _, parent := range parents {
+		if parent.Type != taskdomain.TypeBatchOperation || !isClusterAutomationParent(parent) {
+			continue
+		}
+		detail, detailErr := h.service.GetTaskDetail(r.Context(), parent.ID)
+		if detailErr != nil {
+			continue
+		}
+		taskIDs, level := inspectionChildTaskIDs(detail.Children)
+		if len(taskIDs) == 0 {
+			continue
+		}
+		result, resultErr := h.loadDatabaseInspection(r, taskIDs)
+		if resultErr != nil {
+			continue
+		}
+		record := inspectionHistoryRecord(detail.Task, taskIDs, level, result)
+		if cluster != "" && !containsFold(record.Clusters, cluster) {
+			continue
+		}
+		response.Total++
+		if len(response.Items) < limit {
+			response.Items = append(response.Items, record)
+		}
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func isClusterAutomationParent(task taskdomain.Task) bool {
+	var spec struct {
+		Operation string `json:"operation"`
+	}
+	return json.Unmarshal(task.SpecJSON, &spec) == nil && spec.Operation == "cluster_automation"
+}
+
+func inspectionChildTaskIDs(children []taskdomain.Task) ([]string, string) {
+	ids := make([]string, 0, len(children))
+	level := "standard"
+	for _, child := range children {
+		if child.Type != taskdomain.TypeExec {
+			continue
+		}
+		var spec taskdomain.ExecSpec
+		if json.Unmarshal(child.SpecJSON, &spec) != nil || (spec.Operation != "database_inspection" && spec.Operation != "database_deep_inspection") {
+			continue
+		}
+		ids = append(ids, child.ID)
+		if spec.Operation == "database_deep_inspection" {
+			level = "deep"
+		}
+	}
+	return ids, level
+}
+
+func inspectionHistoryRecord(parent taskdomain.Task, taskIDs []string, level string, result databaseInspectionResult) databaseInspectionHistoryRecord {
+	record := databaseInspectionHistoryRecord{
+		ID: parent.ID, Level: level, Status: string(parent.Status), Progress: parent.ProgressPercent,
+		Ready: result.Ready, TaskIDs: taskIDs, Targets: result.Targets, TargetCount: len(result.Targets),
+		Failed: result.Failed, CreatedAt: parent.CreatedAt, Clusters: []string{},
+	}
+	if parent.FinishedAt != nil {
+		record.FinishedAt = *parent.FinishedAt
+	}
+	clusters := make(map[string]bool)
+	var parentSpec struct {
+		Target string `json:"target"`
+	}
+	if json.Unmarshal(parent.SpecJSON, &parentSpec) == nil {
+		for _, name := range strings.Split(parentSpec.Target, ",") {
+			if name = strings.TrimSpace(name); name != "" && !clusters[name] {
+				clusters[name] = true
+				record.Clusters = append(record.Clusters, name)
+			}
+		}
+	}
+	totalScore, scored := 0, 0
+	for _, target := range result.Targets {
+		if name := strings.TrimSpace(target.Cluster); name != "" && !clusters[name] {
+			clusters[name] = true
+			record.Clusters = append(record.Clusters, name)
+		}
+		record.Passed += target.Passed
+		record.Warnings += target.Warnings
+		record.Critical += target.Critical
+		if target.Status == string(taskdomain.StatusSuccess) {
+			totalScore += target.Score
+			scored++
+		}
+	}
+	if scored > 0 {
+		record.AverageScore = totalScore / scored
+	}
+	sort.Strings(record.Clusters)
+	return record
+}
+
+func containsFold(items []string, expected string) bool {
+	for _, item := range items {
+		if strings.EqualFold(strings.TrimSpace(item), expected) {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *TaskHandler) HandleDatabaseInspectionReport(w http.ResponseWriter, r *http.Request) {

@@ -78,6 +78,7 @@ var clusterAPICatalog = []ClusterAPIEndpoint{
 	{ID: "clusters.automation.report", Group: "automation", Method: http.MethodGet, Path: "/api/v1/tasks/cluster-automation/report", Description: "导出自动化报告", InvocationMode: "read"},
 	{ID: "clusters.automation.artifact", Group: "automation", Method: http.MethodGet, Path: "/api/v1/tasks/cluster-automation/artifacts/{task_id}/{file_name}", Description: "下载自动化产物", InvocationMode: "read"},
 	{ID: "clusters.inspection.results", Group: "automation", Method: http.MethodGet, Path: "/api/v1/tasks/database-inspection/results", Description: "查询数据库巡检结果", InvocationMode: "read"},
+	{ID: "clusters.inspection.history", Group: "automation", Method: http.MethodGet, Path: "/api/v1/tasks/database-inspection/history", Description: "查询数据库巡检历史记录", InvocationMode: "read"},
 	{ID: "clusters.inspection.report", Group: "automation", Method: http.MethodGet, Path: "/api/v1/tasks/database-inspection/report", Description: "导出数据库巡检报告", InvocationMode: "read"},
 	{ID: "clusters.inspection.data", Group: "automation", Method: http.MethodGet, Path: "/api/v1/tasks/database-inspection/data", Description: "查询数据库巡检数据", InvocationMode: "read"},
 }

@@ -595,9 +595,11 @@ func mgrRouterPlanSteps(req hadomain.ArchitectureAdjustmentRequest) []hadomain.A
 	}
 	items := []hadomain.ArchitecturePlanStep{
 		{Code: "acquire_lock", Name: "获取集群架构锁", Description: "阻止并发拓扑、升级和业务入口变更"},
+		{Code: "cleanup_stale_router", Name: "清理旧 Router 运行态", Description: "幂等停止并移除该集群上一次 MGR 调整留下的 Router 服务与配置，释放 Router 端口", Destructive: true},
 		{Code: "preflight", Name: "MGR 实时预检", Description: "验证 MySQL 版本、GTID、server_uuid、InnoDB、主键、端口和管理权限"},
 		{Code: "freeze_business_access", Name: "冻结现有写入口", Description: "配置 Group Replication 前阻止新业务连接和分叉写入", Destructive: true},
 		{Code: "drain_business_sessions", Name: "排空业务会话", Description: "保留管理、监控和备份连接，清理存量业务连接", Destructive: true},
+		{Code: "stop_stale_group", Name: "停止旧复制组运行态", Description: "业务冻结后幂等停止上一次 MGR 调整可能残留的 Group Replication 运行态", Destructive: true},
 		{Code: "align_group_data", Name: "对齐数据与 GTID", Description: "新装空节点安全清理从节点 GTID；已有数据必须先追平并通过 PT 一致性校验", Destructive: true},
 		{Code: "configure_group_replication", Name: "修复实例身份并写入 MGR 配置", Description: "保留已有唯一 server_id；对默认值或重复值分配确定性的唯一编号，再配置组 UUID、种子、通信地址和故障安全参数并重启复检", Destructive: true},
 		{Code: "bootstrap_group", Name: "启动复制组", Description: "仅在首选主节点引导一次组，其余成员通过分布式恢复加入", Destructive: true},
@@ -619,6 +621,8 @@ func mgrRouterPlanSteps(req hadomain.ArchitectureAdjustmentRequest) []hadomain.A
 func architectureTransitionKind(req hadomain.ArchitectureAdjustmentRequest) string {
 	current, target := strings.TrimSpace(req.CurrentArchitecture), strings.TrimSpace(req.Architecture)
 	switch {
+	case current == hadomain.ArchitectureMGRRouter && target != hadomain.ArchitectureMGRRouter && target != hadomain.ArchitectureStandalone:
+		return "mgr_to_async"
 	case current == hadomain.ArchitectureDualMaster && target == hadomain.ArchitectureMasterSlave:
 		return "dual_to_master_slave"
 	case current == hadomain.ArchitectureMasterSlave && target == hadomain.ArchitectureDualMaster:
@@ -632,6 +636,27 @@ func architectureConversionPlanSteps(req hadomain.ArchitectureAdjustmentRequest)
 	kind := architectureTransitionKind(req)
 	if kind == "" {
 		return nil
+	}
+	if kind == "mgr_to_async" {
+		items := []hadomain.ArchitecturePlanStep{
+			{Code: "acquire_lock", Name: "获取集群切换锁", Description: "阻止并发架构调整、MGR 维护和业务入口变更"},
+			{Code: "preflight", Name: "实时预检", Description: "确认 Agent、MySQL、GTID 与管理通道可用"},
+			{Code: "freeze_business_access", Name: "冻结 MGR 业务入口", Description: "在全部成员启用 offline_mode 和只读保护，阻止转换期间产生新事务", Destructive: true},
+			{Code: "drain_business_sessions", Name: "排空业务会话", Description: "保留管理、监控与复制连接，清理其余存量业务会话", Destructive: true},
+			{Code: "verify_group", Name: "确认 MGR 已完全追平", Description: "要求全部成员 ONLINE、仅一个 PRIMARY 且应用队列为零"},
+			{Code: "teardown_mgr", Name: "安全退出 MGR", Description: "停止 Group Replication、关闭开机自动入组并移除该集群 Router 运行态", Destructive: true},
+			{Code: "promote_new_master", Name: "启用目标主库", Description: "清理复制元数据并将指定节点设置为唯一可写主库", Destructive: true},
+			{Code: "reconfigure_topology", Name: "建立异步复制拓扑", Description: "按目标角色建立一主多从或多主复制关系", Destructive: true},
+			{Code: "verify_topology", Name: "验证目标拓扑", Description: "验证复制方向、线程、GTID、只读状态与延迟参数"},
+			{Code: "pt_verify_replication", Name: "PT 数据一致性验证", Description: "验证退出 MGR 后各实例业务数据一致"},
+			{Code: "resume_business_connections", Name: "恢复业务访问", Description: "拓扑与数据校验通过后关闭 offline_mode，恢复业务连接"},
+			{Code: "release_lock", Name: "释放切换锁", Description: "保存审计结果并释放集群锁"},
+		}
+		items = addArchitectureManagementRepairStep(items, req)
+		for index := range items {
+			items[index].Order = index + 1
+		}
+		return items
 	}
 	freezeName, freezeDescription := "锁定当前写入口", "短暂阻止新业务连接，建立一致的拓扑变更边界"
 	reconfigureName, reconfigureDescription := "建立双向复制", "保留当前主库，补充反向复制和双主自增参数；不重复选举或提升现有主库"

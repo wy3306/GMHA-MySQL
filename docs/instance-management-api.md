@@ -84,6 +84,7 @@ POST /api/v1/tasks/cluster-automation
 
 ```http
 GET /api/v1/tasks/database-inspection/results?task_ids=task-01,task-02
+GET /api/v1/tasks/database-inspection/history?cluster=prod&limit=50
 GET /api/v1/tasks/database-inspection/report?task_ids=task-01,task-02
 GET /api/v1/tasks/database-inspection/data?task_ids=task-01,task-02
 ```

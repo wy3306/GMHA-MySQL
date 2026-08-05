@@ -3,12 +3,20 @@ package handler
 import (
 	"archive/zip"
 	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"gmha/internal/app"
 	taskdomain "gmha/internal/domain/task"
+	persistence "gmha/internal/infrastructure/persistence/sqlite"
+	_ "modernc.org/sqlite"
 )
 
 func TestDatabaseInspectionCommandIncludesExpectedChecks(t *testing.T) {
@@ -82,6 +90,62 @@ func TestInspectionOfficeExportsAreValidPackages(t *testing.T) {
 		"xl/worksheets/sheet1.xml": "connection_usage",
 		"xl/styles.xml":            "Microsoft YaHei",
 	})
+}
+
+func TestDatabaseInspectionHistoryUsesPersistedTaskTree(t *testing.T) {
+	db, err := sql.Open("sqlite", t.TempDir()+"/inspection-history.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repo := persistence.NewTaskRepository(persistence.NewDB(db, persistence.DialectSQLite))
+	if err := repo.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 5, 9, 30, 0, 0, time.UTC)
+	finished := now.Add(time.Minute)
+	parent := taskdomain.Task{
+		ID: "inspection-run-1", Type: taskdomain.TypeBatchOperation, AgentID: "manager",
+		Status: taskdomain.StatusSuccess, ProgressPercent: 100, CreatedAt: now, FinishedAt: &finished,
+		SpecJSON: []byte(`{"operation":"cluster_automation","target":"prod"}`),
+	}
+	child := taskdomain.Task{
+		ID: "inspection-task-1", ParentTaskID: parent.ID, Type: taskdomain.TypeExec, MachineID: "db-1",
+		Status: taskdomain.StatusSuccess, ProgressPercent: 100, CreatedAt: now, FinishedAt: &finished,
+		SpecJSON: []byte(`{"operation":"database_inspection","port":3306}`),
+	}
+	if err := repo.CreateTask(context.Background(), parent, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	events := []taskdomain.Event{{ID: "inspection-event-1", TaskID: child.ID, EventType: taskdomain.EventLog, CreatedAt: finished, Content: strings.Join([]string{
+		"GMHA_INSPECTION_META\tdb-1\t8.0.36\t3306\t2026-08-05 09:31:00",
+		"GMHA_INSPECTION_CHECK\t连接\tconnection_usage\t连接使用率\twarning\twarning\t75%\t< 70%\t连接偏高\t检查连接池",
+	}, "\n")}}
+	if err := repo.CreateTask(context.Background(), child, nil, events); err != nil {
+		t.Fatal(err)
+	}
+
+	service := app.NewTaskService(repo, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/tasks/database-inspection/history?cluster=prod", nil)
+	NewTaskHandler(service).HandleDatabaseInspectionHistory(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response databaseInspectionHistoryResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Total != 1 || len(response.Items) != 1 {
+		t.Fatalf("unexpected history response: %+v", response)
+	}
+	record := response.Items[0]
+	if record.ID != parent.ID || len(record.TaskIDs) != 1 || record.TaskIDs[0] != child.ID || record.AverageScore != 92 || record.Warnings != 1 {
+		t.Fatalf("unexpected history record: %+v", record)
+	}
+	if len(record.Clusters) != 1 || record.Clusters[0] != "prod" {
+		t.Fatalf("inspection cluster was not retained: %+v", record.Clusters)
+	}
 }
 
 func assertZipEntries(t *testing.T, contents []byte, expected map[string]string) {

@@ -219,10 +219,15 @@ func (h *ClusterTopologyHandler) buildAt(ctx context.Context, cluster string, ra
 			incoming[topologyEndpoint(target.IP, target.Port)] = true
 		}
 	}
+	observedMGR := hasObservedMGR(view.Nodes)
 	for i := range view.Nodes {
 		node := &view.Nodes[i]
 		key := topologyEndpoint(node.IP, node.Port)
-		if node.GroupRole != "" {
+		// performance_schema may retain an OFFLINE Group Replication row after
+		// the cluster has been converted back to asynchronous replication. Only
+		// treat those rows as the current architecture when at least one member
+		// of the group is actually ONLINE.
+		if observedMGR && node.GroupRole != "" {
 			node.Role = "MGR_" + strings.ToUpper(node.GroupRole)
 			view.Architecture = "mgr_router"
 			continue
@@ -344,7 +349,7 @@ func applyTopologyIntent(view *clusterTopologyView, intent hadomain.TopologyInte
 			continue
 		}
 		if intent.Architecture == hadomain.ArchitectureMGRRouter {
-			if node.GroupRole == "" {
+			if !isOnlineMGRMember(*node) {
 				if desired.MachineID == intent.PrimaryMachineID || strings.EqualFold(desired.Role, "M") {
 					node.Role = "MGR_PRIMARY"
 				} else {
@@ -392,11 +397,15 @@ func applyTopologyIntent(view *clusterTopologyView, intent hadomain.TopologyInte
 
 func hasObservedMGR(nodes []clusterTopologyNode) bool {
 	for _, node := range nodes {
-		if node.GroupState != "" {
+		if isOnlineMGRMember(node) {
 			return true
 		}
 	}
 	return false
+}
+
+func isOnlineMGRMember(node clusterTopologyNode) bool {
+	return strings.EqualFold(node.GroupState, "ONLINE") && strings.TrimSpace(node.GroupRole) != ""
 }
 
 func evaluateTopologyConsistency(view *clusterTopologyView) {
@@ -411,7 +420,7 @@ func evaluateTopologyConsistency(view *clusterTopologyView) {
 			if strings.EqualFold(node.GroupState, "ONLINE") {
 				online++
 			}
-			if strings.EqualFold(node.GroupRole, "PRIMARY") {
+			if strings.EqualFold(node.GroupRole, "PRIMARY") && strings.EqualFold(node.GroupState, "ONLINE") {
 				primary++
 			}
 			queue += node.ApplyQueue + node.RemoteApplyQueue

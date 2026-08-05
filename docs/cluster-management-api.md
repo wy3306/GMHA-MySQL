@@ -207,6 +207,7 @@ MGR 成员的物理恢复会在启动后等待其重新加入原复制组，并�
 - `GET /tasks/cluster-automation/report`
 - `GET /tasks/cluster-automation/artifacts/{task_id}/{file_name}`
 - `GET /tasks/database-inspection/results`
+- `GET /tasks/database-inspection/history`
 - `GET /tasks/database-inspection/report`
 - `GET /tasks/database-inspection/data`
 
