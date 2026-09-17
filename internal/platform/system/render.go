@@ -60,6 +60,7 @@ func (r *Renderer) RenderSystemdUnit() (string, error) {
 Description=GMHA Agent
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

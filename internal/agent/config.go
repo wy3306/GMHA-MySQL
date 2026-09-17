@@ -103,6 +103,9 @@ func LoadConfig(path string) (Config, error) {
 	if cfg.AgentID == "" || cfg.MachineID == "" || cfg.MachineIP == "" || cfg.ManagerGRPCAddr == "" || cfg.ManagerHTTPAddr == "" {
 		return Config{}, errors.New("agent config requires agent_id, machine_id, machine_ip, manager_http_addr and manager_grpc_addr")
 	}
+	if cfg.HeartbeatInterval <= 0 {
+		return Config{}, errors.New("heartbeat_interval must be positive")
+	}
 	return cfg, nil
 }
 

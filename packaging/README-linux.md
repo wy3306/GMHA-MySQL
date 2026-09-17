@@ -52,16 +52,16 @@ GMHA_MANAGER_PUBKEY=/opt/gmha/manager_ed25519.pub ./start-web.sh
 
 ## 版本升级
 
-Manager 和 Agent 的当前版本均为 `V0.2.2`。完整发行包默认把当前版本的 Manager
+Manager 和 Agent 的当前版本均为 `V0.3.2`。完整发行包默认把当前版本的 Manager
 x86_64、Agent x86_64 和 Agent ARM64 制品放入本地安装包仓库；首次启动后可直接在
 “安装包管理”和“版本升级”中看到，最高版本会被自动选中，无需再次上传。
 
-执行 `scripts/build-release.sh V0.2.2` 还会在 `dist/` 额外生成三个独立制品，供旧版
+执行 `scripts/build-release.sh V0.3.2` 还会在 `dist/` 额外生成三个独立制品，供旧版
 Manager 单独上传或跨环境分发：
 
-- `gmha-manager-V0.2.2-linux-amd64.bin`：上传到 `GMHA Manager` 分类。
-- `gmha-agent-V0.2.2-linux-amd64.bin`：x86_64 目标机，上传到 `GMHA Agent` 分类。
-- `gmha-agent-V0.2.2-linux-arm64.bin`：aarch64 目标机，上传到 `GMHA Agent` 分类。
+- `gmha-manager-V0.3.2-linux-amd64.bin`：上传到 `GMHA Manager` 分类。
+- `gmha-agent-V0.3.2-linux-amd64.bin`：x86_64 目标机，上传到 `GMHA Agent` 分类。
+- `gmha-agent-V0.3.2-linux-arm64.bin`：aarch64 目标机，上传到 `GMHA Agent` 分类。
 
 完整发行版支持范围与老版本限制见 `docs/linux-compatibility.md`。Agent 安装会在
 上传前核对目标发行版、systemd 和 ELF 架构；MySQL 安装会再次核对 glibc 与制品。
@@ -151,8 +151,8 @@ Go、Node.js 或 FlameGraph Perl 脚本。PID/进程模式在没有 `perf` 时�
 
 ```sh
 ./scripts/build-flamegraph-offline-bundle.sh \
-  V0.2.2 amd64 ./perf-packages \
-  ./dist/gmha-flamegraph-V0.2.2-linux-amd64-offline.tar.gz
+  V0.3.2 amd64 ./perf-packages \
+  ./dist/gmha-flamegraph-V0.3.2-linux-amd64-offline.tar.gz
 ```
 
 将包内 `bin/agentd` 通过“平台运维 → 版本升级”分发；目标机解压后执行 `sudo ./install.sh`

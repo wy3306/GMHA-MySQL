@@ -13,6 +13,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"gmha/internal/agent"
@@ -33,6 +34,15 @@ func main() {
 	configPath := flag.String("config", "/home/gmha/agent/agent.yaml", "agent config path")
 	flag.Parse()
 
+	// Initialize before reading configuration so startup failures are retained.
+	logs, err := agent.OpenLog(filepath.Join(filepath.Dir(*configPath), "logs"))
+	if err != nil {
+		log.Fatalf("initialize agent log: %v", err)
+	}
+	defer logs.Close()
+	log.SetOutput(logs)
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.LUTC)
+	log.Printf("agent starting version=%s", buildinfo.CurrentVersion())
 	cfg, err := agent.LoadConfig(*configPath)
 	if err != nil {
 		log.Fatal(err)
@@ -44,4 +54,5 @@ func main() {
 	if err := agent.Run(ctx, cfg); err != nil {
 		log.Fatal(err)
 	}
+	log.Print("agent stopped")
 }

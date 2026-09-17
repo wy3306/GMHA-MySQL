@@ -1,6 +1,10 @@
 package app
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
+	"time"
+)
 
 func TestComponentVersionAndArchitectureNormalization(t *testing.T) {
 	for input, want := range map[string]string{"0.0.2": "V0.0.2", "v1.2.3": "V1.2.3", "V2.0.0": "V2.0.0"} {
@@ -91,5 +95,19 @@ func TestDetectAgentVersionOutput(t *testing.T) {
 	}
 	if _, err := detectAgentVersionOutput([]byte("unknown")); err == nil {
 		t.Fatal("invalid Agent version output should fail")
+	}
+}
+
+func TestReconcileManagerRestartFailsStaleInterruptedJob(t *testing.T) {
+	job := UpgradeJob{
+		ID: "stale-build", Component: "manager-build", Status: "running", TargetVersion: "V0.0.1",
+		Steps:     []UpgradeStep{{Name: "preflight", Status: "success"}, {Name: "build", Status: "success"}, {Name: "probe", Status: "success"}, {Name: "install", Status: "success"}, {Name: "restart", Status: "running"}},
+		CreatedAt: time.Now().Add(-time.Hour), UpdatedAt: time.Now().Add(-time.Hour),
+	}
+	service := &UpgradeService{statePath: filepath.Join(t.TempDir(), "jobs.json"), jobs: map[string]UpgradeJob{job.ID: job}}
+	service.reconcileManagerRestart()
+	got, ok := service.Get(job.ID)
+	if !ok || got.Status != "failed" || got.Steps[4].Status != "failed" {
+		t.Fatalf("stale Manager job was not reconciled: %#v", got)
 	}
 }

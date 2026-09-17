@@ -250,6 +250,7 @@ export const apiEndpoints = [
   endpoint('Manager 与升级', 'GET', '/upgrades/jobs', '查询组件升级记录', { response: { items: [] } }),
   endpoint('Manager 与升级', 'GET', '/upgrades/{job_id}', '查询升级任务', { response: { id: 'upgrade-01', component: 'agent', status: 'running', current_version: 'v1.2.0', target_version: 'v1.3.0' } }),
   endpoint('Manager 与升级', 'POST', '/upgrades/agent', '批量升级 Agent', { status: 202, body: { package_name: 'gmha-agent-v1.3.0-linux-amd64', targets: ['10.0.0.11', '10.0.0.12'] }, response: { id: 'upgrade-01', component: 'agent', status: 'pending' } }),
+  endpoint('版本升级', 'POST', '/upgrades/agent/build', '构建并发布新版本 Agent', { response: { component: 'agent-build', status: 'pending' } }),
   endpoint('Manager 与升级', 'POST', '/upgrades/manager', '升级 Manager', { status: 202, body: { package_name: 'gmha-manager-v1.3.0-linux-amd64' }, response: { id: 'upgrade-02', component: 'manager', status: 'pending' } }),
   endpoint('Manager 与升级', 'POST', '/upgrades/manager/rebuild', '重编译、安装并重启 Manager 内核', { status: 202, body: { source_dir: '/opt/gmha-src', confirmation: 'REBUILD' }, response: { id: 'upgrade-rebuild-01', component: 'manager-build', status: 'pending' }, note: '服务端从指定本地源码目录执行 Go 编译；候选自检通过后备份、原子替换并重启。' }),
 

@@ -395,6 +395,7 @@ func preservedAgentSystemdUnit(installDir string) string {
 Description=GMHA Agent
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

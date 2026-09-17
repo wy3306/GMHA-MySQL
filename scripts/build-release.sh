@@ -2,7 +2,8 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-VERSION=${1:-V0.2.2}
+cd "$ROOT"
+VERSION=${1:-$(go run ./cmd/build-agent --print-next-version)}
 EMBED_VERSION=$(printf '%s' "$VERSION" | sed 's/^v/V/')
 NAME="gmha-${VERSION}-linux-amd64"
 PACKAGE="$ROOT/dist/$NAME"
@@ -42,6 +43,8 @@ cp "$ROOT/scripts/build-flamegraph-offline-bundle.sh" "$PACKAGE/scripts/build-fl
 cp "$ROOT/packaging/flamegraph-install-offline.sh" "$PACKAGE/scripts/flamegraph-install-offline.sh"
 cp "$ROOT/packaging/README-linux.md" "$PACKAGE/README.md"
 cp "$ROOT/docs/linux-compatibility.md" "$PACKAGE/docs/linux-compatibility.md"
+cp "$ROOT/docs/agent-release-workflow.md" "$PACKAGE/docs/agent-release-workflow.md"
+cp "$ROOT/docs/agent-recovery-logging.md" "$PACKAGE/docs/agent-recovery-logging.md"
 chmod +x "$PACKAGE/start-web.sh" "$PACKAGE/scripts/build-pt-offline-bundle.sh" "$PACKAGE/scripts/build-flamegraph-offline-bundle.sh" "$PACKAGE/scripts/flamegraph-install-offline.sh" "$PACKAGE/gmha" "$PACKAGE/gmha-web" "$PACKAGE/bin/agentd"
 cp "$PACKAGE/gmha" "$PACKAGE/software/gmha-manager/$BUNDLED_MANAGER_NAME"
 cp "$PACKAGE/bin/agentd" "$PACKAGE/software/gmha-agent/$BUNDLED_AGENT_NAME"

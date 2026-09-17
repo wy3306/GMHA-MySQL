@@ -35,6 +35,7 @@ func NewClusterTopologyHandler(machines *app.MachineService, mysql *app.MySQLSer
 
 type clusterTopologyView struct {
 	Cluster           string                `json:"cluster"`
+	AgentHealth       string                `json:"agent_health"`
 	Architecture      string                `json:"architecture"`
 	Nodes             []clusterTopologyNode `json:"nodes"`
 	Edges             []clusterTopologyEdge `json:"edges"`
@@ -296,6 +297,7 @@ func (h *ClusterTopologyHandler) buildAt(ctx context.Context, cluster string, ra
 			return clusterTopologyView{}, fmt.Errorf("instance %q not found in cluster %q", instanceSelector, cluster)
 		}
 	}
+	view.AgentHealth = h.clusterAgentHealth(ctx, cluster)
 	view.Overview = h.buildOverview(ctx, cluster, overviewNodes, rangeMinutes, endAt, instanceSelector)
 	return view, nil
 }
@@ -542,4 +544,54 @@ func topologyFirstString(values map[string]any, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+// Aggregate all members, independent of the selected instance or Agent page.
+func (h *ClusterTopologyHandler) clusterAgentHealth(ctx context.Context, cluster string) string {
+	if h.machines == nil || h.heartbeat == nil {
+		return "unknown"
+	}
+	machines, err := h.machines.ListMachines(ctx)
+	if err != nil {
+		return "unknown"
+	}
+	states := []string{}
+	for _, machine := range machines {
+		if machine.Cluster != cluster {
+			continue
+		}
+		hb, ok, err := h.heartbeat.GetByMachineID(ctx, machine.ID)
+		if err != nil {
+			return "unknown"
+		}
+		if !ok {
+			states = append(states, "unknown")
+			continue
+		}
+		states = append(states, string(hb.CurrentState))
+	}
+	return aggregateAgentHealth(states)
+}
+
+func aggregateAgentHealth(states []string) string {
+	total, online, degraded := len(states), 0, false
+	for _, state := range states {
+		switch strings.ToLower(state) {
+		case "online":
+			online++
+		case "degraded":
+			online++
+			degraded = true
+		}
+	}
+	if total == 0 {
+		return "pending"
+	}
+	if online == 0 {
+		return "offline"
+	}
+	if online < total || degraded {
+		return "warning"
+	}
+	return "healthy"
 }

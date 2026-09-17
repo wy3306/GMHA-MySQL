@@ -52,3 +52,22 @@ func TestObservedMGRRequiresAnOnlineMember(t *testing.T) {
 		t.Fatal("an ONLINE Group Replication member must be classified as an observed MGR architecture")
 	}
 }
+
+func TestClusterAgentHealthNeverTreatsMissingOrOfflineAsHealthy(t *testing.T) {
+	for _, tc := range []struct {
+		states []string
+		want   string
+	}{
+		{nil, "pending"},
+		{[]string{"OFFLINE", "OFFLINE", "OFFLINE"}, "offline"},
+		{[]string{"ONLINE", "OFFLINE"}, "warning"},
+		{[]string{"ONLINE", "unknown"}, "warning"},
+		{[]string{"DEGRADED", "ONLINE"}, "warning"},
+		{[]string{"SUSPECT"}, "offline"},
+		{[]string{"ONLINE", "ONLINE"}, "healthy"},
+	} {
+		if got := aggregateAgentHealth(tc.states); got != tc.want {
+			t.Errorf("%v: got %s want %s", tc.states, got, tc.want)
+		}
+	}
+}

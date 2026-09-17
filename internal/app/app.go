@@ -29,14 +29,16 @@ import (
 
 // Config 是应用配置，包含数据库路径、SSH 公钥、Agent 二进制路径和 Manager 地址等。
 type Config struct {
-	DBPath           string // 兼容旧版 SQLite 文件路径
-	DatabaseDriver   string // sqlite（默认）、mysql、postgres
-	DatabaseDSN      string // 外部数据库连接串；SQLite 为空时使用 DBPath
-	StateDir         string // Manager 本地状态目录；为空时使用 ~/.gmha
-	ManagerPublicKey string
-	AgentBinaryPath  string
-	ManagerHTTPAddr  string
-	ManagerGRPCAddr  string
+	DBPath             string // 兼容旧版 SQLite 文件路径
+	DatabaseDriver     string // sqlite（默认）、mysql、postgres
+	DatabaseDSN        string // 外部数据库连接串；SQLite 为空时使用 DBPath
+	StateDir           string // Manager 本地状态目录；为空时使用 ~/.gmha
+	ManagerPublicKey   string
+	AgentBinaryPath    string
+	ManagerHTTPAddr    string
+	ManagerGRPCAddr    string
+	ManagerSourceDir   string // 源码部署目录；用于开发/源码部署模式自动重编译
+	ManagerAutoRebuild bool   // 监听源码变更并自动构建、安装和重启 Manager
 }
 
 // App 是应用核心结构体，持有所有服务实例。
@@ -327,6 +329,9 @@ func New(cfg Config) (*App, error) {
 		return total > 0, err
 	})
 	upgradeService := NewUpgradeService(filepath.Join(stateDir, "upgrade-jobs.json"), packageService, agentService, managerRuntime)
+	if cfg.ManagerAutoRebuild {
+		upgradeService.StartManagerSourceWatch(cfg.ManagerSourceDir)
+	}
 	managerHAService := NewManagerHAService(managerHARepo, machineRepo, taskService, managerRuntime, machineService)
 	aiService, err := NewAIService(aiRepo, alertService, machineService, taskService, filepath.Join(stateDir, "ai-secret.key"))
 	if err != nil {
@@ -431,6 +436,9 @@ func configureSQLite(db *sql.DB) {
 }
 
 func (a *App) Close() error {
+	if a.UpgradeService != nil {
+		a.UpgradeService.Close()
+	}
 	if a.HAService != nil {
 		a.HAService.StopTopologyRecovery()
 	}

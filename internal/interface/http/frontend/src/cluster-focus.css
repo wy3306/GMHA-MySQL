@@ -102,3 +102,7 @@
     transition: none;
   }
 }
+
+.context-cluster .cluster-health.offline i { background:#ef4444; box-shadow:0 0 0 3px #fee2e2; }
+.context-cluster .cluster-health.warning i { background:#f59e0b; box-shadow:0 0 0 3px #fef3c7; }
+.context-cluster .cluster-health.unknown i,.context-cluster .cluster-health.pending i { background:#94a3b8; box-shadow:0 0 0 3px #e2e8f0; }

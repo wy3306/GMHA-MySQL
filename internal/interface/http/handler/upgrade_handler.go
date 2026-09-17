@@ -114,3 +114,16 @@ func (h *UpgradeHandler) HandleManagerRebuild(w http.ResponseWriter, r *http.Req
 	}
 	writeJSON(w, http.StatusAccepted, item)
 }
+
+func (h *UpgradeHandler) HandleAgentBuild(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	job, err := h.service.StartAgentBuild()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, job)
+}

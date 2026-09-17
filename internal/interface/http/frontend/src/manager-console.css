@@ -168,6 +168,7 @@
 .manager-node-operations article>div{display:flex;gap:8px}
 .manager-node-operations article>em{color:#718096;font-size:10px;font-style:normal}
 .manager-node-operations>div>p{margin:20px;color:#8290a4;text-align:center;font-size:11px}
+.manager-source-watch{display:flex;align-items:center;gap:12px;padding:14px 17px;border:1px solid #dce5ef;border-radius:10px;background:#f8fafc}.manager-source-watch>i{display:grid;width:34px;height:34px;flex:0 0 34px;place-items:center;border-radius:9px;background:#e9eef5;color:#64748b;font-size:17px;font-style:normal}.manager-source-watch>span{display:grid;min-width:0;gap:3px}.manager-source-watch b{color:#334155;font-size:12px}.manager-source-watch small{overflow:hidden;color:#718096;font-size:10px;text-overflow:ellipsis;white-space:nowrap}.manager-source-watch em{color:#b4233b;font-size:10px;font-style:normal}.manager-source-watch.enabled{border-color:#b9e3d0;background:#f0fdf7}.manager-source-watch.enabled>i{background:#d9f5e8;color:#13845d}.manager-source-watch.error{border-color:#fecdd3;background:#fff5f6}
 .manager-rebuild-panel>header>strong{padding:5px 9px;border-radius:999px;background:#fff0f1;color:#bd3547;font-size:10px}
 .manager-rebuild-panel>form{display:grid;grid-template-columns:1.2fr .8fr auto;padding:20px;align-items:end;gap:14px}
 .manager-rebuild-panel>form button{height:42px}

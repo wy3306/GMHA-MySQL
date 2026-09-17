@@ -267,12 +267,14 @@ func (s *RecoveryService) ExecuteTask(ctx context.Context, task recoverydomain.T
 	}
 
 	action := recoverydomain.ActionRestart
-	if containsAny(inspectOut, "inactive", "failed") {
+	serviceState := strings.TrimSpace(strings.SplitN(inspectOut, "\n", 2)[0])
+	if serviceState == "inactive" || serviceState == "failed" {
 		action = recoverydomain.ActionStart
 	}
 	task.Action = action
 	_ = s.repo.UpdateTask(ctx, task)
 
+	startedAt := time.Now().UTC()
 	var execOut string
 	if action == recoverydomain.ActionStart {
 		execOut, err = s.executor.Start(ctx, endpoint, auth)
@@ -295,9 +297,12 @@ func (s *RecoveryService) ExecuteTask(ctx context.Context, task recoverydomain.T
 
 	waitCtx, cancel := context.WithTimeout(ctx, cfg.WaitHeartbeat)
 	defer cancel()
-	if err := s.heartbeat.WaitForOnline(waitCtx, task.MachineID, cfg.WaitHeartbeat); err != nil {
+	if err := s.heartbeat.WaitForFreshHeartbeat(waitCtx, task.MachineID, startedAt, cfg.WaitHeartbeat); err != nil {
 		task.Status = recoverydomain.StatusFailed
 		task.LastError = err.Error()
+		if diagnostics, _ := s.executor.Inspect(ctx, endpoint, auth); diagnostics != "" {
+			task.LastSSHOutput = diagnostics
+		}
 		_ = s.repo.UpdateTask(ctx, task)
 		return s.markFailed(ctx, task)
 	}
@@ -398,12 +403,3 @@ func (s *RecoveryService) ScanAndRecover(ctx context.Context) error {
 }
 
 func ptrTime(t time.Time) *time.Time { return &t }
-
-func containsAny(s string, terms ...string) bool {
-	for _, term := range terms {
-		if strings.Contains(strings.ToLower(s), strings.ToLower(term)) {
-			return true
-		}
-	}
-	return false
-}

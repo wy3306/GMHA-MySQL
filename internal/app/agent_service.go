@@ -5,6 +5,7 @@ import (
 	"context"
 	"debug/elf"
 	"errors"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,12 +22,14 @@ import (
 	dynamicdomain "gmha/internal/domain/dynamic"
 	hbdomain "gmha/internal/domain/heartbeat"
 	machinedomain "gmha/internal/domain/machine"
+	taskdomain "gmha/internal/domain/task"
 	agentusecase "gmha/internal/usecase/agent"
 )
 
 // AgentService 是 Agent 管理服务，负责 Agent 的安装、升级、卸载、重试安装、
 // 平台检测、二进制构建、心跳管理和 MySQL 配置修复等。
 type AgentService struct {
+	packages        *PackageService
 	repo            agentdomain.Repository
 	machineRepo     machinedomain.Repository
 	credentialRepo  credentialdomain.Repository
@@ -323,10 +326,11 @@ func (s *AgentService) RetryInstallByIP(ctx context.Context, req agentusecase.In
 	if err != nil {
 		return agentusecase.InstallAgentResponse{}, err
 	}
-	binary, err := s.loadAgentBinary(targetOS, targetArch)
+	binary, version, err := s.latestAgentBinary(targetOS, targetArch)
 	if err != nil {
 		return agentusecase.InstallAgentResponse{}, err
 	}
+	req.Version = version
 	return s.installer.Execute(ctx, req, binary)
 }
 
@@ -449,15 +453,138 @@ func (s *AgentService) UpgradeByIP(ctx context.Context, ip string) (agentusecase
 	if !agentFound {
 		return agentusecase.UpgradeAgentResponse{}, errors.New("agent not found")
 	}
+	if s.taskService != nil {
+		if ready, _ := s.taskService.MachineAgentReady(machine.ID); ready {
+			return s.upgradeOnlineAgent(ctx, machine, agent)
+		}
+	}
 	targetOS, targetArch, err := s.detectRemotePlatform(ctx, machine)
 	if err != nil {
-		return agentusecase.UpgradeAgentResponse{}, err
+		return agentusecase.UpgradeAgentResponse{}, fmt.Errorf("Agent 任务通道离线，SSH 连接 %s:%d 也失败，无法推送升级：%w；请检查目标机 SSH 服务、防火墙、安全组及 Manager 到目标网段的连通性", machine.IP, machine.SSHPort, err)
 	}
-	binary, err := s.loadAgentBinary(targetOS, targetArch)
+	binary, version, err := s.latestAgentBinary(targetOS, targetArch)
 	if err != nil {
 		return agentusecase.UpgradeAgentResponse{}, err
 	}
-	return s.upgradeByIPBinary(ctx, machine, agent.Version, binary)
+	if comparison, ok := compareComponentVersions(agent.Version, version); !ok || comparison >= 0 {
+		return agentusecase.UpgradeAgentResponse{}, fmt.Errorf("当前版本 %s，目标版本 %s；请先构建发布更高版本 Agent", agent.Version, version)
+	}
+	return s.upgradeByIPBinary(ctx, machine, version, binary)
+}
+
+// upgradeOnlineAgent sends a delayed self-update through the already connected
+// Agent task channel. This is the primary path: an online Agent does not need
+// inbound SSH merely to replace its own executable.
+func (s *AgentService) upgradeOnlineAgent(ctx context.Context, machine machinedomain.Machine, current agentdomain.Agent) (agentusecase.UpgradeAgentResponse, error) {
+	if s.packages == nil || s.heartbeat == nil {
+		return agentusecase.UpgradeAgentResponse{}, errors.New("Agent 在线升级服务未配置")
+	}
+	items, err := s.packages.List("gmha-agent", "")
+	if err != nil {
+		return agentusecase.UpgradeAgentResponse{}, err
+	}
+	versions := make([]string, 0, len(items))
+	for _, item := range items {
+		if _, ok := parseComponentVersion(item.Version); ok {
+			versions = append(versions, item.Version)
+		}
+	}
+	targetVersion := highestComponentVersion(versions...)
+	if targetVersion == "" {
+		return agentusecase.UpgradeAgentResponse{}, errors.New("没有可用的 Agent 升级制品")
+	}
+	if comparison, ok := compareComponentVersions(current.Version, targetVersion); !ok || comparison >= 0 {
+		return agentusecase.UpgradeAgentResponse{}, fmt.Errorf("当前版本 %s，目标版本 %s，没有可推送的新版本", current.Version, targetVersion)
+	}
+
+	byArch := make(map[string]PackageItem)
+	for _, item := range items {
+		if strings.EqualFold(componentVersion(item.Version), componentVersion(targetVersion)) {
+			byArch[normalizeComponentArch(item.Arch)] = item
+		}
+	}
+	amd64, amdOK := byArch["amd64"]
+	arm64, armOK := byArch["arm64"]
+	if !amdOK || !armOK {
+		return agentusecase.UpgradeAgentResponse{}, fmt.Errorf("Agent %s 发布不完整：AMD64 与 ARM64 制品必须同时存在", targetVersion)
+	}
+	if _, err := s.packages.Verify("gmha-agent", amd64.Name); err != nil {
+		return agentusecase.UpgradeAgentResponse{}, err
+	}
+	if _, err := s.packages.Verify("gmha-agent", arm64.Name); err != nil {
+		return agentusecase.UpgradeAgentResponse{}, err
+	}
+
+	installDir := agentdomain.ResolveInstallDir(machine.SSHUser, current.InstallDir)
+	managerURL := strings.TrimRight(ResolveManagerHTTPAddrForTarget(s.managerHTTPAddr, machine.IP), "/")
+	command := onlineAgentUpgradeCommand(installDir, managerURL, targetVersion, amd64, arm64)
+	startedAt := time.Now().UTC()
+	task, err := s.taskService.CreateExecTaskWithOptions(ctx, machine.IP, command, ExecTaskOptions{
+		Operation: "agent_self_upgrade", DisplayName: "在线推送升级 Agent", StepName: "下载、校验并安排重启", Internal: true,
+	})
+	if err != nil {
+		return agentusecase.UpgradeAgentResponse{}, fmt.Errorf("创建 Agent 在线升级任务失败: %w", err)
+	}
+	detail, err := s.taskService.WaitForTask(ctx, task.Task.ID, 45*time.Second)
+	if err != nil {
+		return agentusecase.UpgradeAgentResponse{}, fmt.Errorf("等待 Agent 在线升级任务失败: %w", err)
+	}
+	if detail.Task.Status != taskdomain.StatusSuccess {
+		return agentusecase.UpgradeAgentResponse{}, fmt.Errorf("Agent 在线升级准备失败，任务 %s 状态为 %s；请在任务中心查看输出", task.Task.ID, detail.Task.Status)
+	}
+	if err := s.heartbeat.WaitForVersionHeartbeat(ctx, machine.ID, targetVersion, startedAt, 45*time.Second); err != nil {
+		return agentusecase.UpgradeAgentResponse{}, fmt.Errorf("Agent 已接收升级，但新版本心跳未确认: %w；请查看 %s/logs/agent.log", err, installDir)
+	}
+	current.Version = targetVersion
+	current.State = agentdomain.StateOnline
+	current.LastError = ""
+	if _, err := s.repo.Save(ctx, current); err != nil {
+		return agentusecase.UpgradeAgentResponse{}, err
+	}
+	return agentusecase.UpgradeAgentResponse{MachineID: machine.ID, AgentID: current.ID, InstallDir: installDir, FinalState: string(agentdomain.StateOnline)}, nil
+}
+
+func onlineAgentUpgradeCommand(installDir, managerURL, version string, amd64, arm64 PackageItem) string {
+	packageURL := func(name string) string {
+		return managerURL + "/api/v1/software/packages/gmha-agent/" + url.PathEscape(name)
+	}
+	return fmt.Sprintf(`set -eu
+dir=%s
+arch=$(uname -m)
+case "$arch" in
+  x86_64|amd64) url=%s; sha=%s ;;
+  aarch64|arm64) url=%s; sha=%s ;;
+  *) echo "unsupported Agent architecture: $arch" >&2; exit 1 ;;
+esac
+candidate="$dir/.agentd.%s.candidate"
+backup="$dir/agentd.backup-%s"
+mkdir -p "$dir/logs"
+if command -v curl >/dev/null 2>&1; then curl -fsSL --connect-timeout 10 --max-time 180 "$url" -o "$candidate"; elif command -v wget >/dev/null 2>&1; then wget -q -T 180 -O "$candidate" "$url"; else echo 'curl or wget is required' >&2; exit 1; fi
+printf '%%s  %%s\n' "$sha" "$candidate" | sha256sum -c -
+chmod 0755 "$candidate"
+test "$("$candidate" --version)" = %s
+cp -p "$dir/agentd" "$backup"
+cat > "$dir/.apply-agent-upgrade.sh" <<'GMHA_UPGRADE'
+#!/bin/sh
+set -eu
+dir="$1"; candidate="$2"; backup="$3"
+exec >>"$dir/logs/upgrade.log" 2>&1
+mv -f "$candidate" "$dir/agentd"
+if ! systemctl enable gmha-agent.service >/dev/null 2>&1 || ! systemctl restart gmha-agent.service; then
+  cp -p "$backup" "$dir/agentd"
+  systemctl restart gmha-agent.service || true
+  exit 1
+fi
+rm -f "$0"
+GMHA_UPGRADE
+chmod 0700 "$dir/.apply-agent-upgrade.sh"
+command -v systemd-run >/dev/null 2>&1
+: >"$dir/logs/upgrade.log"
+systemd-run --quiet --collect --unit=gmha-agent-upgrade-%s --on-active=2s "$dir/.apply-agent-upgrade.sh" "$dir" "$candidate" "$backup"
+echo 'Agent upgrade staged; restart scheduled'`,
+		shellQuote(installDir), shellQuote(packageURL(amd64.Name)), shellQuote(amd64.SHA256),
+		shellQuote(packageURL(arm64.Name)), shellQuote(arm64.SHA256), strings.TrimPrefix(componentVersion(version), "V"),
+		strings.ReplaceAll(componentVersion(version), "/", "_"), shellQuote(componentVersion(version)), strings.TrimPrefix(componentVersion(version), "V"))
 }
 
 // UpgradeByIPBinary upgrades an Agent with a versioned binary selected from the
@@ -837,4 +964,52 @@ func normalizeGOARCH(value string) string {
 	default:
 		return ""
 	}
+}
+
+func (s *AgentService) latestAgentBinary(targetOS, targetArch string) ([]byte, string, error) {
+	if s.packages != nil {
+		items, err := s.packages.List("gmha-agent", "")
+		if err != nil {
+			return nil, "", err
+		}
+		var selected *PackageItem
+		for i := range items {
+			item := &items[i]
+			if targetOS != "linux" || normalizeComponentArch(item.Arch) != normalizeComponentArch(targetArch) {
+				continue
+			}
+			if _, ok := parseComponentVersion(item.Version); !ok {
+				continue
+			}
+			if selected == nil {
+				selected = item
+				continue
+			}
+			if cmp, ok := compareComponentVersions(item.Version, selected.Version); ok && cmp > 0 {
+				selected = item
+			}
+		}
+		if selected != nil {
+			if _, err := s.packages.Verify("gmha-agent", selected.Name); err != nil {
+				return nil, "", err
+			}
+			path, err := s.packages.Open("gmha-agent", selected.Name)
+			if err != nil {
+				return nil, "", err
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return nil, "", err
+			}
+			if err := validateAgentBinary(data, selected.Arch); err != nil {
+				return nil, "", err
+			}
+			return data, componentVersion(selected.Version), nil
+		}
+		if len(items) > 0 {
+			return nil, "", fmt.Errorf("没有适配 %s/%s 的已发布 Agent，请先构建发布或上传制品", targetOS, targetArch)
+		}
+	}
+	data, err := s.loadAgentBinary(targetOS, targetArch)
+	return data, buildinfo.CurrentVersion(), err
 }

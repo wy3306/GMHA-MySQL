@@ -797,22 +797,31 @@ func (s *PackageService) save(category, name string, content io.Reader, metadata
 		return PackageItem{}, err
 	}
 	path := filepath.Join(dir, name)
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	file, err := os.CreateTemp(dir, ".upload-*")
 	if err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return PackageItem{}, errors.New("package file already exists; delete it before uploading a replacement")
-		}
+		return PackageItem{}, err
+	}
+	tempPath := file.Name()
+	defer os.Remove(tempPath)
+	if err := file.Chmod(0644); err != nil {
+		file.Close()
 		return PackageItem{}, err
 	}
 	hash := sha256.New()
 	_, copyErr := io.Copy(io.MultiWriter(file, hash), content)
 	closeErr := file.Close()
 	if copyErr != nil || closeErr != nil {
-		_ = os.Remove(path)
 		if copyErr != nil {
 			return PackageItem{}, copyErr
 		}
 		return PackageItem{}, closeErr
+	}
+	// Publish complete bytes without overwriting an existing release.
+	if err := os.Link(tempPath, path); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return PackageItem{}, errors.New("package file already exists; publish a new version instead")
+		}
+		return PackageItem{}, err
 	}
 	info, err := os.Stat(path)
 	if err != nil {

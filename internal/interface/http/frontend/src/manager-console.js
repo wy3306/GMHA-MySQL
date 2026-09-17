@@ -28,7 +28,10 @@ const emptyHA = () => ({
 
 export default {
   name: 'ManagerConsole',
-  props: { machines: { type: Array, default: () => [] } },
+  props: {
+    machines: { type: Array, default: () => [] },
+    upgrade: { type: Object, default: () => ({}) }
+  },
   emits: ['refresh', 'view-change'],
   setup(props, { emit }) {
     const view = ref('overview')
@@ -411,7 +414,8 @@ export default {
       </template>
 
       <template v-else>
-        <section class="panel manager-rebuild-panel"><header><div><span>MANAGER KERNEL</span><h3>内核重编译、安装与重启</h3><p>候选程序自检通过后备份当前内核、原子安装并自动重启。</p></div><strong>高风险运维</strong></header><form @submit.prevent="rebuild"><label>源码目录<input v-model.trim="rebuildForm.source_dir" required placeholder="/opt/gmha-src"></label><label>输入 REBUILD 确认<input v-model.trim="rebuildForm.confirmation" autocomplete="off" placeholder="REBUILD"></label><button class="danger-button" :disabled="!!busy || rebuildForm.confirmation!=='REBUILD'">{{ busy==='rebuild' ? '正在启动任务…' : '重编译并安装重启' }}</button></form></section>
+        <section :class="['manager-source-watch',{enabled:upgrade.manager_auto_rebuild,error:upgrade.manager_watch_error}]"><i>↻</i><span><b>{{ upgrade.manager_auto_rebuild ? '源码变更自动构建已启用' : upgrade.manager_source_available ? '源码监听未启用' : '当前为制品部署' }}</b><small v-if="upgrade.manager_auto_rebuild">监听 {{ upgrade.manager_source_dir }}；文件稳定后自动构建前端与 Manager，并完成安装重启。</small><small v-else>制品部署继续通过下方手工维护或版本升级更新。</small><em v-if="upgrade.manager_watch_error">{{ upgrade.manager_watch_error }}</em></span></section>
+        <section class="panel manager-rebuild-panel"><header><div><span>MANAGER KERNEL</span><h3>手工重编译与恢复</h3><p>自动监听异常或需要立即执行时，可在这里手工构建；候选程序自检通过后备份、原子安装并自动重启。</p></div><strong>维护入口</strong></header><form @submit.prevent="rebuild"><label>源码目录<input v-model.trim="rebuildForm.source_dir" required placeholder="/opt/gmha-src"></label><label>输入 REBUILD 确认<input v-model.trim="rebuildForm.confirmation" autocomplete="off" placeholder="REBUILD"></label><button class="danger-button" :disabled="!!busy || rebuildForm.confirmation!=='REBUILD'">{{ busy==='rebuild' ? '正在启动任务…' : '重编译并安装重启' }}</button></form></section>
         <section class="manager-maintenance-note"><i>↑</i><span><b>版本升级</b><small>升级制品、版本关系与执行记录统一显示在本子页面下方。</small></span></section>
       </template>
     </div>

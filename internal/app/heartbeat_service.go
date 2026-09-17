@@ -1096,3 +1096,25 @@ func buildEvent(prev, next hbdomain.LatestStatus, reason string, payload hbdomai
 		CreatedAt:    now,
 	}
 }
+
+// WaitForVersionHeartbeat confirms the running process, not a requested database version.
+func (s *HeartbeatService) WaitForVersionHeartbeat(ctx context.Context, machineID, version string, startedAt time.Time, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		hb, ok, err := s.getByMachineIDRefreshing(ctx, machineID)
+		if err != nil {
+			return err
+		}
+		if ok && !hb.LastHeartbeatAt.Before(startedAt) && strings.EqualFold(hb.Version, version) && (hb.CurrentState == hbdomain.StateOnline || hb.CurrentState == hbdomain.StateDegraded) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("Agent 版本心跳未确认：期望 %s，最近上报 %s", version, hb.Version)
+		case <-ticker.C:
+		}
+	}
+}

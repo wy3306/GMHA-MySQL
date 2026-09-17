@@ -17,16 +17,32 @@ func NewRecoveryExecutor(client *Client) *RecoveryExecutor {
 }
 
 func (e *RecoveryExecutor) Inspect(ctx context.Context, endpoint machinedomain.Endpoint, auth machinedomain.SSHAuth) (string, error) {
-	out, err := e.client.RunOutput(ctx, endpoint, auth, "systemctl is-active gmha-agent; echo ====; systemctl is-enabled gmha-agent || true; echo ====; systemctl status gmha-agent --no-pager -n 20 || true; echo ====; journalctl -u gmha-agent -n 30 --no-pager || true")
+	out, err := e.client.RunOutput(ctx, endpoint, auth, agentRecoveryDiagnostics)
 	return strings.TrimSpace(string(out)), err
 }
 
 func (e *RecoveryExecutor) Start(ctx context.Context, endpoint machinedomain.Endpoint, auth machinedomain.SSHAuth) (string, error) {
-	out, err := e.client.RunOutput(ctx, endpoint, auth, "systemctl start gmha-agent && systemctl status gmha-agent --no-pager -n 20 || true")
+	out, err := e.client.RunOutput(ctx, endpoint, auth, recoveryActivationCommand("start"))
 	return strings.TrimSpace(string(out)), err
 }
 
 func (e *RecoveryExecutor) Restart(ctx context.Context, endpoint machinedomain.Endpoint, auth machinedomain.SSHAuth) (string, error) {
-	out, err := e.client.RunOutput(ctx, endpoint, auth, "systemctl restart gmha-agent && systemctl status gmha-agent --no-pager -n 20 || true")
+	out, err := e.client.RunOutput(ctx, endpoint, auth, recoveryActivationCommand("restart"))
 	return strings.TrimSpace(string(out)), err
 }
+
+// Keep the activation exit status: diagnostics must never turn failure into success.
+func recoveryActivationCommand(action string) string {
+	return `rc=0
+systemctl daemon-reload && systemctl reset-failed gmha-agent.service && systemctl enable gmha-agent.service && systemctl ` + action + ` gmha-agent.service && systemctl is-active --quiet gmha-agent.service || rc=$?
+` + agentRecoveryDiagnostics + `
+exit "$rc"`
+}
+
+const agentRecoveryDiagnostics = `systemctl is-active gmha-agent.service || true
+systemctl is-enabled gmha-agent.service || true
+systemctl status gmha-agent.service --no-pager --full -n 20 || true
+journalctl -u gmha-agent.service -n 30 --no-pager || true
+dir=$(systemctl show gmha-agent.service -p WorkingDirectory --value 2>/dev/null || true)
+if [ -n "$dir" ] && [ -f "$dir/logs/agent.log" ]; then tail -c 8192 "$dir/logs/agent.log"; fi
+true`

@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/url"
 	"strings"
 	"time"
@@ -48,6 +49,7 @@ func (r *Receiver) Run(ctx context.Context) error {
 			return nil
 		}
 		if err != nil {
+			log.Printf("task channel disconnected: %v; retry in 3s", err)
 			select {
 			case <-ctx.Done():
 				return nil
@@ -72,6 +74,9 @@ func (r *Receiver) runOnce(ctx context.Context, managerHTTPAddr string) error {
 		return err
 	}
 	defer conn.Close()
+	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopClose()
+	log.Print("task channel connected")
 
 	reporter := NewReporter(conn, r.agentID, r.machineID)
 	for {

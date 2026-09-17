@@ -29,3 +29,11 @@ test('Manager database page exposes guarded one-click WAL maintenance', () => {
   assert.match(source, /walStatus\.supported/)
   assert.match(styles, /\.manager-wal-panel/)
 })
+
+test('Manager maintenance shows automatic source rebuild state and keeps manual recovery', () => {
+  assert.match(source, /upgrade\.manager_auto_rebuild/)
+  assert.match(source, /源码变更自动构建已启用/)
+  assert.match(source, /自动构建前端与 Manager，并完成安装重启/)
+  assert.match(source, /手工重编译与恢复/)
+  assert.match(styles, /\.manager-source-watch\.enabled/)
+})

@@ -1,7 +1,6 @@
 const header = document.querySelector("[data-header]");
 const menuButton = document.querySelector("[data-menu-button]");
 const navigation = document.querySelector("[data-nav]");
-const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 function updateHeader() {
   header?.classList.toggle("scrolled", window.scrollY > 18);
@@ -14,66 +13,56 @@ function closeMenu() {
 }
 
 menuButton?.addEventListener("click", () => {
-  const isOpen = menuButton.getAttribute("aria-expanded") === "true";
-  menuButton.setAttribute("aria-expanded", String(!isOpen));
-  navigation?.classList.toggle("open", !isOpen);
-  document.body.classList.toggle("menu-open", !isOpen);
+  const open = menuButton.getAttribute("aria-expanded") !== "true";
+  menuButton.setAttribute("aria-expanded", String(open));
+  navigation?.classList.toggle("open", open);
+  document.body.classList.toggle("menu-open", open);
 });
 
-navigation?.querySelectorAll("a").forEach((link) => {
-  link.addEventListener("click", closeMenu);
-});
-
-window.addEventListener("resize", () => {
-  if (window.innerWidth > 760) closeMenu();
-});
-
+navigation?.querySelectorAll("a").forEach((link) => link.addEventListener("click", closeMenu));
+window.addEventListener("resize", () => window.innerWidth > 760 && closeMenu());
 window.addEventListener("scroll", updateHeader, { passive: true });
-updateHeader();
 
-const revealItems = document.querySelectorAll(".reveal");
-
-if (reduceMotion || !("IntersectionObserver" in window)) {
-  revealItems.forEach((item) => item.classList.add("visible"));
-} else {
-  const observer = new IntersectionObserver(
-    (entries) => {
-      entries.forEach((entry) => {
-        if (!entry.isIntersecting) return;
-        entry.target.classList.add("visible");
-        observer.unobserve(entry.target);
-      });
-    },
-    { threshold: 0.12, rootMargin: "0px 0px -40px" },
-  );
-
-  revealItems.forEach((item) => observer.observe(item));
+const hero = document.querySelector("[data-hero]");
+const capture = document.querySelector("[data-hero-image]");
+const toggle = document.querySelector("[data-hero-toggle]");
+const scenes = [
+ ["cluster-overview", "集群运行概览", "QPS、TPS、资源与复制拓扑"],
+ ["performance-flamegraph", "实采 Linux 火焰图", "304 个样本与完整调用栈"],
+ ["instance-database-inspection", "数据库健康巡检", "真实评分、风险与修复建议"],
+ ["architecture-safety-plan", "架构调整安全计划", "变更前生成 12 步执行护栏"],
+ ["ai-assistant-conversation", "AI 运维助手", "理解上下文，衔接受控执行"]
+];
+let current = 0;
+let paused = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+let changing = false;
+function updatePlayback() {
+ hero?.classList.toggle("paused", paused);
+ toggle.textContent = paused ? "▶" : "Ⅱ";
+ toggle.setAttribute("aria-label", paused ? "播放首页演示" : "暂停首页演示");
 }
-
-const screenshotTabs = document.querySelectorAll("[data-screenshot]");
-const productImage = document.querySelector("[data-product-image]");
-const productTitle = document.querySelector("[data-product-title]");
-const productDescription = document.querySelector("[data-product-description]");
-
-screenshotTabs.forEach((tab) => {
-  tab.addEventListener("click", () => {
-    if (tab.classList.contains("active") || !productImage) return;
-
-    screenshotTabs.forEach((item) => {
-      const isActive = item === tab;
-      item.classList.toggle("active", isActive);
-      item.setAttribute("aria-selected", String(isActive));
-    });
-
-    productImage.classList.add("switching");
-    const nextImage = new Image();
-    nextImage.src = tab.dataset.screenshot;
-    nextImage.addEventListener("load", () => {
-      productImage.src = nextImage.src;
-      productImage.alt = `GMHA ${tab.dataset.title}控制台`;
-      if (productTitle) productTitle.textContent = tab.dataset.title;
-      if (productDescription) productDescription.textContent = tab.dataset.description;
-      productImage.classList.remove("switching");
-    });
-  });
-});
+toggle?.addEventListener("click", () => { paused = !paused; updatePlayback(); });
+updatePlayback();
+setInterval(async () => {
+ if (paused || changing || document.hidden || !capture) return;
+ changing = true;
+ const next = (current + 1) % scenes.length;
+ const [file, title, description] = scenes[next];
+ const source = "/screenshots/v022-complete/" + file + "-4k.jpg";
+ const preload = new Image();
+ preload.src = source;
+ try {
+  await preload.decode();
+  if (paused) return;
+  capture.classList.add("changing");
+  await new Promise(resolve => setTimeout(resolve, 350));
+  capture.src = source;
+  capture.alt = "GMHA " + title + "完整截图";
+  current = next;
+  document.querySelector("[data-hero-index]").textContent = String(next + 1).padStart(2,"0") + " / 05";
+  document.querySelector("[data-hero-title]").textContent = title;
+  document.querySelector("[data-hero-description]").textContent = description;
+  capture.classList.remove("changing");
+ } catch { capture.classList.remove("changing"); }
+ finally { changing = false; }
+}, 6000);

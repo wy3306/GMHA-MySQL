@@ -162,7 +162,7 @@ func (u *UpgradeAgentUsecase) Execute(ctx context.Context, req UpgradeAgentReque
 		ID:         agent.ID,
 		MachineID:  machine.ID,
 		InstallDir: installDir,
-		Version:    req.Version,
+		Version:    agent.Version,
 		State:      agentdomain.StateInstalling,
 	})
 
@@ -189,11 +189,17 @@ func (u *UpgradeAgentUsecase) Execute(ctx context.Context, req UpgradeAgentReque
 	if err := u.sshClient.Upload(ctx, endpoint, auth, tmpAgentPath, binary, "0755"); err != nil {
 		return u.fail(ctx, machine.ID, installDir, agent.ID, fmt.Errorf("failed to upload agent binary to %s: %w", installDir, err))
 	}
+	// Probe the uploaded binary on its target architecture before touching the running binary.
+	output, probeErr := u.sshClient.RunOutput(ctx, endpoint, auth, shellQuote(tmpAgentPath)+" --version")
+	if probeErr != nil || !strings.EqualFold(strings.TrimSpace(string(output)), strings.TrimSpace(req.Version)) {
+		_ = u.sshClient.Run(ctx, endpoint, auth, "rm -f -- "+shellQuote(tmpAgentPath))
+		return u.fail(ctx, machine.ID, installDir, agent.ID, fmt.Errorf("candidate Agent version mismatch: expected %s, got %q (probe: %v)", req.Version, strings.TrimSpace(string(output)), probeErr))
+	}
 	if err := u.sshClient.Run(ctx, endpoint, auth, fmt.Sprintf("chmod 0755 %s && if test -f %s; then cp -p %s %s; fi && mv -f %s %s", shellQuote(tmpAgentPath), shellQuote(installDir+"/agentd"), shellQuote(installDir+"/agentd"), shellQuote(backupAgentPath), shellQuote(tmpAgentPath), shellQuote(installDir+"/agentd"))); err != nil {
 		return u.fail(ctx, machine.ID, installDir, agent.ID, fmt.Errorf("failed to replace agent binary: %w", err))
 	}
 	rollback := func(baseErr error) (UpgradeAgentResponse, error) {
-		rollbackCmd := fmt.Sprintf("if test -f %s; then cp -p %s %s && systemctl restart gmha-agent; fi", shellQuote(backupAgentPath), shellQuote(backupAgentPath), shellQuote(installDir+"/agentd"))
+		rollbackCmd := fmt.Sprintf("test -f %s && cp -p %s %s && mv -f %s %s && systemctl restart gmha-agent", shellQuote(backupAgentPath), shellQuote(backupAgentPath), shellQuote(tmpAgentPath), shellQuote(tmpAgentPath), shellQuote(installDir+"/agentd"))
 		rollbackCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if rollbackErr := u.sshClient.Run(rollbackCtx, endpoint, auth, rollbackCmd); rollbackErr != nil {
@@ -224,6 +230,19 @@ func (u *UpgradeAgentUsecase) Execute(ctx context.Context, req UpgradeAgentReque
 		}
 	}
 
+	if reader, ok := u.heartbeat.(interface {
+		WaitForVersionHeartbeat(context.Context, string, string, time.Time, time.Duration) error
+	}); ok {
+		if err := reader.WaitForVersionHeartbeat(ctx, machine.ID, req.Version, startedAt, 30*time.Second); err != nil {
+			return rollback(err)
+		}
+	}
+	agent.Version = req.Version
+	agent.State = agentdomain.StateOnline
+	agent.LastError = ""
+	if _, err := u.agentRepo.Save(ctx, agent); err != nil {
+		return UpgradeAgentResponse{}, err
+	}
 	_ = u.machineRepo.UpdateStatus(ctx, machine.ID, machinedomain.StatusAgentOnline, "")
 	_ = u.agentRepo.UpdateState(ctx, machine.ID, agentdomain.StateOnline, "")
 	return UpgradeAgentResponse{

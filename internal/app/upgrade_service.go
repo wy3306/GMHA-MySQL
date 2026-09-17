@@ -46,15 +46,20 @@ type UpgradeJob struct {
 }
 
 type UpgradeOverview struct {
-	ManagerVersion       string                `json:"manager_version"`
-	ManagerLatestVersion string                `json:"manager_latest_version"`
-	AgentRunningVersion  string                `json:"agent_running_latest_version"`
-	AgentLatestVersion   string                `json:"agent_latest_version"`
-	AgentTotal           int                   `json:"agent_total"`
-	AgentVersions        []UpgradeVersionCount `json:"agent_versions"`
-	ManagerPackages      []UpgradePackageView  `json:"manager_packages"`
-	AgentPackages        []UpgradePackageView  `json:"agent_packages"`
-	Storage              UpgradeStorageInfo    `json:"storage"`
+	AgentBuildAvailable    bool                  `json:"agent_build_available"`
+	ManagerSourceAvailable bool                  `json:"manager_source_available"`
+	ManagerAutoRebuild     bool                  `json:"manager_auto_rebuild"`
+	ManagerSourceDir       string                `json:"manager_source_dir,omitempty"`
+	ManagerWatchError      string                `json:"manager_watch_error,omitempty"`
+	ManagerVersion         string                `json:"manager_version"`
+	ManagerLatestVersion   string                `json:"manager_latest_version"`
+	AgentRunningVersion    string                `json:"agent_running_latest_version"`
+	AgentLatestVersion     string                `json:"agent_latest_version"`
+	AgentTotal             int                   `json:"agent_total"`
+	AgentVersions          []UpgradeVersionCount `json:"agent_versions"`
+	ManagerPackages        []UpgradePackageView  `json:"manager_packages"`
+	AgentPackages          []UpgradePackageView  `json:"agent_packages"`
+	Storage                UpgradeStorageInfo    `json:"storage"`
 }
 
 type UpgradeVersionCount struct {
@@ -85,16 +90,24 @@ type UpgradeStorageInfo struct {
 }
 
 type UpgradeService struct {
-	mu        sync.RWMutex
-	jobs      map[string]UpgradeJob
-	statePath string
-	packages  *PackageService
-	agents    *AgentService
-	runtime   *ManagerRuntimeService
+	mu          sync.RWMutex
+	jobs        map[string]UpgradeJob
+	statePath   string
+	packages    *PackageService
+	agents      *AgentService
+	runtime     *ManagerRuntimeService
+	watchCancel context.CancelFunc
+	watchStatus ManagerSourceWatchStatus
 }
 
 func NewUpgradeService(statePath string, packages *PackageService, agents *AgentService, managerRuntime *ManagerRuntimeService) *UpgradeService {
 	s := &UpgradeService{statePath: statePath, packages: packages, agents: agents, runtime: managerRuntime, jobs: make(map[string]UpgradeJob)}
+	if root, err := findRepoRoot(); err == nil {
+		s.watchStatus = ManagerSourceWatchStatus{Available: true, SourceDir: root}
+	}
+	if agents != nil {
+		agents.packages = packages
+	}
 	_ = s.load()
 	s.reconcileManagerRestart()
 	return s
@@ -150,6 +163,7 @@ func (s *UpgradeService) Overview(ctx context.Context) (UpgradeOverview, error) 
 		agentKnownVersions = append(agentKnownVersions, version)
 	}
 	agentRunningVersion := highestComponentVersion(agentKnownVersions...)
+	agentKnownVersions = nil // Latest available means a published, selectable artifact.
 	for _, item := range agentPackages {
 		item.Version = componentVersion(item.Version)
 		agentKnownVersions = append(agentKnownVersions, item.Version)
@@ -182,15 +196,20 @@ func (s *UpgradeService) Overview(ctx context.Context) (UpgradeOverview, error) 
 		ManagerBackupPattern: executable + ".backup-<version>", AgentInstallPattern: "<Agent InstallDir>/agentd", AgentBackupPattern: "<Agent InstallDir>/agentd.backup-<version>",
 	}
 	return UpgradeOverview{
-		ManagerVersion:       managerVersion,
-		ManagerLatestVersion: managerLatestVersion,
-		AgentRunningVersion:  agentRunningVersion,
-		AgentLatestVersion:   agentLatestVersion,
-		AgentTotal:           len(agents),
-		AgentVersions:        versions,
-		ManagerPackages:      managerViews,
-		AgentPackages:        agentViews,
-		Storage:              storage,
+		AgentBuildAvailable:    agentSourceAvailable(),
+		ManagerSourceAvailable: s.ManagerSourceWatchStatus().Available,
+		ManagerAutoRebuild:     s.ManagerSourceWatchStatus().Enabled,
+		ManagerSourceDir:       s.ManagerSourceWatchStatus().SourceDir,
+		ManagerWatchError:      s.ManagerSourceWatchStatus().LastError,
+		ManagerVersion:         managerVersion,
+		ManagerLatestVersion:   managerLatestVersion,
+		AgentRunningVersion:    agentRunningVersion,
+		AgentLatestVersion:     agentLatestVersion,
+		AgentTotal:             len(agents),
+		AgentVersions:          versions,
+		ManagerPackages:        managerViews,
+		AgentPackages:          agentViews,
+		Storage:                storage,
 	}, nil
 }
 
@@ -325,9 +344,23 @@ func (s *UpgradeService) runManagerRebuild(id, sourceDir string) {
 
 	candidate := exePath + ".rebuild.candidate"
 	_ = os.Remove(candidate)
-	s.step(id, 1, "running", "执行 go build -trimpath ./cmd/gmha")
+	s.step(id, 1, "running", "构建前端资源并执行 go build -trimpath ./cmd/gmha")
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
+	frontendDir := filepath.Join(sourceDir, "internal", "interface", "http", "frontend")
+	if _, statErr := os.Stat(filepath.Join(frontendDir, "package.json")); statErr == nil {
+		npmPath, lookupErr := exec.LookPath("npm")
+		if lookupErr != nil {
+			s.fail(id, 1, errors.New("检测到前端源码但未找到 npm，无法把页面修改写入 Manager"))
+			return
+		}
+		frontendBuild := exec.CommandContext(ctx, npmPath, "run", "build")
+		frontendBuild.Dir = frontendDir
+		if output, buildErr := frontendBuild.CombinedOutput(); buildErr != nil {
+			s.fail(id, 1, fmt.Errorf("Manager 前端构建失败: %s", strings.TrimSpace(string(output))))
+			return
+		}
+	}
 	command := exec.CommandContext(ctx, goPath, "build", "-trimpath", "-o", candidate, "./cmd/gmha")
 	command.Dir = sourceDir
 	output, err := command.CombinedOutput()
@@ -340,7 +373,7 @@ func (s *UpgradeService) runManagerRebuild(id, sourceDir string) {
 		s.fail(id, 1, err)
 		return
 	}
-	s.step(id, 1, "success", "Manager 内核编译完成")
+	s.step(id, 1, "success", "Manager 前端资源与内核编译完成")
 
 	s.step(id, 2, "running", "执行候选程序 --version 并检查可执行性")
 	versionOutput, err := exec.Command(candidate, "--version").CombinedOutput()
@@ -348,7 +381,14 @@ func (s *UpgradeService) runManagerRebuild(id, sourceDir string) {
 		s.fail(id, 2, fmt.Errorf("候选程序自检失败: %s", strings.TrimSpace(string(versionOutput))))
 		return
 	}
-	s.step(id, 2, "success", "候选程序自检通过，版本 "+strings.TrimSpace(string(versionOutput)))
+	candidateVersion := componentVersion(strings.TrimSpace(string(versionOutput)))
+	s.mu.Lock()
+	job := s.jobs[id]
+	job.TargetVersion = candidateVersion
+	s.jobs[id] = job
+	_ = s.saveLocked()
+	s.mu.Unlock()
+	s.step(id, 2, "success", "候选程序自检通过，版本 "+candidateVersion)
 
 	backup := exePath + ".backup-rebuild-" + time.Now().UTC().Format("20060102T150405")
 	s.step(id, 3, "running", "备份当前程序并原子安装重编译内核")
@@ -433,30 +473,41 @@ func (s *UpgradeService) newJob(component string, targets []string, pkg PackageI
 }
 
 func (s *UpgradeService) runAgent(id, version, packageArch string, binary []byte) {
-	s.step(id, 0, "running", "检查目标在线状态、SSH 权限与当前版本")
+	s.step(id, 0, "running", "检查 SSH 连接、架构与当前版本；支持离线 Agent")
 	job, _ := s.Get(id)
+	binaries := make(map[string][]byte)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
 	for _, ip := range job.Targets {
-		view, ok, err := s.agents.GetViewByIP(context.Background(), ip)
-		if err != nil || !ok || (strings.ToLower(view.HeartbeatState) != "online" && strings.ToLower(view.InstallState) != "online") {
-			s.fail(id, 0, fmt.Errorf("%s 升级前检查失败：Agent 不在线", ip))
+		view, ok, err := s.agents.GetViewByIP(ctx, ip)
+		if err != nil || !ok || strings.ToLower(view.InstallState) == "installing" {
+			s.fail(id, 0, fmt.Errorf("%s 升级前检查失败：Agent 不存在或正在安装", ip))
 			return
 		}
-		machine, found, err := s.agents.resolveMachineByIP(context.Background(), ip)
+		machine, found, err := s.agents.resolveMachineByIP(ctx, ip)
 		if err != nil || !found {
 			s.fail(id, 0, fmt.Errorf("%s 升级前检查失败：机器不存在", ip))
 			return
 		}
-		_, targetArch, err := s.agents.detectRemotePlatform(context.Background(), machine)
-		if err != nil || (packageArch != "未识别" && normalizeComponentArch(targetArch) != normalizeComponentArch(packageArch)) {
-			s.fail(id, 0, fmt.Errorf("%s 架构不兼容：目标 %s，安装包 %s", ip, targetArch, packageArch))
+		_, targetArch, err := s.agents.detectRemotePlatform(ctx, machine)
+		if err != nil {
+			s.fail(id, 0, fmt.Errorf("%s SSH 平台检查失败: %w", ip, err))
 			return
 		}
+		binaries[ip] = binary
+		if normalizeComponentArch(targetArch) != normalizeComponentArch(packageArch) {
+			binaries[ip], err = s.agentBinaryForVersion(version, targetArch)
+			if err != nil {
+				s.fail(id, 0, fmt.Errorf("%s: %w", ip, err))
+				return
+			}
+		}
 	}
-	s.step(id, 0, "success", "目标 Agent 均在线，当前版本已记录")
+	s.step(id, 0, "success", "目标 SSH 可达且架构兼容，当前版本已记录")
 	s.step(id, 1, "success", fmt.Sprintf("安装包已读取，目标版本 %s", version))
 	s.step(id, 2, "running", "逐台备份并原子替换 Agent 二进制")
 	for _, ip := range job.Targets {
-		if _, err := s.agents.UpgradeByIPBinary(context.Background(), ip, version, binary); err != nil {
+		if _, err := s.agents.UpgradeByIPBinary(ctx, ip, version, binaries[ip]); err != nil {
 			s.fail(id, 2, fmt.Errorf("%s: %w", ip, err))
 			return
 		}
@@ -465,7 +516,7 @@ func (s *UpgradeService) runAgent(id, version, packageArch string, binary []byte
 	s.step(id, 3, "success", "systemd 服务已重启")
 	s.step(id, 4, "running", "核对新鲜心跳与上报版本")
 	for _, ip := range job.Targets {
-		view, ok, err := s.agents.GetViewByIP(context.Background(), ip)
+		view, ok, err := s.agents.GetViewByIP(ctx, ip)
 		if err != nil || !ok || !strings.EqualFold(view.Version, version) {
 			s.fail(id, 4, fmt.Errorf("%s 版本后检失败：上报 %s，期望 %s", ip, view.Version, version))
 			return
@@ -725,14 +776,31 @@ func (s *UpgradeService) complete(id string) {
 
 func (s *UpgradeService) reconcileManagerRestart() {
 	s.mu.RLock()
-	ids := make([]string, 0)
+	verifyIDs := make([]string, 0)
+	failedIDs := make([]string, 0)
 	for id, job := range s.jobs {
-		if (job.Component == "manager" || job.Component == "manager-build") && job.Status == "running" && len(job.Steps) > 4 && job.Steps[4].Status == "running" && strings.EqualFold(job.TargetVersion, buildinfo.CurrentVersion()) {
-			ids = append(ids, id)
+		if (job.Component != "manager" && job.Component != "manager-build") || (job.Status != "running" && job.Status != "pending") {
+			continue
+		}
+		if len(job.Steps) > 4 && job.Steps[4].Status == "running" && strings.EqualFold(componentVersion(job.TargetVersion), componentVersion(buildinfo.CurrentVersion())) {
+			verifyIDs = append(verifyIDs, id)
+		} else {
+			failedIDs = append(failedIDs, id)
 		}
 	}
 	s.mu.RUnlock()
-	for _, id := range ids {
+	for _, id := range failedIDs {
+		job, _ := s.Get(id)
+		index := 0
+		for stepIndex, step := range job.Steps {
+			if step.Status == "running" || step.Status == "pending" {
+				index = stepIndex
+				break
+			}
+		}
+		s.fail(id, index, errors.New("Manager 上次运行期间的构建或升级任务已中断，请重新提交"))
+	}
+	for _, id := range verifyIDs {
 		go s.verifyManagerAfterRestart(id)
 	}
 }
@@ -748,22 +816,18 @@ func (s *UpgradeService) verifyManagerAfterRestart(id string) {
 		s.fail(id, 4, err)
 		return
 	}
-	statusURL := strings.TrimSuffix(healthURL, "/healthz") + "/manager/status"
 	client := &http.Client{Timeout: 1500 * time.Millisecond}
 	deadline := time.Now().Add(45 * time.Second)
 	for time.Now().Before(deadline) {
-		resp, requestErr := client.Get(statusURL)
+		resp, requestErr := client.Get(healthURL)
 		if requestErr == nil {
-			content, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
-			var remote ManagerRuntimeStatus
-			if resp.StatusCode == http.StatusOK && json.Unmarshal(content, &remote) == nil {
-				job, _ := s.Get(id)
-				if remote.Running && strings.EqualFold(remote.Version, job.TargetVersion) {
-					s.step(id, 4, "success", "新版本 Manager 健康检查通过，运行版本 "+remote.Version)
-					s.complete(id)
-					return
-				}
+			job, _ := s.Get(id)
+			if resp.StatusCode == http.StatusOK && strings.EqualFold(componentVersion(buildinfo.CurrentVersion()), componentVersion(job.TargetVersion)) {
+				s.step(id, 4, "success", "新版本 Manager 健康检查通过，运行版本 "+buildinfo.CurrentVersion())
+				s.complete(id)
+				return
 			}
 		}
 		time.Sleep(time.Second)
@@ -784,6 +848,11 @@ func (s *UpgradeService) load() error {
 		return err
 	}
 	for _, item := range items {
+		if item.Component == "agent-build" && (item.Status == "pending" || item.Status == "running") {
+			item.Status = "failed"
+			item.Error = "Manager 重启中断了 Agent 构建，请检查构建锁后重新发布"
+			item.UpdatedAt = time.Now().UTC()
+		}
 		s.jobs[item.ID] = item
 	}
 	return nil
@@ -805,4 +874,30 @@ func (s *UpgradeService) saveLocked() error {
 		return err
 	}
 	return os.Rename(tmp, s.statePath)
+}
+
+// A batch selects a release version; each target receives its matching architecture.
+func (s *UpgradeService) agentBinaryForVersion(version, arch string) ([]byte, error) {
+	items, err := s.packages.List("gmha-agent", "")
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range items {
+		if !strings.EqualFold(componentVersion(item.Version), componentVersion(version)) || normalizeComponentArch(item.Arch) != normalizeComponentArch(arch) {
+			continue
+		}
+		_, path, err := s.resolvePackage("gmha-agent", item.Name)
+		if err != nil {
+			return nil, err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateAgentBinary(data, arch); err != nil {
+			return nil, err
+		}
+		return data, nil
+	}
+	return nil, fmt.Errorf("版本 %s 缺少 %s Agent 制品，请构建发布双架构版本或上传对应文件", version, arch)
 }

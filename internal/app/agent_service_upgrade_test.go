@@ -10,6 +10,28 @@ import (
 	machinedomain "gmha/internal/domain/machine"
 )
 
+func TestOnlineAgentUpgradeCommandSelectsArchitectureAndRunsOutsideAgentCgroup(t *testing.T) {
+	command := onlineAgentUpgradeCommand(
+		"/opt/gmha agent", "http://10.0.0.1:8080", "V0.2.4",
+		PackageItem{Name: "gmha-agent-V0.2.4-linux-amd64.bin", SHA256: strings.Repeat("a", 64)},
+		PackageItem{Name: "gmha-agent-V0.2.4-linux-arm64.bin", SHA256: strings.Repeat("b", 64)},
+	)
+	for _, expected := range []string{
+		"x86_64|amd64", "aarch64|arm64",
+		"/api/v1/software/packages/gmha-agent/gmha-agent-V0.2.4-linux-amd64.bin",
+		"/api/v1/software/packages/gmha-agent/gmha-agent-V0.2.4-linux-arm64.bin",
+		"sha256sum -c -", `test "$("$candidate" --version)" = 'V0.2.4'`,
+		"systemd-run --quiet --collect", "systemctl restart gmha-agent.service",
+	} {
+		if !strings.Contains(command, expected) {
+			t.Fatalf("online upgrade command missing %q:\n%s", expected, command)
+		}
+	}
+	if strings.Contains(command, "nohup") {
+		t.Fatal("upgrade helper must run in a transient systemd unit outside the Agent service cgroup")
+	}
+}
+
 type versionAgentRepo struct{ agent agentdomain.Agent }
 
 func (r *versionAgentRepo) Save(_ context.Context, item agentdomain.Agent) (agentdomain.Agent, error) {

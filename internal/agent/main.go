@@ -4,7 +4,7 @@ package agent
 import (
 	"context"
 	"fmt"
-	"io"
+	"log"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -43,6 +43,34 @@ func Run(ctx context.Context, cfg Config) error {
 		_ = receiver.Run(ctx)
 	}()
 
+	startedAt := time.Now().UTC()
+	return retryHeartbeat(ctx, 5*time.Second, func(ctx context.Context) error {
+		return runHeartbeatSession(ctx, cfg, startedAt)
+	})
+}
+
+// Keep task execution alive while the heartbeat transport reconnects.
+func retryHeartbeat(ctx context.Context, delay time.Duration, session func(context.Context) error) error {
+	for ctx.Err() == nil {
+		err := session(ctx)
+		if ctx.Err() != nil {
+			return nil
+		}
+		log.Printf("heartbeat disconnected: %v; retry in %s", err, delay)
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil
+		case <-timer.C:
+		}
+	}
+	return nil
+}
+
+func runHeartbeatSession(ctx context.Context, cfg Config, startedAt time.Time) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	conn, err := dialManager(ctx, cfg.ManagerGRPCAddrs)
 	if err != nil {
 		return err
@@ -70,13 +98,20 @@ func Run(ctx context.Context, cfg Config) error {
 	mysqlDynamicManager.Start(ctx, dynamicdomain.BuildDefaultMySQLDynamicCollectConfig())
 	defer mysqlDynamicManager.StopMySQLDynamicCollectors()
 
+	recvErrors := make(chan error, 1)
+	recvDone := make(chan struct{})
+	defer func() {
+		cancel()
+		_ = conn.Close()
+		<-recvDone
+	}()
+	log.Printf("heartbeat connected")
 	go func() {
+		defer close(recvDone)
 		for {
 			resp, recvErr := stream.Recv()
 			if recvErr != nil {
-				if recvErr != io.EOF {
-					return
-				}
+				recvErrors <- recvErr
 				return
 			}
 			if resp.DynamicCollect != nil {
@@ -89,7 +124,6 @@ func Run(ctx context.Context, cfg Config) error {
 	}()
 
 	hostname, _ := os.Hostname()
-	startedAt := time.Now().UTC()
 	bootID := startedAt.Format("20060102T150405") + "-" + hostname
 	streamID := startedAt.Format("20060102T150405") + "-" + randString(8)
 	checker := selfcheck.NewChecker(cfg.InstallDir)
@@ -129,6 +163,8 @@ func Run(ctx context.Context, cfg Config) error {
 		select {
 		case <-ctx.Done():
 			return nil
+		case err := <-recvErrors:
+			return fmt.Errorf("receive heartbeat: %w", err)
 		case <-ticker.C:
 		}
 	}

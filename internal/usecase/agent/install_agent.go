@@ -211,7 +211,7 @@ func (u *InstallAgentUsecase) Execute(ctx context.Context, req InstallAgentReque
 	}
 	for _, cmd := range agentSystemdActivationCommands() {
 		if err := u.sshClient.Run(ctx, endpoint, auth, cmd); err != nil {
-			return u.fail(ctx, machine.ID, installDir, agentID, fmt.Errorf("failed to activate gmha-agent systemd service: %w", err))
+			return u.fail(ctx, machine.ID, installDir, agentID, u.wrapStartupFailure(ctx, endpoint, auth, fmt.Errorf("failed to activate gmha-agent systemd service: %w", err)))
 		}
 	}
 

@@ -72,6 +72,7 @@ func NewRouter(core *app.App) http.Handler {
 	mux.HandleFunc("/api/v1/upgrades/overview", upgradeHandler.HandleOverview)
 	mux.HandleFunc("/api/v1/upgrades/jobs", upgradeHandler.HandleJobs)
 	mux.HandleFunc("/api/v1/upgrades/agent", upgradeHandler.HandleAgent)
+	mux.HandleFunc("/api/v1/upgrades/agent/build", upgradeHandler.HandleAgentBuild)
 	mux.HandleFunc("/api/v1/upgrades/manager", upgradeHandler.HandleManager)
 	mux.HandleFunc("/api/v1/upgrades/manager/rebuild", upgradeHandler.HandleManagerRebuild)
 	mux.HandleFunc("/api/v1/upgrades/", upgradeHandler.HandleJob)
